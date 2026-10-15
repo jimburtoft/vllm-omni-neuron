@@ -37,6 +37,7 @@ timestep MLP and the two output heads stay float32 while the block stack (includ
 projections) runs bfloat16.
 """
 
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -70,6 +71,12 @@ MINIMAX_H3_MODALITY_NUM = 3
 # Matched as substrings of the parameter name, exactly as diffusers'
 # `_keep_in_fp32_modules` does, so `proj_in` / `proj_out` also cover the audio heads.
 _KEEP_IN_FP32 = ("proj_in", "audio_proj_in", "time_embedder", "proj_out", "audio_proj_out")
+
+# `MINIMAX_H3_ADALN_ON_HOST=1` keeps the 50 AdaLN projections (13B parameters, ~40% of the DiT)
+# off the NeuronCores. They read only the timestep embedding, so each rank evaluates its
+# row-parallel slice on the host once per distinct timestep value and feeds the partial sums to
+# the graph, which keeps the all-reduce. Frees 26 GB of HBM (6.5 GB/core at TP=4).
+ADALN_ON_HOST = os.environ.get("MINIMAX_H3_ADALN_ON_HOST", "0") == "1"
 
 
 @dataclass
@@ -504,7 +511,22 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
         if tp_size > 1:
             set_weight_loader(self.linear_bias, _row_bias_loader(tp_size))
 
-    def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def host_partial(self, activated: torch.Tensor) -> torch.Tensor:
+        """This rank's row-parallel partial sum on the host; ``activated`` is ``silu(temb)``
+        already cast to the projection dtype, full width."""
+        rank = parallel.tp_rank()
+        weight, bias = self._host_weight, self._host_bias
+        in_per_rank = weight.shape[0]
+        return torch.matmul(activated[:, rank * in_per_rank : (rank + 1) * in_per_rank], weight) + bias
+
+    def forward(self, temb: torch.Tensor, partial: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
+        if partial is not None:
+            # Precomputed on the host (`ADALN_ON_HOST`): only the reduction runs here.
+            temb = partial
+            if self.tp_size > 1:
+                dist.all_reduce(temb, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
+            temb = temb.view(-1, 6 * self.hidden_size)
+            return torch.tensor_split(temb, [self.hidden_size * i for i in range(1, 6)], dim=-1)
         # The activation runs at `temb`'s own precision — float32, since `time_embedder`
         # is a float32 module in this mixed-precision checkpoint — and only its result is
         # cast down to the bfloat16 projection. Every block reads the same `temb`, so a
@@ -659,8 +681,9 @@ class MiniMaxH3TransformerBlock(nn.Module):
         run_rows: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         context: _AttentionContext,
+        adaln_partial: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        modulation = self.adaln_proj(temb)
+        modulation = self.adaln_proj(temb, adaln_partial)
         # One row per run instead of one per sequence row: the six table lookups shrink
         # from `(seq_len, hidden_size)` to `(num_runs, hidden_size)`.
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -833,6 +856,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         num_text_tokens: torch.Tensor,
         row_runs: MiniMaxH3RowRuns,
         return_dict: bool = False,
+        adaln_partials=None,
     ):
         """Run one denoising step over the packed sequence.
 
@@ -873,12 +897,13 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             return self._forward_staged(
                 hidden_states, audio_hidden_states, encoder_hidden_states, timestep,
                 rotary_cos, rotary_sin, adaln_run_rows, norm_out_run_rows, num_text_tokens, row_runs,
+                adaln_partials=adaln_partials,
             )
         return self._forward_whole(
             hidden_states=hidden_states, audio_hidden_states=audio_hidden_states,
             encoder_hidden_states=encoder_hidden_states, timestep=timestep, rotary_cos=rotary_cos,
             rotary_sin=rotary_sin, adaln_run_rows=adaln_run_rows, norm_out_run_rows=norm_out_run_rows,
-            num_text_tokens=num_text_tokens, row_runs=row_runs,
+            num_text_tokens=num_text_tokens, row_runs=row_runs, adaln_partials=adaln_partials,
         )
 
     def _forward_whole(
@@ -893,14 +918,18 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         norm_out_run_rows,
         num_text_tokens,
         row_runs: MiniMaxH3RowRuns,
+        adaln_partials=None,
     ):
         hidden_states, temb, adaln_run_rows, rotary_cos, rotary_sin, key_start = self._prologue(
             hidden_states, audio_hidden_states, encoder_hidden_states, timestep,
             rotary_cos, rotary_sin, adaln_run_rows, num_text_tokens, row_runs,
         )
         runs, context = self._block_geometry(row_runs, key_start)
-        for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context)
+        for index, block in enumerate(self.transformer_blocks):
+            partial = None if adaln_partials is None else adaln_partials[index]
+            hidden_states = block(
+                hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context, partial
+            )
         return self._epilogue(hidden_states, temb, norm_out_run_rows, row_runs)
 
     def compile_stages(self, compile_fn) -> None:
@@ -934,6 +963,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         norm_out_run_rows,
         num_text_tokens,
         row_runs: MiniMaxH3RowRuns,
+        adaln_partials=None,
     ):
         stages = self._stage_compiler
         outputs, probe = stages["prologue"](
@@ -943,8 +973,14 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         pending = [probe]
         hidden_states, temb, adaln_run_rows, rotary_cos, rotary_sin, key_start = outputs
         runs, context = self._block_geometry(row_runs, key_start)
-        for block in stages["blocks"]:
-            hidden_states, probe = block(hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context)
+        for index, block in enumerate(stages["blocks"]):
+            if adaln_partials is None:
+                hidden_states, probe = block(hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context)
+            else:
+                hidden_states, probe = block(
+                    hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context,
+                    adaln_partials[index],
+                )
             pending.append(probe)
             # Keep a few launches in flight, well under the runtime's queue depth (~8).
             while len(pending) > _MAX_IN_FLIGHT:
@@ -1177,6 +1213,54 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 state_dict[name] = tensor.to(target_dtype)
 
         self.load_state_dict(state_dict, strict=False, assign=True)
+        if ADALN_ON_HOST:
+            self._move_adaln_to_host()
+
+    def _move_adaln_to_host(self) -> None:
+        """Turn every block's AdaLN parameters into plain host tensors, out of `.to(device)`'s reach.
+
+        The bias stays pre-divided by TP (`_row_bias_loader`), so the all-reduce sums it back.
+        """
+        for block in self.transformer_blocks:
+            mod = block.adaln_proj
+            mod._host_weight = mod.linear_weight.detach().cpu().contiguous()
+            mod._host_bias = mod.linear_bias.detach().cpu()
+            del mod.linear_weight
+            del mod.linear_bias
+        import copy
+
+        # A float32 host copy of the (tiny) timestep MLP, taken before the pipeline moves the
+        # model to the device.
+        self._host_time_embedder = copy.deepcopy(self.time_embedder).to("cpu").float()
+        self._adaln_cache: dict[float, torch.Tensor] = {}
+
+    @torch.no_grad()
+    def adaln_host_partials(self, timestep: torch.Tensor) -> torch.Tensor:
+        """``(num_layers, num_timesteps, 18 * hidden)`` row-parallel AdaLN partials for ``timestep``.
+
+        Each distinct timestep value is evaluated once (the same `temb` as `_time_embedding`, in
+        float32 on the host) and cached, so a schedule costs one host pass per noise level.
+        """
+        values = timestep.detach().cpu().float().tolist()
+        missing = sorted({v for v in values if v not in self._adaln_cache})
+        if missing:
+            from vllm_omni_neuron.diffusion.models.minimax_h3.text_encoder import host_threads
+
+            saved = self.time_embedder
+            self.time_embedder = self._host_time_embedder
+            try:
+                with host_threads():
+                    temb = self._time_embedding(torch.tensor(missing, dtype=torch.float32))
+                    activated = F.silu(temb).to(self.transformer_blocks[0].adaln_proj._host_weight.dtype)
+                    # (num_layers, len(missing), 18 * hidden): one GEMM per block for all values.
+                    table = torch.stack(
+                        [block.adaln_proj.host_partial(activated) for block in self.transformer_blocks]
+                    )
+            finally:
+                self.time_embedder = saved
+            for index, value in enumerate(missing):
+                self._adaln_cache[value] = table[:, index].clone()
+        return torch.stack([self._adaln_cache[v] for v in values], dim=1)
 
 
 class WholeGraph(nn.Module):
