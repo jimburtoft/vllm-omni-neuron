@@ -468,6 +468,8 @@ class MiniMaxH3Pipeline(nn.Module):
             "--auto-cast=none",
             os.environ.get("MINIMAX_H3_DIT_OPT", "-O1"),
             "--hbm-scratchpad-page-size=2048",
+            # Extra DiT compiler flags for A/B runs, whitespace-separated, one token per flag.
+            *os.environ.get("MINIMAX_H3_DIT_EXTRA_FLAGS", "").split(),
         ]
         options["model_name"] = "minimax_h3_transformer"
         self._transformer_compile_kwargs = t_kwargs
