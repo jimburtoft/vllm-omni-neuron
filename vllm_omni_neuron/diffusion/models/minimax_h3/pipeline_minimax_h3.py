@@ -334,6 +334,7 @@ class MiniMaxH3Pipeline(nn.Module):
         self._transformer_compile_kwargs: dict | None = None
         self._compiled_transformer = None
         self._qwen_processor = None
+        self._pdd = None
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -372,6 +373,58 @@ class MiniMaxH3Pipeline(nn.Module):
             self.vae.load_weights(os.path.join(model, "vae"))
         if self.audio_vae is not None:
             self.audio_vae.load_weights(os.path.join(model, "audio_vae"))
+        self._pdd = None
+        pdd_path = os.environ.get("MINIMAX_H3_PDD_HEADS")
+        if pdd_path:
+            self._load_pdd_heads(pdd_path)
+
+    # ------------------------------------------------------------------
+    # PDD (Parallel Decoding Distillation, arXiv 2607.26004) few-step heads
+    # ------------------------------------------------------------------
+
+    def _load_pdd_heads(self, path: str) -> None:
+        """Load the per-interval output heads of a PDD checkpoint whose backbone LoRA has
+        already been merged into ``transformer/``.
+
+        PDD repeats ``proj_out`` / ``audio_proj_out`` once per interval of an ``N``-point
+        grid; one evaluation covers a block of ``L`` intervals with the step-size-weighted mean
+        of the block's heads. The fused head is a plain linear map, so it is formed on the host
+        each step and copied into the existing head parameters: the compiled graph is unchanged.
+        """
+        from safetensors import safe_open
+
+        with safe_open(path, "pt") as handle:
+            meta = handle.metadata()
+            heads = {key: handle.get_tensor(key).float() for key in handle.keys()}
+        num_steps, block = int(meta["pdd_num_steps"]), int(meta["pdd_block_size"])
+
+        def grid(shift: float) -> torch.Tensor:
+            sigma = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)
+            return (1.0 - shift * sigma / (1 + (shift - 1) * sigma)).diff()
+
+        self._pdd = {
+            "heads": heads,
+            "block": block,
+            "nfe": num_steps // block,
+            "video_steps": grid(float(self.scheduler._shift)),
+            "audio_steps": grid(float(self.audio_scheduler._shift)),
+        }
+        logger.info("PDD heads loaded: grid=%d block=%d nfe=%d", num_steps, block, num_steps // block)
+
+    @torch.no_grad()
+    def _arm_pdd_heads(self, step_index: int, num_evals: int) -> None:
+        pdd = self._pdd
+        if num_evals != pdd["nfe"]:
+            raise ValueError(f"PDD heads need num_inference_steps={pdd['nfe'] + 1}, got {num_evals + 1}.")
+        start, block = step_index * pdd["block"], pdd["block"]
+        for name, steps in (("proj_out", pdd["video_steps"]), ("audio_proj_out", pdd["audio_steps"])):
+            weights = steps[start : start + block]
+            weights = (weights / weights.sum()).float()
+            fused_w = torch.einsum("n,noi->oi", weights, pdd["heads"][f"{name}.weight"][start : start + block])
+            fused_b = torch.einsum("n,no->o", weights, pdd["heads"][f"{name}.bias"][start : start + block])
+            layer = getattr(self.transformer, name)
+            layer.weight.data.copy_(fused_w.to(layer.weight.dtype))
+            layer.bias.data.copy_(fused_b.to(layer.bias.dtype))
 
     # ------------------------------------------------------------------
     # Compilation
@@ -822,6 +875,8 @@ class MiniMaxH3Pipeline(nn.Module):
             adaln_partials = None
             if getattr(self.transformer, "_adaln_cache", None) is not None:
                 adaln_partials = self.transformer.adaln_host_partials(step_timesteps).to(self.device)
+            if self._pdd is not None:
+                self._arm_pdd_heads(index, timesteps.numel())
 
             noise_pred, audio_noise_pred = transformer(
                 hidden_states=latents.unsqueeze(0).to(self.device),
