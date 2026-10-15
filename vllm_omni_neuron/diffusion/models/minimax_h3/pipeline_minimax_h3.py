@@ -466,7 +466,7 @@ class MiniMaxH3Pipeline(nn.Module):
         options["compiler_args"] = [
             "--model-type=transformer",
             "--auto-cast=none",
-            "-O1",
+            os.environ.get("MINIMAX_H3_DIT_OPT", "-O1"),
             "--hbm-scratchpad-page-size=2048",
         ]
         options["model_name"] = "minimax_h3_transformer"
