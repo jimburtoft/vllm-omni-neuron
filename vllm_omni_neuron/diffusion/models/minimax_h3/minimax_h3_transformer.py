@@ -59,6 +59,7 @@ from vllm_omni_neuron.diffusion.distributed.parallel_state import (
 from vllm_omni_neuron.diffusion.models.minimax_h3 import parallel
 from vllm_omni_neuron.diffusion.models.minimax_h3.attention import (
     context_parallel_attention,
+    heads_first_attention_dmajor,
     local_attention,
 )
 
@@ -77,6 +78,18 @@ _KEEP_IN_FP32 = ("proj_in", "audio_proj_in", "time_embedder", "proj_out", "audio
 # row-parallel slice on the host once per distinct timestep value and feeds the partial sums to
 # the graph, which keeps the all-reduce. Frees 26 GB of HBM (6.5 GB/core at TP=4).
 ADALN_ON_HOST = os.environ.get("MINIMAX_H3_ADALN_ON_HOST", "0") == "1"
+
+# `MINIMAX_H3_HEADS_FIRST` (batch-1 requests): keep q/k/v heads-first `[N, S, D]` from the
+# projection through attention (`tp_out` d-major output into the O projection), so attention_cte
+# needs no relayout of its operands. `bmm` stores QKV as `[3N, H, D]` (one batched matmul);
+# `view` keeps the fused token-major matmul and transposes into the following elementwise ops.
+HEADS_FIRST = os.environ.get("MINIMAX_H3_HEADS_FIRST", "")
+if HEADS_FIRST not in ("", "bmm", "view"):
+    raise ValueError(f"MINIMAX_H3_HEADS_FIRST must be '', 'bmm' or 'view', got {HEADS_FIRST!r}")
+
+# `MINIMAX_H3_FUSED_RMSNORM=1`: RMSNorm via `torch.rms_norm` (fused lowering) instead of the
+# hand-written reduction.
+FUSED_RMSNORM = os.environ.get("MINIMAX_H3_FUSED_RMSNORM", "0") == "1"
 
 
 @dataclass
@@ -252,6 +265,12 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if FUSED_RMSNORM:
+            # `torch.rms_norm` with explicit eps and weight lowers to one fused custom call on
+            # Neuron; the hand-written form decomposes into ~17 ops.
+            return torch.rms_norm(hidden_states.float(), (hidden_states.shape[-1],), self.weight.float(), self.eps).to(
+                hidden_states.dtype
+            )
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.float()
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -274,6 +293,19 @@ def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch
     sin = sin.to(hidden_states.dtype)[None, :, None, :]
     # `tensor_split` rather than `chunk`: XLA mislowers `split` on some axes
     # (pytorch/xla#8640) and `tensor_split` takes indices, which lowers correctly.
+    x1, x2 = torch.tensor_split(hidden_states_rotary, [rotary_dim // 2], dim=-1)
+    hidden_states_rotated = torch.cat((-x2, x1), dim=-1)
+    hidden_states_rotary = hidden_states_rotary * cos + hidden_states_rotated * sin
+    return torch.cat((hidden_states_rotary, hidden_states_pass), dim=-1)
+
+
+def _apply_rotary_emb_heads_first(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """`_apply_rotary_emb` for heads-first ``(num_heads, seq_len, head_dim)``."""
+    rotary_dim = cos.shape[-1]
+    hidden_states_rotary = hidden_states[..., :rotary_dim]
+    hidden_states_pass = hidden_states[..., rotary_dim:]
+    cos = cos.to(hidden_states.dtype)[None]
+    sin = sin.to(hidden_states.dtype)[None]
     x1, x2 = torch.tensor_split(hidden_states_rotary, [rotary_dim // 2], dim=-1)
     hidden_states_rotated = torch.cat((-x2, x1), dim=-1)
     hidden_states_rotary = hidden_states_rotary * cos + hidden_states_rotated * sin
@@ -435,6 +467,8 @@ class MiniMaxH3Attention(nn.Module):
         rotary_emb=None,
         context: "_AttentionContext | None" = None,
     ) -> torch.Tensor:
+        if getattr(self, "_heads_first", False) and hidden_states.shape[0] == 1:
+            return self._forward_heads_first(hidden_states, rotary_emb, context)
         qkv = torch.matmul(hidden_states, self.qkv_proj_weight)
         query, key, value = torch.tensor_split(qkv, self.qkv_split, dim=-1)
 
@@ -462,6 +496,49 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         output = torch.matmul(attn_output.flatten(2), self.o_proj_weight)
+        if self.tp_size > 1:
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
+        return output
+
+    def relayout_for_heads_first(self) -> None:
+        """`HEADS_FIRST=bmm`: store the fused QKV weight as ``[3N, H, D]`` so one batched matmul
+        emits q/k/v already heads-first, and fold ``1/sqrt(D)`` into ``norm_q``'s weight."""
+        if HEADS_FIRST == "bmm" and hasattr(self, "qkv_proj_weight"):
+            weight = self.qkv_proj_weight.data
+            hidden = weight.shape[0]
+            heads_weight = weight.view(hidden, 3 * self.num_heads, self.head_dim).permute(1, 0, 2).contiguous()
+            del self.qkv_proj_weight
+            self.qkv_heads_weight = nn.Parameter(heads_weight, requires_grad=False)
+        with torch.no_grad():
+            self.norm_q.weight.mul_(self.scale)
+        self._scale_folded = True
+        self._heads_first = True
+
+    def _forward_heads_first(self, hidden_states, rotary_emb, context) -> torch.Tensor:
+        """Batch-1 path that keeps q/k/v heads-first ``[N, S, D]`` end to end: the attention kernel
+        reads its operands without a relayout, and writes ``[N, D, S]`` (``tp_out``), which the
+        output projection contracts over ``N * D`` directly."""
+        num_heads, head_dim = self.num_heads, self.head_dim
+        x = hidden_states[0]
+        seq = x.shape[0]
+        if HEADS_FIRST == "bmm":
+            qkv = torch.matmul(x.unsqueeze(0), self.qkv_heads_weight)  # [3N, S, D]
+        else:  # "view": token-major matmul, transposed into the elementwise ops that follow
+            qkv = torch.matmul(x, self.qkv_proj_weight).view(seq, 3 * num_heads, head_dim).transpose(0, 1)
+        query, key, value = qkv[:num_heads], qkv[num_heads : 2 * num_heads], qkv[2 * num_heads :]
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+        if not getattr(self, "_scale_folded", False):
+            query = query * self.scale
+        if rotary_emb is not None:
+            query = _apply_rotary_emb_heads_first(query, *rotary_emb)
+            key = _apply_rotary_emb_heads_first(key, *rotary_emb)
+        cp_group = context.cp_group if self.sequence_is_sharded else None
+        attn = heads_first_attention_dmajor(
+            query.contiguous(), key.contiguous(), value.contiguous(), context.key_start, context.key_end, cp_group
+        )  # [N, D, S]
+        output = torch.matmul(attn.reshape(num_heads * head_dim, seq).transpose(0, 1), self.o_proj_weight)
+        output = output.unsqueeze(0)
         if self.tp_size > 1:
             dist.all_reduce(output, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
         return output
@@ -1215,6 +1292,9 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         self.load_state_dict(state_dict, strict=False, assign=True)
         if ADALN_ON_HOST:
             self._move_adaln_to_host()
+        if HEADS_FIRST:
+            for block in self.transformer_blocks:
+                block.attn.relayout_for_heads_first()
 
     def _move_adaln_to_host(self) -> None:
         """Turn every block's AdaLN parameters into plain host tensors, out of `.to(device)`'s reach.
