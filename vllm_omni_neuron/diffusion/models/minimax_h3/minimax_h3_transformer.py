@@ -91,6 +91,38 @@ if HEADS_FIRST not in ("", "bmm", "view"):
 # hand-written reduction.
 FUSED_RMSNORM = os.environ.get("MINIMAX_H3_FUSED_RMSNORM", "0") == "1"
 
+# `MINIMAX_H3_SEQ_PARALLEL=1` (CP=1 only): Megatron-style sequence parallelism inside the TP group.
+# The residual stream is sharded over the sequence across TP ranks instead of replicated, so the
+# norms, modulation, gating and residual adds run on 1/TP of the rows; each block's two all-reduces
+# become an all-gather before the column-parallel projection and a reduce-scatter after the
+# row-parallel one (same bytes).
+SEQ_PARALLEL = os.environ.get("MINIMAX_H3_SEQ_PARALLEL", "0") == "1"
+
+
+def _sp_all_gather(x: torch.Tensor) -> torch.Tensor:
+    """``[1, S/TP, H]`` -> ``[1, S, H]`` over the TP group."""
+    _, rows, hidden = x.shape
+    out = torch.empty((rows * parallel.tp_size(), hidden), dtype=x.dtype, device=x.device)
+    dist.all_gather_into_tensor(out, x.reshape(rows, hidden), group=parallel.tp_device_group())
+    return out.reshape(1, rows * parallel.tp_size(), hidden)
+
+
+def _sp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
+    """Partial ``[1, S, H]`` -> summed ``[1, S/TP, H]`` over the TP group."""
+    _, rows, hidden = x.shape
+    out = torch.empty((rows // parallel.tp_size(), hidden), dtype=x.dtype, device=x.device)
+    dist.reduce_scatter_tensor(out, x.reshape(rows, hidden), op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
+    return out.reshape(1, rows // parallel.tp_size(), hidden)
+
+
+def _tp_reduce(output: torch.Tensor, tp_size: int, sp: bool) -> torch.Tensor:
+    if tp_size <= 1:
+        return output
+    if sp:
+        return _sp_reduce_scatter(output)
+    dist.all_reduce(output, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
+    return output
+
 
 @dataclass
 class MiniMaxH3Config:
@@ -399,12 +431,13 @@ class MiniMaxH3FeedForward(nn.Module):
         set_weight_loader(self.down_proj_weight, _row_weight_loader(inner_per_rank, tp_size))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        sp = getattr(self, "sequence_parallel", False)
+        if sp:
+            hidden_states = _sp_all_gather(hidden_states)
         value = hidden_states @ self.value_proj_weight
         gate = hidden_states @ self.gate_proj_weight
         output = (value * F.silu(gate)) @ self.down_proj_weight
-        if self.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
-        return output
+        return _tp_reduce(output, self.tp_size, sp)
 
 
 class MiniMaxH3Attention(nn.Module):
@@ -467,8 +500,11 @@ class MiniMaxH3Attention(nn.Module):
         rotary_emb=None,
         context: "_AttentionContext | None" = None,
     ) -> torch.Tensor:
+        sp = getattr(self, "sequence_parallel", False)
+        if sp:
+            hidden_states = _sp_all_gather(hidden_states)
         if getattr(self, "_heads_first", False) and hidden_states.shape[0] == 1:
-            return self._forward_heads_first(hidden_states, rotary_emb, context)
+            return _tp_reduce(self._forward_heads_first(hidden_states, rotary_emb, context), self.tp_size, sp)
         qkv = torch.matmul(hidden_states, self.qkv_proj_weight)
         query, key, value = torch.tensor_split(qkv, self.qkv_split, dim=-1)
 
@@ -496,9 +532,7 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         output = torch.matmul(attn_output.flatten(2), self.o_proj_weight)
-        if self.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
-        return output
+        return _tp_reduce(output, self.tp_size, sp)
 
     def relayout_for_heads_first(self) -> None:
         """`HEADS_FIRST=bmm`: store the fused QKV weight as ``[3N, H, D]`` so one batched matmul
@@ -538,10 +572,7 @@ class MiniMaxH3Attention(nn.Module):
             query.contiguous(), key.contiguous(), value.contiguous(), context.key_start, context.key_end, cp_group
         )  # [N, D, S]
         output = torch.matmul(attn.reshape(num_heads * head_dim, seq).transpose(0, 1), self.o_proj_weight)
-        output = output.unsqueeze(0)
-        if self.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
-        return output
+        return output.unsqueeze(0)  # partial sum; the caller reduces
 
 
 @dataclass
@@ -834,6 +865,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         register_replica_groups(tp_size=parallel.tp_size(), cp_size=self.cp_size)
         # Resolved here rather than in `forward`: a Python-side lookup Dynamo cannot trace.
         self.cp_group = get_cp_group() if self.cp_size > 1 else None
+        self._seq_parallel = SEQ_PARALLEL and self.cp_size == 1 and parallel.tp_size() > 1
         # Set by `compile_stages`; None runs (or traces) the whole forward as one graph.
         self._stage_compiler = None
 
@@ -878,6 +910,10 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 for _ in range(config.num_layers)
             ]
         )
+        if self._seq_parallel:
+            for block in self.transformer_blocks:
+                block.attn.sequence_parallel = True
+                block.ff.sequence_parallel = True
 
         # 5. Shared output norm and the two per-modality heads.
         self.norm_out = MiniMaxH3AdaLayerNormOut(
@@ -1069,6 +1105,10 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
     def _block_geometry(self, row_runs: MiniMaxH3RowRuns, key_start: torch.Tensor):
         """This rank's run spans and attention context: static geometry, computed in Python."""
         runs = row_runs.runs
+        if self._seq_parallel:
+            shard = self._sp_shard(row_runs.sequence_length)
+            runs, _ = parallel.shard_runs(runs, torch.zeros(len(runs), dtype=torch.long), shard.start, shard.end)
+            return runs, _AttentionContext(key_start=key_start, key_end=row_runs.sequence_length)
         if self.cp_size <= 1:
             return runs, _AttentionContext(key_start=key_start, key_end=row_runs.sequence_length)
         shard = parallel.sequence_shard(row_runs.sequence_length, self.cp_size, self.cp_rank)
@@ -1172,12 +1212,31 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 pad_to=shard.shard_length,
             )
 
+        if self._seq_parallel:
+            # Sequence parallelism inside TP: this rank keeps its 1/TP of the rows (and their
+            # AdaLN rows) for the block stack; the rotary tables stay whole, since attention
+            # works on the gathered sequence.
+            shard = self._sp_shard(sequence_length)
+            hidden_states = hidden_states[:, shard.start : shard.end].contiguous()
+            _, adaln_run_rows = parallel.shard_runs(runs, adaln_run_rows, shard.start, shard.end)
+
         return hidden_states, temb, adaln_run_rows, rotary_emb[0], rotary_emb[1], key_start
+
+    def _sp_shard(self, sequence_length: int):
+        shard = parallel.sequence_shard(sequence_length, parallel.tp_size(), parallel.tp_rank())
+        if shard.num_pad:
+            raise ValueError(
+                f"MINIMAX_H3_SEQ_PARALLEL needs the sequence ({sequence_length} rows) to split into "
+                f"{parallel.tp_size()} 128-aligned shards."
+            )
+        return shard
 
     def _epilogue(self, hidden_states, temb, norm_out_run_rows, row_runs: MiniMaxH3RowRuns):
         """Gather the shards (under CP), normalize the media rows and run the two output heads."""
         num_text_rows = row_runs.num_text_rows
         num_condition_rows = row_runs.num_condition_rows
+        if self._seq_parallel:
+            hidden_states = _sp_all_gather(hidden_states.contiguous())
         if self.cp_size > 1:
             # Back to full length before the output heads, so `norm_out`'s run spans stay in
             # absolute coordinates.
