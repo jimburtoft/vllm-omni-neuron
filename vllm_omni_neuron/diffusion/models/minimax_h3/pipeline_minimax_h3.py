@@ -343,6 +343,9 @@ class MiniMaxH3Pipeline(nn.Module):
         """Move every component to the target device."""
         # The conditioner stays on the host; see `text_encoder`.
         components = ["transformer", "vae"] + (["audio_vae"] if self._audio_on_neuron else [])
+        if os.environ.get("MINIMAX_H3_SWAP_FOR_DECODE", "0") == "1":
+            # The decoder is moved in around each decode instead (see `forward`).
+            components.remove("vae")
         for attr in components:
             component = getattr(self, attr, None)
             if component is not None:
@@ -1288,6 +1291,14 @@ class MiniMaxH3Pipeline(nn.Module):
         if not self._decode:
             return DiffusionOutput(output=None)
 
+        # `MINIMAX_H3_SWAP_FOR_DECODE=1` (small instances): the DiT and the 4.8 GB replicated video
+        # decoder do not fit one 24 GB core together, so the decoder lives on the host during the
+        # denoise loop and the DiT weights on the host during decode.
+        swap = os.environ.get("MINIMAX_H3_SWAP_FOR_DECODE", "0") == "1" and self.device.type != "cpu"
+        if swap:
+            with _stage("swap_in_vae"):
+                self.transformer.to("cpu")
+                self.vae.to(self.device)
         with _stage("decode_video"):
             video = self.decode_video(
                 video_rows,
@@ -1297,6 +1308,10 @@ class MiniMaxH3Pipeline(nn.Module):
                 latent_width,
                 output_type=output_type,
             )
+        if swap:
+            with _stage("swap_out_vae"):
+                self.vae.to("cpu")
+                self.transformer.to(self.device)
         with _stage("decode_audio"):
             audio = self.decode_audio(
                 audio_rows,
