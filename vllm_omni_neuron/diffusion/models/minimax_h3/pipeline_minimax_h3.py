@@ -848,6 +848,9 @@ class MiniMaxH3Pipeline(nn.Module):
         # This line is where every stage-level timing analysis finds the denoise window, so it
         # reports the steps that will actually run, not the schedule's length.
         num_steps = min(timesteps.numel(), audio_timesteps.numel())
+        if trace_steps is None and os.environ.get("MINIMAX_H3_TRACE_STEPS"):
+            # Accuracy runs: stop the schedule after N steps (the 2-step protocol of the docs).
+            trace_steps = int(os.environ["MINIMAX_H3_TRACE_STEPS"])
         if trace_steps is not None:
             num_steps = min(num_steps, trace_steps)
         logger.info(
