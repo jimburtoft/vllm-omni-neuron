@@ -108,6 +108,10 @@ FUSED_RMSNORM = os.environ.get("MINIMAX_H3_FUSED_RMSNORM", "0") == "1"
 # row run, instead of separate norm / multiply / add passes over the replicated residual stream.
 FUSED_ADALN = os.environ.get("MINIMAX_H3_FUSED_ADALN", "0") == "1"
 
+# `MINIMAX_H3_SPLIT_BLOCK=1` (per-block compile): compile each block as two graphs, the attention
+# half and the feed-forward half.
+SPLIT_BLOCK = os.environ.get("MINIMAX_H3_SPLIT_BLOCK", "0") == "1"
+
 
 def _fused_norm_modulate_runs(hidden, norm_weight, eps, shift, scale, runs, residual=None, gate=None):
     """Per run: ``Norm(residual + gate * hidden) * (w * (1 + scale)) + shift`` with the fused kernel.
@@ -857,6 +861,33 @@ class MiniMaxH3TransformerBlock(nn.Module):
             time_embed_dim=time_embed_dim, hidden_size=hidden_size
         )
 
+    def attn_half(self, hidden_states, temb, runs, run_rows, rotary_emb, context, adaln_partial=None):
+        """`MINIMAX_H3_SPLIT_BLOCK`: norm1 + modulate + attention + gated residual; returns the
+        residual stream and the reduced modulation table for `ff_half`."""
+        modulation = self.adaln_proj(temb, adaln_partial)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            tensor.index_select(0, run_rows).to(hidden_states.dtype) for tensor in modulation
+        )
+        if FUSED_ADALN:
+            norm_hidden_states = _fused_norm_modulate_runs(
+                hidden_states, self.norm1.weight, self.norm1.eps, shift_msa, scale_msa, runs
+            )
+        else:
+            norm_hidden_states = _modulate_runs(self.norm1(hidden_states), shift_msa, scale_msa, runs)
+        attn_output = self.attn(norm_hidden_states, rotary_emb, context)
+        hidden_states = hidden_states + _gate_runs(attn_output, gate_msa, runs)
+        return hidden_states, torch.stack((shift_mlp, scale_mlp, gate_mlp))
+
+    def ff_half(self, hidden_states, mlp_mod, runs):
+        shift_mlp, scale_mlp, gate_mlp = mlp_mod[0], mlp_mod[1], mlp_mod[2]
+        if FUSED_ADALN:
+            norm_hidden_states = _fused_norm_modulate_runs(
+                hidden_states, self.norm2.weight, self.norm2.eps, shift_mlp, scale_mlp, runs
+            )
+        else:
+            norm_hidden_states = _modulate_runs(self.norm2(hidden_states), shift_mlp, scale_mlp, runs)
+        return hidden_states + _gate_runs(self.ff(norm_hidden_states), gate_mlp, runs)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1203,6 +1234,12 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         self._stage_compiler = {
             "prologue": compile_fn(_Probed(self._prologue)),
             "blocks": [compile_fn(_Probed(block)) for block in self.transformer_blocks],
+            "halves": [
+                (compile_fn(_Probed(block.attn_half)), compile_fn(_Probed(block.ff_half)))
+                for block in self.transformer_blocks
+            ]
+            if SPLIT_BLOCK
+            else None,
             "epilogue": compile_fn(self._epilogue),
         }
 
@@ -1235,6 +1272,18 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         # where inside the whole graph it saves 0.2 s/step.
         runs, context = self._block_geometry(row_runs, key_start, ring=False, tp_cols=tp_cols)
         for index, block in enumerate(stages["blocks"]):
+            if stages["halves"] is not None:
+                attn_half, ff_half = stages["halves"][index]
+                partial = None if adaln_partials is None else adaln_partials[index]
+                (hidden_states, mlp_mod), probe = attn_half(
+                    hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context, partial
+                )
+                pending.append(probe)
+                hidden_states, probe = ff_half(hidden_states, mlp_mod, runs)
+                pending.append(probe)
+                while len(pending) > _MAX_IN_FLIGHT:
+                    pending.pop(0).to("cpu")
+                continue
             if adaln_partials is None:
                 hidden_states, probe = block(hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context)
             else:
