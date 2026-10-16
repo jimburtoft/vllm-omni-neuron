@@ -98,6 +98,36 @@ FUSED_RMSNORM = os.environ.get("MINIMAX_H3_FUSED_RMSNORM", "0") == "1"
 # row-parallel one (same bytes).
 SEQ_PARALLEL = os.environ.get("MINIMAX_H3_SEQ_PARALLEL", "0") == "1"
 
+# `MINIMAX_H3_FUSED_ADALN=1`: the block's RMSNorm + modulation (and the attention branch's gated
+# residual add before norm2) run as the plugin's fused `adaln_modulate` NKI kernel, one launch per
+# row run, instead of separate norm / multiply / add passes over the replicated residual stream.
+FUSED_ADALN = os.environ.get("MINIMAX_H3_FUSED_ADALN", "0") == "1"
+
+
+def _fused_norm_modulate_runs(hidden, norm_weight, eps, shift, scale, runs, residual=None, gate=None):
+    """Per run: ``Norm(residual + gate * hidden) * (w * (1 + scale)) + shift`` with the fused kernel.
+
+    Returns ``modulated`` or, with ``residual``, ``(residual_out, modulated)``.
+    """
+    from vllm_omni_neuron.diffusion.quantization.adaln_kernels import adaln_modulate
+
+    res_parts, mod_parts = [], []
+    for index, (start, end) in enumerate(runs):
+        mul = (norm_weight.float() * (1.0 + scale[index : index + 1].float())).to(hidden.dtype)
+        add = shift[index : index + 1]
+        h = hidden[:, start:end]
+        if residual is None:
+            mod_parts.append(adaln_modulate(h, mul, add, eps=eps, norm_type="rms_norm"))
+        else:
+            r, m = adaln_modulate(
+                h, mul, add, eps=eps, norm_type="rms_norm",
+                residual=residual[:, start:end], gate=gate[index : index + 1],
+            )
+            res_parts.append(r)
+            mod_parts.append(m)
+    cat = lambda parts: torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+    return cat(mod_parts) if residual is None else (cat(res_parts), cat(mod_parts))
+
 
 def _sp_all_gather(x: torch.Tensor) -> torch.Tensor:
     """``[1, S/TP, H]`` -> ``[1, S, H]`` over the TP group."""
@@ -797,6 +827,19 @@ class MiniMaxH3TransformerBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             tensor.index_select(0, run_rows).to(hidden_states.dtype) for tensor in modulation
         )
+
+        if FUSED_ADALN:
+            norm_hidden_states = _fused_norm_modulate_runs(
+                hidden_states, self.norm1.weight, self.norm1.eps, shift_msa, scale_msa, runs
+            )
+            attn_output = self.attn(norm_hidden_states, rotary_emb, context)
+            hidden_states, norm_hidden_states = _fused_norm_modulate_runs(
+                attn_output, self.norm2.weight, self.norm2.eps, shift_mlp, scale_mlp, runs,
+                residual=hidden_states, gate=gate_msa,
+            )
+            residual = hidden_states
+            ff_output = self.ff(norm_hidden_states)
+            return residual + _gate_runs(ff_output, gate_mlp, runs)
 
         residual = hidden_states
         norm_hidden_states = _modulate_runs(
