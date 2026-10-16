@@ -820,6 +820,11 @@ class MiniMaxH3Pipeline(nn.Module):
             layout, text_bucket_length(num_text, media_length, self._text_bucket_align)
         )
         runs, run_tags = order.runs(layout)
+        if os.environ.get("MINIMAX_H3_ATTN_MASK_FIRST_TILE", "0") == "1" and order.num_text_pad >= 512:
+            raise ValueError(
+                f"MINIMAX_H3_ATTN_MASK_FIRST_TILE needs the prompt padding below 512 rows, got "
+                f"{order.num_text_pad}; use text_bucket_align <= 512."
+            )
         row_runs = MiniMaxH3RowRuns(
             num_text_rows=order.num_text_rows,
             num_condition_rows=num_condition_video_rows,

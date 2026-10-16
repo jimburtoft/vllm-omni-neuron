@@ -139,10 +139,24 @@ def context_parallel_attention(query, key, value, scale, cp_group, key_start: to
     return local_attention(query, key_value[0], key_value[1], scale, key_start, key_end)
 
 
+# `MINIMAX_H3_ATTN_MASK_FIRST_TILE=1`: use the vendored copy of nkilib `attention_cte` (2.32) whose
+# sequence-packing mask is skipped for K tiles at or beyond 512. H3's key bounds are
+# ``[key_start, seqlen)`` with ``key_start`` < 512 (the prompt bucket's left padding), so only the first
+# K tile can hold masked keys; the result is bit-identical and the per-tile range_select is saved on
+# every other tile.
+_MASK_FIRST_TILE = os.environ.get("MINIMAX_H3_ATTN_MASK_FIRST_TILE", "0") == "1"
+if _MASK_FIRST_TILE:
+    from vllm_omni_neuron.kernels.nkilib.experimental.attention.attention_cte_h3 import (
+        attention_cte as _attention_cte_dmajor_impl,
+    )
+else:
+    _attention_cte_dmajor_impl = attention_cte
+
+
 @nki.jit
 def _h3_attention_kernel_dmajor(q, k, v, bound_min, bound_max):
     """`_h3_attention_kernel` with a d-major output: ``[BN, S, D]`` in, ``[BN, D, S]`` out."""
-    return attention_cte(
+    return _attention_cte_dmajor_impl(
         q=q,
         k=k,
         v=v,
