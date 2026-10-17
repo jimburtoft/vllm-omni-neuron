@@ -1583,7 +1583,9 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             logger.info("MiniMax-H3 blocks %s attend over gathered K/V; the rest over the K/V ring.", gathered)
 
         # After the ring check: the heads-first relayout folds 1/sqrt(D) into `norm_q`'s weight.
-        if HEADS_FIRST:
+        # Heads-first is a per-chip win at CP=1 (-5.6 % at TP4) but measured +13 % at TP8 x CP8, where
+        # the K/V all-gather runs on the heads-first layout; keep it to CP=1 unless forced.
+        if HEADS_FIRST and (self.cp_size == 1 or os.environ.get("MINIMAX_H3_HEADS_FIRST_CP", "0") == "1"):
             for block in self.transformer_blocks:
                 block.attn.relayout_for_heads_first()
 
