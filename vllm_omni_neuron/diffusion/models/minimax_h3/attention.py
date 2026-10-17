@@ -199,6 +199,19 @@ def heads_first_attention_dmajor(query, key, value, key_start: torch.Tensor, key
     if os.environ.get("MINIMAX_H3_ABLATE", "") == "kernel":
         # Timing ablation only (wrong numerics): no attention kernel.
         return query.transpose(1, 2) * 1.0
-    bound_min = key_start.to(torch.int32).view(1, 1, 1).expand(N, S, 1).contiguous()
+    group = int(os.environ.get("MINIMAX_H3_ATTN_HEADS_PER_CALL", "0")) or N
+    bound_min = key_start.to(torch.int32).view(1, 1, 1).expand(group, S, 1).contiguous()
     bound_max = torch.full_like(bound_min, key_end)
-    return _h3_nki_attention_dmajor(query, key, value, bound_min, bound_max)
+    if group >= N:
+        return _h3_nki_attention_dmajor(query, key, value, bound_min, bound_max)
+    # `MINIMAX_H3_ATTN_HEADS_PER_CALL`: one kernel launch per group of heads. At 37,888 rows, 2 heads
+    # per call measured 73 TF/s against 62 TF/s for all 14 in one call (less dI/dt throttling).
+    return torch.cat(
+        [
+            _h3_nki_attention_dmajor(
+                query[i : i + group], key[i : i + group], value[i : i + group], bound_min, bound_max
+            )
+            for i in range(0, N, group)
+        ],
+        dim=0,
+    )
