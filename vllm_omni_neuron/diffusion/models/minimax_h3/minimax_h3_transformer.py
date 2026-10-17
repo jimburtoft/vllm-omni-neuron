@@ -859,7 +859,8 @@ class MiniMaxH3TransformerBlock(nn.Module):
             tensor.index_select(0, run_rows).to(hidden_states.dtype) for tensor in modulation
         )
 
-        if FUSED_ADALN:
+        if FUSED_ADALN and (context.cp_group is None or os.environ.get("MINIMAX_H3_FUSED_ADALN_CP", "0") == "1"):
+            # CP=1 only by default: under CP8 the per-run launches on 4.7K-row shards measured +48 %.
             norm_hidden_states = _fused_norm_modulate_runs(
                 hidden_states, self.norm1.weight, self.norm1.eps, shift_msa, scale_msa, runs
             )
