@@ -864,7 +864,10 @@ class MiniMaxH3TransformerBlock(nn.Module):
     def attn_half(self, hidden_states, temb, runs, run_rows, rotary_emb, context, adaln_partial=None):
         """`MINIMAX_H3_SPLIT_BLOCK`: norm1 + modulate + attention + gated residual; returns the
         residual stream and the reduced modulation table for `ff_half`."""
-        modulation = self.adaln_proj(temb, adaln_partial)
+        if adaln_partial is not None:
+            modulation = self.adaln_proj.reduce(adaln_partial)
+        else:
+            modulation = self.adaln_proj(temb, context.tp_cols)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             tensor.index_select(0, run_rows).to(hidden_states.dtype) for tensor in modulation
         )
