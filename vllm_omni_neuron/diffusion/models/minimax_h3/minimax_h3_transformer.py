@@ -74,6 +74,12 @@ _RING_ATTENTION_ENV = "MINIMAX_H3_RING_ATTENTION"
 #: ``0`` keeps the block stack's rows replicated over the TP group (an A/B switch for SP).
 _SEQUENCE_PARALLEL_ENV = "MINIMAX_H3_SEQUENCE_PARALLEL"
 
+# `MINIMAX_H3_ADALN_ON_HOST=1` keeps the 50 AdaLN projections (13B parameters, ~40% of the DiT)
+# off the NeuronCores. They read only the timestep embedding, so each rank evaluates its
+# row-parallel partial on the host once per distinct timestep value and the graph keeps only the
+# TP all-reduce. Frees 26 GB of HBM (6.5 GB/core at TP=4) -- what lets TP=4 fit one trn2.3xlarge.
+ADALN_ON_HOST = os.environ.get("MINIMAX_H3_ADALN_ON_HOST", "0") == "1"
+
 # MiniMax-H3 tags every row of the packed sequence with the modality it belongs to and
 # keeps one set of AdaLN modulation parameters per (timestep, modality) pair:
 # 0 = video, 1 = text, 2 = audio.
@@ -594,6 +600,21 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
             activated = activated[:, rank * in_per_rank : (rank + 1) * in_per_rank]
         return torch.matmul(activated, self.linear_weight) + self.linear_bias
 
+    def host_partial(self, activated: torch.Tensor) -> torch.Tensor:
+        """`ADALN_ON_HOST`: this rank's partial on the host; ``activated`` is ``silu(temb)`` in the
+        projection dtype, full width."""
+        rank = parallel.tp_rank()
+        weight = self._host_weight
+        in_per_rank = weight.shape[0]
+        return torch.matmul(activated[:, rank * in_per_rank : (rank + 1) * in_per_rank], weight) + self._host_bias
+
+    def reduce(self, partial: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """`ADALN_ON_HOST`: the six modulation tensors from a host-computed partial."""
+        if self.tp_size > 1:
+            partial = partial.clone()
+            dist.all_reduce(partial, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
+        return self.split(partial)
+
     def split(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """The all-reduced projection as the six modulation tensors."""
         # `reshape`: a slice of the hoisted, concatenated projection is not contiguous.
@@ -737,7 +758,10 @@ class MiniMaxH3TransformerBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         context: _AttentionContext,
         modulation: tuple[torch.Tensor, ...] | None = None,
+        adaln_partial: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if modulation is None and adaln_partial is not None:
+            modulation = self.adaln_proj.reduce(adaln_partial)
         if modulation is None:
             modulation = self.adaln_proj(temb, context.tp_cols)
         # One row per run instead of one per sequence row: the six table lookups shrink
@@ -934,6 +958,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         sp_run_index: torch.Tensor | None = None,
         tp_cols: torch.Tensor | None = None,
         return_dict: bool = False,
+        adaln_partials: torch.Tensor | None = None,
     ):
         """Run one denoising step over the packed sequence.
 
@@ -976,14 +1001,14 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             return self._forward_staged(
                 hidden_states, audio_hidden_states, encoder_hidden_states, timestep,
                 rotary_cos, rotary_sin, adaln_run_rows, norm_out_run_rows, num_text_tokens, row_runs,
-                sp_rows, sp_run_index, tp_cols,
+                sp_rows, sp_run_index, tp_cols, adaln_partials,
             )
         return self._forward_whole(
             hidden_states=hidden_states, audio_hidden_states=audio_hidden_states,
             encoder_hidden_states=encoder_hidden_states, timestep=timestep, rotary_cos=rotary_cos,
             rotary_sin=rotary_sin, adaln_run_rows=adaln_run_rows, norm_out_run_rows=norm_out_run_rows,
             num_text_tokens=num_text_tokens, row_runs=row_runs, sp_rows=sp_rows, sp_run_index=sp_run_index,
-            tp_cols=tp_cols,
+            tp_cols=tp_cols, adaln_partials=adaln_partials,
         )
 
     def _forward_whole(
@@ -1001,6 +1026,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         sp_rows=None,
         sp_run_index=None,
         tp_cols=None,
+        adaln_partials=None,
     ):
         hidden_states, temb, adaln_run_rows, rotary_cos, rotary_sin, key_start = self._prologue(
             hidden_states, audio_hidden_states, encoder_hidden_states, timestep,
@@ -1008,7 +1034,19 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         )
         runs, context = self._block_geometry(row_runs, key_start, tp_cols=tp_cols)
         modulations = [None] * len(self.transformer_blocks)
-        if self.sequence_parallel:
+        if adaln_partials is not None:
+            # Host-computed partials (`ADALN_ON_HOST`): one all-reduce for all 50 blocks, which
+            # also keeps the TP collectives in program order under sequence parallelism.
+            num_layers = len(self.transformer_blocks)
+            reduced = adaln_partials.permute(1, 0, 2).reshape(adaln_partials.shape[1], -1).contiguous()
+            if self.tp_size > 1:
+                dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
+            width = adaln_partials.shape[-1]
+            modulations = [
+                block.adaln_proj.split(reduced[:, index * width : (index + 1) * width])
+                for index, block in zip(range(num_layers), self.transformer_blocks)
+            ]
+        elif self.sequence_parallel:
             # Every block's AdaLN projection depends on `temb` alone, so in one graph its TP
             # all-reduce is free to interleave with the blocks' SP all-gathers and
             # reduce-scatters — which, past a few blocks, corrupts the result (NaN with the ring
@@ -1062,6 +1100,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         sp_rows=None,
         sp_run_index=None,
         tp_cols=None,
+        adaln_partials=None,
     ):
         stages = self._stage_compiler
         outputs, probe = stages["prologue"](
@@ -1074,8 +1113,14 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         # ring block costs ~17 ms more than an all-gather one (2.325 vs 1.526 s/step at 37888 rows),
         # where inside the whole graph it saves 0.2 s/step.
         runs, context = self._block_geometry(row_runs, key_start, ring=False, tp_cols=tp_cols)
-        for block in stages["blocks"]:
-            hidden_states, probe = block(hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context)
+        for index, block in enumerate(stages["blocks"]):
+            if adaln_partials is None:
+                hidden_states, probe = block(hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context)
+            else:
+                hidden_states, probe = block(
+                    hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context,
+                    None, adaln_partials[index],
+                )
             pending.append(probe)
             # Keep a few launches in flight, well under the runtime's queue depth (~8).
             while len(pending) > _MAX_IN_FLIGHT:
@@ -1357,6 +1402,8 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 state_dict[name] = tensor.to(target_dtype)
 
         self.load_state_dict(state_dict, strict=False, assign=True)
+        if ADALN_ON_HOST:
+            self._move_adaln_to_host()
 
         ring = os.environ.get(_RING_ATTENTION_ENV, "1") != "0"
         for block in self.transformer_blocks:
@@ -1364,6 +1411,47 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         gathered = [index for index, block in enumerate(self.transformer_blocks) if not block.attn.use_ring]
         if self.cp_size > 1:
             logger.info("MiniMax-H3 blocks %s attend over gathered K/V; the rest over the K/V ring.", gathered)
+
+
+def _move_adaln_to_host_impl(model) -> None:
+    import copy
+
+    for block in model.transformer_blocks:
+        mod = block.adaln_proj
+        # The bias stays pre-divided by TP (`_row_bias_loader`); the all-reduce sums it back.
+        mod._host_weight = mod.linear_weight.detach().cpu().contiguous()
+        mod._host_bias = mod.linear_bias.detach().cpu()
+        del mod.linear_weight
+        del mod.linear_bias
+    # A float32 host copy of the (tiny) timestep MLP, taken before the pipeline moves the model.
+    model._host_time_embedder = copy.deepcopy(model.time_embedder).to("cpu").float()
+    model._adaln_cache = {}
+
+
+@torch.no_grad()
+def _adaln_host_partials_impl(model, timestep: torch.Tensor) -> torch.Tensor:
+    values = timestep.detach().cpu().float().tolist()
+    missing = sorted({v for v in values if v not in model._adaln_cache})
+    if missing:
+        from vllm_omni_neuron.diffusion.models.minimax_h3.text_encoder import host_threads
+
+        saved = model.time_embedder
+        model.time_embedder = model._host_time_embedder
+        try:
+            with host_threads():
+                temb = model._time_embedding(torch.tensor(missing, dtype=torch.float32))
+                activated = F.silu(temb).to(model.transformer_blocks[0].adaln_proj._host_weight.dtype)
+                # (num_layers, len(missing), 18 * hidden): one GEMM per block for all values.
+                table = torch.stack([block.adaln_proj.host_partial(activated) for block in model.transformer_blocks])
+        finally:
+            model.time_embedder = saved
+        for index, value in enumerate(missing):
+            model._adaln_cache[value] = table[:, index].clone()
+    return torch.stack([model._adaln_cache[v] for v in values], dim=1)
+
+
+NeuronMiniMaxH3Transformer3DModel._move_adaln_to_host = _move_adaln_to_host_impl
+NeuronMiniMaxH3Transformer3DModel.adaln_host_partials = _adaln_host_partials_impl
 
 
 class WholeGraph(nn.Module):

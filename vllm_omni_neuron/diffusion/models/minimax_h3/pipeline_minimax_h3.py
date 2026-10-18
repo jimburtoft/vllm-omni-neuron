@@ -881,6 +881,9 @@ class MiniMaxH3Pipeline(nn.Module):
             adaln_run_rows, _ = build_run_table_rows(runs, run_tags, timestep_indices)
             norm_out_run_rows = self._norm_out_run_rows(row_runs, timestep_indices)
 
+            adaln_partials = None
+            if getattr(self.transformer, "_adaln_cache", None) is not None:
+                adaln_partials = self.transformer.adaln_host_partials(step_timesteps).to(self.device)
             if self._pdd is not None:
                 self._arm_pdd_heads(index, timesteps.numel())
 
@@ -895,6 +898,7 @@ class MiniMaxH3Pipeline(nn.Module):
                 norm_out_run_rows=norm_out_run_rows.to(self.device),
                 num_text_tokens=num_text_tokens,
                 row_runs=row_runs,
+                adaln_partials=adaln_partials,
                 **sp_inputs,
             )
             noise_pred = noise_pred[0].detach().to(device="cpu", dtype=torch.float32)
