@@ -108,6 +108,13 @@ FUSED_RMSNORM = os.environ.get("MINIMAX_H3_FUSED_RMSNORM", "0") == "1"
 # row run, instead of separate norm / multiply / add passes over the replicated residual stream.
 FUSED_ADALN = os.environ.get("MINIMAX_H3_FUSED_ADALN", "0") == "1"
 
+# `MINIMAX_H3_LOCAL_CONSTMAX=1` (CP=1): blocks whose QK-norm gains bound their scores
+# (`ring_bound_holds`, 47 of 50) run the const-max kernel as a one-rank ring instead of
+# attention_cte: no online max, mask or P-transpose (the row sum rides MM2). Measured 134 vs 158 ms
+# per call at 14 heads x 37888 rows. Per-row Cauchy-Schwarz slack on those blocks is <= 43 nats, far
+# from the ~85-nat underflow floor. Token-major path only (not with `MINIMAX_H3_HEADS_FIRST`).
+LOCAL_CONSTMAX = os.environ.get("MINIMAX_H3_LOCAL_CONSTMAX", "0") == "1"
+
 # `MINIMAX_H3_SPLIT_BLOCK=1` (per-block compile): compile each block as two graphs, the attention
 # half and the feed-forward half.
 SPLIT_BLOCK = os.environ.get("MINIMAX_H3_SPLIT_BLOCK", "0") == "1"
@@ -572,6 +579,12 @@ class MiniMaxH3Attention(nn.Module):
         elif sharded:
             attn_output = context_parallel_attention(
                 query, key, value, self.scale, context.cp_group, context.key_start, context.key_end
+            )
+        elif LOCAL_CONSTMAX and self.use_ring and self.sequence_is_sharded and can_run_ring_attention(query):
+            # CP=1: the const-max kernel with a one-rank ring (no collective). Same per-block gate as
+            # under CP (`ring_bound_holds`); the others keep attention_cte.
+            attn_output = ring_attention(
+                query, key, value, self.scale, (), 1, context.key_start, context.key_end, 0,
             )
         else:
             attn_output = local_attention(
