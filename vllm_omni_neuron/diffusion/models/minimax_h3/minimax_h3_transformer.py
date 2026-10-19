@@ -341,6 +341,7 @@ class RMSNorm(nn.Module):
 # window went 87.6 -> 22.9 ms.
 ROPE_MATMUL = os.environ.get("MINIMAX_H3_ROPE_MATMUL", "0") == "1"
 _ROPE_MATRICES: dict = {}
+_ROPE_CHUNK_ROWS = 32768
 
 
 def _rope_matrix(head_dim: int, rotary_dim: int, dtype, device) -> torch.Tensor:
@@ -365,7 +366,13 @@ def _rope_by_matmul(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.T
     sin = torch.cat([sin, torch.zeros_like(sin[..., :1]).expand(*sin.shape[:-1], pad)], dim=-1)
     cos, sin = cos_sin_view(cos.to(hidden_states.dtype)), cos_sin_view(sin.to(hidden_states.dtype))
     rotate = _rope_matrix(head_dim, rotary_dim, hidden_states.dtype, hidden_states.device)
-    return hidden_states * cos + torch.matmul(hidden_states, rotate) * sin
+    # Rotate in row chunks of at most `_ROPE_CHUNK_ROWS`: one flat `(rows, 128) @ (128, 128)` over all
+    # heads (530K rows at TP4) overflows a uint16 access-pattern count in the backend (NCC_IBTN021).
+    flat = hidden_states.reshape(-1, head_dim)
+    rotated = torch.cat(
+        [torch.matmul(piece, rotate) for piece in torch.split(flat, _ROPE_CHUNK_ROWS, dim=0)], dim=0
+    ).reshape(hidden_states.shape)
+    return hidden_states * cos + rotated * sin
 
 
 def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
