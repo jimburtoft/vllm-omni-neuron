@@ -1071,9 +1071,9 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         # it divides), and the norms, modulation and residual run on those rows only.
         self.tp_size = parallel.tp_size()
         self.tp_rank = parallel.tp_rank()
-        self.sequence_parallel = (
-            self.tp_size > 1 and self.cp_size > 1 and os.environ.get(_SEQUENCE_PARALLEL_ENV, "1") != "0"
-        )
+        # At CP=1 opt-in (`MINIMAX_H3_SEQUENCE_PARALLEL=1`): the whole sequence is the one "shard".
+        sp_env = os.environ.get(_SEQUENCE_PARALLEL_ENV, "1" if self.cp_size > 1 else "0")
+        self.sequence_parallel = self.tp_size > 1 and sp_env != "0"
         # Set by `compile_stages`; None runs (or traces) the whole forward as one graph.
         self._stage_compiler = None
 
@@ -1399,7 +1399,10 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         """This rank's run spans and attention context: static geometry, computed in Python."""
         runs = row_runs.runs
         if self.cp_size <= 1:
-            return runs, _AttentionContext(key_start=key_start, key_end=row_runs.sequence_length)
+            return runs, _AttentionContext(
+                key_start=key_start, key_end=row_runs.sequence_length,
+                sequence_parallel=self.sequence_parallel, tp_cols=tp_cols,
+            )
         shard = parallel.sequence_shard(row_runs.sequence_length, self.cp_size, self.cp_rank)
         runs, _ = parallel.shard_runs(
             runs,
@@ -1517,6 +1520,17 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 # whose collectives the compiler schedules differently fail to rendezvous.
                 hidden_states = hidden_states.index_select(1, sp_rows)
                 adaln_run_rows = adaln_run_rows.index_select(0, sp_run_index)
+        elif self.sequence_parallel:
+            # CP=1: the one shard is the whole (128-aligned) sequence; attention gathers it back.
+            shard = parallel.sequence_shard(sequence_length, 1, 0)
+            if shard.num_pad:
+                hidden_states = _pad_rows(hidden_states, 1, sequence_length + shard.num_pad)
+                rotary_emb = tuple(_pad_rows(table, 0, sequence_length + shard.num_pad) for table in rotary_emb)
+            _, adaln_run_rows = parallel.shard_runs(
+                runs, adaln_run_rows, 0, sequence_length, pad_to=shard.shard_length
+            )
+            hidden_states = hidden_states.index_select(1, sp_rows)
+            adaln_run_rows = adaln_run_rows.index_select(0, sp_run_index)
 
         return hidden_states, temb, adaln_run_rows, rotary_emb[0], rotary_emb[1], key_start
 
@@ -1651,7 +1665,10 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         # After the ring check: the heads-first relayout folds 1/sqrt(D) into `norm_q`'s weight.
         # Heads-first is a per-chip win at CP=1 (-5.6 % at TP4) but measured +13 % at TP8 x CP8, where
         # the K/V all-gather runs on the heads-first layout; keep it to CP=1 unless forced.
-        if HEADS_FIRST and (self.cp_size == 1 or os.environ.get("MINIMAX_H3_HEADS_FIRST_CP", "0") == "1"):
+        # Not under sequence parallelism: the heads-first path has no TP row gather / scatter.
+        if HEADS_FIRST and not self.sequence_parallel and (
+            self.cp_size == 1 or os.environ.get("MINIMAX_H3_HEADS_FIRST_CP", "0") == "1"
+        ):
             for block in self.transformer_blocks:
                 block.attn.relayout_for_heads_first()
 
