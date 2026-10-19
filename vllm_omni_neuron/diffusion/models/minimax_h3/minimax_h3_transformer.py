@@ -332,6 +332,42 @@ class RMSNorm(nn.Module):
         return (hidden_states * self.weight.float()).to(input_dtype)
 
 
+# `MINIMAX_H3_ROPE_MATMUL=1`: partial rotate-half RoPE as one full-head-width expression,
+# ``x * cos' + (x @ R) * sin'`` with ``R`` the signed rotate-half permutation of the first
+# ``rotary_dim`` channels (zero on the pass-through ones) and ``cos'``/``sin'`` padded with 1/0.
+# Bit-exact vs the slice/cat form (each output is one +-x term times sin, the identity elsewhere), but
+# the compiler lowers it as a [*,128]x[128,128] TensorE matmul plus two full-width elementwise ops
+# instead of strided slices and concatenations: at 14 heads x 37888 rows (TP4) the QKV+norm+RoPE
+# window went 87.6 -> 22.9 ms.
+ROPE_MATMUL = os.environ.get("MINIMAX_H3_ROPE_MATMUL", "0") == "1"
+_ROPE_MATRICES: dict = {}
+
+
+def _rope_matrix(head_dim: int, rotary_dim: int, dtype, device) -> torch.Tensor:
+    key = (head_dim, rotary_dim, dtype, str(device))
+    mat = _ROPE_MATRICES.get(key)
+    if mat is None:
+        half = rotary_dim // 2
+        mat = torch.zeros(head_dim, head_dim)
+        index = torch.arange(half)
+        mat[index + half, index] = -1.0  # out[i]        = -x[i + half]
+        mat[index, index + half] = 1.0  # out[i + half] =  x[i]
+        mat = mat.to(dtype=dtype, device=device)
+        _ROPE_MATRICES[key] = mat
+    return mat
+
+
+def _rope_by_matmul(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cos_sin_view):
+    head_dim = hidden_states.shape[-1]
+    rotary_dim = cos.shape[-1]
+    pad = head_dim - rotary_dim
+    cos = torch.cat([cos, torch.ones_like(cos[..., :1]).expand(*cos.shape[:-1], pad)], dim=-1)
+    sin = torch.cat([sin, torch.zeros_like(sin[..., :1]).expand(*sin.shape[:-1], pad)], dim=-1)
+    cos, sin = cos_sin_view(cos.to(hidden_states.dtype)), cos_sin_view(sin.to(hidden_states.dtype))
+    rotate = _rope_matrix(head_dim, rotary_dim, hidden_states.dtype, hidden_states.device)
+    return hidden_states * cos + torch.matmul(hidden_states, rotate) * sin
+
+
 def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     """Rotate the leading ``rotary_dim`` channels of every head, pass the rest through.
 
@@ -339,6 +375,8 @@ def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch
     ``sin`` are ``(seq_len, rotary_dim)`` with ``rotary_dim = 2 * 3 * rope_freq_dim`` —
     96 of the 128 head channels for the released config.
     """
+    if ROPE_MATMUL:
+        return _rope_by_matmul(hidden_states, cos, sin, lambda t: t[None, :, None, :])
     rotary_dim = cos.shape[-1]
     hidden_states_rotary = hidden_states[..., :rotary_dim]
     hidden_states_pass = hidden_states[..., rotary_dim:]
@@ -355,6 +393,8 @@ def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch
 
 def _apply_rotary_emb_heads_first(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     """`_apply_rotary_emb` for heads-first ``(num_heads, seq_len, head_dim)``."""
+    if ROPE_MATMUL:
+        return _rope_by_matmul(hidden_states, cos, sin, lambda t: t[None])
     rotary_dim = cos.shape[-1]
     hidden_states_rotary = hidden_states[..., :rotary_dim]
     hidden_states_pass = hidden_states[..., rotary_dim:]
