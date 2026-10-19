@@ -840,8 +840,19 @@ class MiniMaxH3Pipeline(nn.Module):
             self.transformer_config.rope_freq_dim,
             self.transformer_config.rope_theta,
         )
-        rotary_cos = order.rows(rotary_cos).to(self.device)
-        rotary_sin = order.rows(rotary_sin).to(self.device)
+        rotary_cos = order.rows(rotary_cos)
+        rotary_sin = order.rows(rotary_sin)
+        if getattr(self.transformer, "rope_rotate", None) is not None:
+            # `MINIMAX_H3_ROPE_MATMUL`: pad the tables to the full head width here, once per
+            # request, and hand the device-resident rotate matrix to the blocks.
+            from vllm_omni_neuron.diffusion.models.minimax_h3.minimax_h3_transformer import rope_full_width_tables
+
+            rotary_cos, rotary_sin = rope_full_width_tables(
+                rotary_cos, rotary_sin, self.transformer.config.attention_head_dim
+            )
+            self.transformer.prepare_rope_matrix()
+        rotary_cos = rotary_cos.to(self.device)
+        rotary_sin = rotary_sin.to(self.device)
         prompt_embeds = prompt_embeds.to("cpu")
         prompt_embeds = torch.cat(
             [prompt_embeds.new_zeros((1, order.num_text_pad, prompt_embeds.shape[-1])), prompt_embeds],

@@ -341,6 +341,11 @@ class RMSNorm(nn.Module):
 # window went 87.6 -> 22.9 ms.
 ROPE_MATMUL = os.environ.get("MINIMAX_H3_ROPE_MATMUL", "0") == "1"
 _ROPE_MATRICES: dict = {}
+#: The 128x128 rotate matrix as a device constant, keyed by dtype. Filled by
+#: `NeuronMiniMaxH3Transformer3DModel.prepare_rope_matrix` from a registered buffer, so every block
+#: graph takes it as an input rather than building it from zeros + index writes.
+_ROPE_ROTATE: dict = {}
+_ROPE_ROTARY_DIM = 96
 _ROPE_CHUNK_ROWS = 32768
 
 
@@ -358,14 +363,27 @@ def _rope_matrix(head_dim: int, rotary_dim: int, dtype, device) -> torch.Tensor:
     return mat
 
 
+def rope_full_width_tables(cos: torch.Tensor, sin: torch.Tensor, head_dim: int):
+    """``(cos', sin')``: the rotary tables padded to ``head_dim`` with 1 / 0 (pass-through channels).
+
+    Built once per request by the pipeline, so no block graph rebuilds them.
+    """
+    pad = head_dim - cos.shape[-1]
+    if pad == 0:
+        return cos, sin
+    return (
+        torch.cat([cos, cos.new_ones(*cos.shape[:-1], pad)], dim=-1),
+        torch.cat([sin, sin.new_zeros(*sin.shape[:-1], pad)], dim=-1),
+    )
+
+
 def _rope_by_matmul(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cos_sin_view):
     head_dim = hidden_states.shape[-1]
-    rotary_dim = cos.shape[-1]
-    pad = head_dim - rotary_dim
-    cos = torch.cat([cos, torch.ones_like(cos[..., :1]).expand(*cos.shape[:-1], pad)], dim=-1)
-    sin = torch.cat([sin, torch.zeros_like(sin[..., :1]).expand(*sin.shape[:-1], pad)], dim=-1)
+    rotate = _ROPE_ROTATE.get(hidden_states.dtype)
+    if rotate is None:  # not prepared (e.g. CPU unit tests): build it inline
+        rotate = _rope_matrix(head_dim, _ROPE_ROTARY_DIM, hidden_states.dtype, hidden_states.device)
+    cos, sin = rope_full_width_tables(cos, sin, head_dim)  # no-op when the pipeline pre-padded them
     cos, sin = cos_sin_view(cos.to(hidden_states.dtype)), cos_sin_view(sin.to(hidden_states.dtype))
-    rotate = _rope_matrix(head_dim, rotary_dim, hidden_states.dtype, hidden_states.device)
     # Rotate in row chunks of at most `_ROPE_CHUNK_ROWS`: one flat `(rows, 128) @ (128, 128)` over all
     # heads (530K rows at TP4) overflows a uint16 access-pattern count in the backend (NCC_IBTN021).
     flat = hidden_states.reshape(-1, head_dim)
@@ -1104,6 +1122,14 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         )
 
         # 4. The block stack.
+        if ROPE_MATMUL:
+            # The rotate matrix as a model constant: moved to the device with the weights and fed to
+            # every block graph as an input (`prepare_rope_matrix`).
+            self.register_buffer(
+                "rope_rotate",
+                _rope_matrix(config.attention_head_dim, 2 * 3 * config.rope_freq_dim, torch.bfloat16, "cpu").clone(),
+                persistent=False,
+            )
         self.transformer_blocks = nn.ModuleList(
             [
                 MiniMaxH3TransformerBlock(
@@ -1710,6 +1736,13 @@ def _adaln_host_partials_impl(model, timestep: torch.Tensor) -> torch.Tensor:
     return torch.stack([model._adaln_cache[v] for v in values], dim=1)
 
 
+def _prepare_rope_matrix_impl(model) -> None:
+    """Publish the (device-resident) `rope_rotate` buffer to `_rope_by_matmul`. Call after `.to(device)`."""
+    if hasattr(model, "rope_rotate"):
+        _ROPE_ROTATE[model.rope_rotate.dtype] = model.rope_rotate
+
+
+NeuronMiniMaxH3Transformer3DModel.prepare_rope_matrix = _prepare_rope_matrix_impl
 NeuronMiniMaxH3Transformer3DModel._move_adaln_to_host = _move_adaln_to_host_impl
 NeuronMiniMaxH3Transformer3DModel.adaln_host_partials = _adaln_host_partials_impl
 
