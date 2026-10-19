@@ -939,9 +939,19 @@ class MiniMaxH3TransformerBlock(nn.Module):
             time_embed_dim=time_embed_dim, hidden_size=hidden_size
         )
 
+    def _half_modulators(self, runs, sequence_parallel):
+        if sequence_parallel:
+            # `run_rows` holds one table row per local row: broadcast over the batch.
+            return (lambda h, shift, scale: h * (1.0 + scale) + shift), (lambda h, value: h * value)
+        return (
+            (lambda h, shift, scale: _modulate_runs(h, shift, scale, runs)),
+            (lambda h, value: _gate_runs(h, value, runs)),
+        )
+
     def attn_half(self, hidden_states, temb, runs, run_rows, rotary_emb, context, adaln_partial=None):
         """`MINIMAX_H3_SPLIT_BLOCK`: norm1 + modulate + attention + gated residual; returns the
-        residual stream and the reduced modulation table for `ff_half`."""
+        residual stream and the reduced modulation table for `ff_half`. Under sequence parallelism
+        the gathered sequence then lives in only one of the two graphs at a time."""
         if adaln_partial is not None:
             modulation = self.adaln_proj.reduce(adaln_partial)
         else:
@@ -949,25 +959,28 @@ class MiniMaxH3TransformerBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             tensor.index_select(0, run_rows).to(hidden_states.dtype) for tensor in modulation
         )
-        if FUSED_ADALN:
+        sp = context.sequence_parallel
+        modulate, gate = self._half_modulators(runs, sp)
+        if FUSED_ADALN and not sp:
             norm_hidden_states = _fused_norm_modulate_runs(
                 hidden_states, self.norm1.weight, self.norm1.eps, shift_msa, scale_msa, runs
             )
         else:
-            norm_hidden_states = _modulate_runs(self.norm1(hidden_states), shift_msa, scale_msa, runs)
+            norm_hidden_states = modulate(self.norm1(hidden_states), shift_msa, scale_msa)
         attn_output = self.attn(norm_hidden_states, rotary_emb, context)
-        hidden_states = hidden_states + _gate_runs(attn_output, gate_msa, runs)
+        hidden_states = hidden_states + gate(attn_output, gate_msa)
         return hidden_states, torch.stack((shift_mlp, scale_mlp, gate_mlp))
 
-    def ff_half(self, hidden_states, mlp_mod, runs):
+    def ff_half(self, hidden_states, mlp_mod, runs, sequence_parallel=False):
         shift_mlp, scale_mlp, gate_mlp = mlp_mod[0], mlp_mod[1], mlp_mod[2]
-        if FUSED_ADALN:
+        modulate, gate = self._half_modulators(runs, sequence_parallel)
+        if FUSED_ADALN and not sequence_parallel:
             norm_hidden_states = _fused_norm_modulate_runs(
                 hidden_states, self.norm2.weight, self.norm2.eps, shift_mlp, scale_mlp, runs
             )
         else:
-            norm_hidden_states = _modulate_runs(self.norm2(hidden_states), shift_mlp, scale_mlp, runs)
-        return hidden_states + _gate_runs(self.ff(norm_hidden_states), gate_mlp, runs)
+            norm_hidden_states = modulate(self.norm2(hidden_states), shift_mlp, scale_mlp)
+        return hidden_states + gate(self.ff(norm_hidden_states, sequence_parallel), gate_mlp)
 
     def forward(
         self,
@@ -1371,7 +1384,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                     hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context, partial
                 )
                 pending.append(probe)
-                hidden_states, probe = ff_half(hidden_states, mlp_mod, runs)
+                hidden_states, probe = ff_half(hidden_states, mlp_mod, runs, context.sequence_parallel)
                 pending.append(probe)
                 while len(pending) > _MAX_IN_FLIGHT:
                     pending.pop(0).to("cpu")
