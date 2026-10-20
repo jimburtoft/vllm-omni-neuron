@@ -449,12 +449,24 @@ class _Probed(nn.Module):
     outputs stay in HBM fills its execution queue after ~8 launches.
     """
 
-    def __init__(self, fn):
+    def __init__(self, fn, probe_input: int | None = None):
         super().__init__()
         self.fn = fn
+        # Probe from this positional input instead of the first output (see below).
+        self.probe_input = probe_input
 
     def forward(self, *args):
         outputs = self.fn(*args)
+        if self.probe_input is not None:
+            # A probe that reads the graph's (large) output forces the compiler to keep that
+            # output's producer chain addressable as one flat buffer: on the sequence-parallel
+            # FFN graph (all_gather -> SwiGLU -> reduce_scatter -> gated residual, 37,888 rows at
+            # TP4) that alone is NCC_EXSP001 (27.75 GB). Reading one element of a small input
+            # still retires the execution and compiles. Same on SDK 2.32 and 2.33.
+            source = args[self.probe_input]
+            if isinstance(source, (tuple, list)):
+                source = source[0]
+            return outputs, source.reshape(-1)[:1] * 1
         first = outputs[0] if isinstance(outputs, tuple) else outputs
         return outputs, first.reshape(-1)[:1] * 1
 
@@ -1340,7 +1352,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             "prologue": compile_fn(_Probed(self._prologue)),
             "blocks": [compile_fn(_Probed(block)) for block in self.transformer_blocks],
             "halves": [
-                (compile_fn(_Probed(block.attn_half)), compile_fn(_Probed(block.ff_half)))
+                (compile_fn(_Probed(block.attn_half)), compile_fn(_Probed(block.ff_half, probe_input=1)))
                 for block in self.transformer_blocks
             ]
             if SPLIT_BLOCK
