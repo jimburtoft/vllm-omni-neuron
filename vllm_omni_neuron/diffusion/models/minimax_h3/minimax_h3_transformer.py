@@ -1031,6 +1031,13 @@ class MiniMaxH3TransformerBlock(nn.Module):
         hidden_states = hidden_states + _tp_scatter_rows(attn_partial) * gate_msa
         return hidden_states, torch.stack((shift_mlp, scale_mlp)), gate_mlp
 
+    def block_spf(self, hidden_states, temb, runs, run_rows, row_rows, rotary_emb, context, adaln_partial=None):
+        """`SP_FUSED` without `SPLIT_BLOCK`: both halves in one graph."""
+        hidden_states, mlp_mod, gate_mlp = self.attn_half_spf(
+            hidden_states, temb, runs, run_rows, row_rows, rotary_emb, context, adaln_partial
+        )
+        return self.ff_half_spf(hidden_states, mlp_mod, gate_mlp, runs)
+
     def ff_half_spf(self, hidden_states, mlp_mod, gate_mlp, runs):
         full = _tp_gather_rows(hidden_states)
         if FUSED_ADALN:
@@ -1423,7 +1430,10 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 )
                 for block in self.transformer_blocks
             ]
-            if self._sp_fused
+            if self._sp_fused and SPLIT_BLOCK
+            else None,
+            "spf_blocks": [compile_fn(_Probed(block.block_spf, probe_input=3)) for block in self.transformer_blocks]
+            if self._sp_fused and not SPLIT_BLOCK
             else None,
             "epilogue": compile_fn(self._epilogue),
         }
@@ -1458,6 +1468,16 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         # where inside the whole graph it saves 0.2 s/step.
         runs, context = self._block_geometry(row_runs, key_start, ring=False, tp_cols=tp_cols)
         for index, block in enumerate(stages["blocks"]):
+            if stages.get("spf_blocks") is not None:
+                partial = None if adaln_partials is None else adaln_partials[index]
+                hidden_states, probe = stages["spf_blocks"][index](
+                    hidden_states, temb, runs, run_level_rows, adaln_run_rows, (rotary_cos, rotary_sin),
+                    context, partial,
+                )
+                pending.append(probe)
+                while len(pending) > _MAX_IN_FLIGHT:
+                    pending.pop(0).to("cpu")
+                continue
             if stages.get("spf_halves") is not None:
                 attn_half, ff_half = stages["spf_halves"][index]
                 partial = None if adaln_partials is None else adaln_partials[index]
