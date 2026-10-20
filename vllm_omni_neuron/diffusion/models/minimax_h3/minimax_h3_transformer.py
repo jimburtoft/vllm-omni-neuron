@@ -119,6 +119,13 @@ LOCAL_CONSTMAX = os.environ.get("MINIMAX_H3_LOCAL_CONSTMAX", "0") == "1"
 # half and the feed-forward half.
 SPLIT_BLOCK = os.environ.get("MINIMAX_H3_SPLIT_BLOCK", "0") == "1"
 
+# `MINIMAX_H3_SP_FUSED=1` (CP=1, with `MINIMAX_H3_SEQUENCE_PARALLEL=1` and `MINIMAX_H3_SPLIT_BLOCK=1`):
+# sequence parallelism that keeps the CP=1 kernels. Each half all-gathers the *raw* residual rows,
+# runs the fused RMSNorm + modulate (`adaln_modulate`, per run span, identical on every rank) and the
+# heads-first attention / FFN on the full sequence, reduce-scatters the projection output, and does
+# the gated residual on this rank's 1/TP of the rows. Same collective bytes as the all-reduce path.
+SP_FUSED = os.environ.get("MINIMAX_H3_SP_FUSED", "0") == "1"
+
 
 def _fused_norm_modulate_runs(hidden, norm_weight, eps, shift, scale, runs, residual=None, gate=None):
     """Per run: ``Norm(residual + gate * hidden) * (w * (1 + scale)) + shift`` with the fused kernel.
@@ -550,6 +557,12 @@ class MiniMaxH3FeedForward(nn.Module):
         self.down_proj_weight = nn.Parameter(torch.empty(inner_per_rank, hidden_size))
         set_weight_loader(self.down_proj_weight, _row_weight_loader(inner_per_rank, tp_size))
 
+    def partial(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """`SP_FUSED`: the un-reduced output on already-gathered rows."""
+        value = hidden_states @ self.value_proj_weight
+        gate = hidden_states @ self.gate_proj_weight
+        return (value * F.silu(gate)) @ self.down_proj_weight
+
     def forward(self, hidden_states: torch.Tensor, sequence_parallel: bool = False) -> torch.Tensor:
         if sequence_parallel:
             hidden_states = _tp_gather_rows(hidden_states)
@@ -714,9 +727,19 @@ class MiniMaxH3Attention(nn.Module):
         )  # [N, D, S]
         output = torch.matmul(attn.reshape(num_heads * head_dim, seq).transpose(0, 1), self.o_proj_weight)
         output = output.unsqueeze(0)
+        if getattr(self, "_return_partial", False):
+            return output  # `SP_FUSED`: the caller reduce-scatters
         if self.tp_size > 1:
             dist.all_reduce(output, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
         return output
+
+    def heads_first_partial(self, hidden_states, rotary_emb, context) -> torch.Tensor:
+        """`SP_FUSED`: heads-first attention on already-gathered rows, un-reduced output."""
+        self._return_partial = True
+        try:
+            return self._forward_heads_first(hidden_states, rotary_emb, context)
+        finally:
+            self._return_partial = False
 
 
 @dataclass
@@ -983,6 +1006,41 @@ class MiniMaxH3TransformerBlock(nn.Module):
         hidden_states = hidden_states + gate(attn_output, gate_msa)
         return hidden_states, torch.stack((shift_mlp, scale_mlp, gate_mlp))
 
+    def attn_half_spf(self, hidden_states, temb, runs, run_rows, row_rows, rotary_emb, context, adaln_partial=None):
+        """`SP_FUSED` attention half. ``hidden_states`` is this rank's ``[1, S/TP, H]`` residual
+        shard, ``run_rows`` one table row per run (full sequence), ``row_rows`` one per local row."""
+        if adaln_partial is not None:
+            modulation = self.adaln_proj.reduce(adaln_partial)
+        else:
+            modulation = self.adaln_proj(temb, context.tp_cols)
+        shift_msa, scale_msa = (t.index_select(0, run_rows).to(hidden_states.dtype) for t in modulation[:2])
+        shift_mlp, scale_mlp = (t.index_select(0, run_rows).to(hidden_states.dtype) for t in modulation[3:5])
+        gate_msa = modulation[2].index_select(0, row_rows).to(hidden_states.dtype)
+        gate_mlp = modulation[5].index_select(0, row_rows).to(hidden_states.dtype)
+        full = _tp_gather_rows(hidden_states)
+        if FUSED_ADALN:
+            norm_hidden_states = _fused_norm_modulate_runs(
+                full, self.norm1.weight, self.norm1.eps, shift_msa, scale_msa, runs
+            )
+        else:
+            norm_hidden_states = _modulate_runs(self.norm1(full), shift_msa, scale_msa, runs)
+        if getattr(self.attn, "_heads_first", False):
+            attn_partial = self.attn.heads_first_partial(norm_hidden_states, rotary_emb, context)
+        else:
+            raise NotImplementedError("MINIMAX_H3_SP_FUSED needs MINIMAX_H3_HEADS_FIRST=bmm")
+        hidden_states = hidden_states + _tp_scatter_rows(attn_partial) * gate_msa
+        return hidden_states, torch.stack((shift_mlp, scale_mlp)), gate_mlp
+
+    def ff_half_spf(self, hidden_states, mlp_mod, gate_mlp, runs):
+        full = _tp_gather_rows(hidden_states)
+        if FUSED_ADALN:
+            norm_hidden_states = _fused_norm_modulate_runs(
+                full, self.norm2.weight, self.norm2.eps, mlp_mod[0], mlp_mod[1], runs
+            )
+        else:
+            norm_hidden_states = _modulate_runs(self.norm2(full), mlp_mod[0], mlp_mod[1], runs)
+        return hidden_states + _tp_scatter_rows(self.ff.partial(norm_hidden_states)) * gate_mlp
+
     def ff_half(self, hidden_states, mlp_mod, runs, sequence_parallel=False):
         shift_mlp, scale_mlp, gate_mlp = mlp_mod[0], mlp_mod[1], mlp_mod[2]
         modulate, gate = self._half_modulators(runs, sequence_parallel)
@@ -1117,6 +1175,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         # At CP=1 opt-in (`MINIMAX_H3_SEQUENCE_PARALLEL=1`): the whole sequence is the one "shard".
         sp_env = os.environ.get(_SEQUENCE_PARALLEL_ENV, "1" if self.cp_size > 1 else "0")
         self.sequence_parallel = self.tp_size > 1 and sp_env != "0"
+        self._sp_fused = SP_FUSED and self.sequence_parallel and self.cp_size == 1
         # Set by `compile_stages`; None runs (or traces) the whole forward as one graph.
         self._stage_compiler = None
 
@@ -1355,7 +1414,16 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 (compile_fn(_Probed(block.attn_half)), compile_fn(_Probed(block.ff_half, probe_input=1)))
                 for block in self.transformer_blocks
             ]
-            if SPLIT_BLOCK
+            if SPLIT_BLOCK and not self._sp_fused
+            else None,
+            "spf_halves": [
+                (
+                    compile_fn(_Probed(block.attn_half_spf, probe_input=3)),
+                    compile_fn(_Probed(block.ff_half_spf, probe_input=1)),
+                )
+                for block in self.transformer_blocks
+            ]
+            if self._sp_fused
             else None,
             "epilogue": compile_fn(self._epilogue),
         }
@@ -1378,6 +1446,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         adaln_partials=None,
     ):
         stages = self._stage_compiler
+        run_level_rows = adaln_run_rows
         outputs, probe = stages["prologue"](
             hidden_states, audio_hidden_states, encoder_hidden_states, timestep,
             rotary_cos, rotary_sin, adaln_run_rows, num_text_tokens, row_runs, sp_rows, sp_run_index,
@@ -1389,6 +1458,19 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         # where inside the whole graph it saves 0.2 s/step.
         runs, context = self._block_geometry(row_runs, key_start, ring=False, tp_cols=tp_cols)
         for index, block in enumerate(stages["blocks"]):
+            if stages.get("spf_halves") is not None:
+                attn_half, ff_half = stages["spf_halves"][index]
+                partial = None if adaln_partials is None else adaln_partials[index]
+                (hidden_states, mlp_mod, gate_mlp), probe = attn_half(
+                    hidden_states, temb, runs, run_level_rows, adaln_run_rows, (rotary_cos, rotary_sin),
+                    context, partial,
+                )
+                pending.append(probe)
+                hidden_states, probe = ff_half(hidden_states, mlp_mod, gate_mlp, runs)
+                pending.append(probe)
+                while len(pending) > _MAX_IN_FLIGHT:
+                    pending.pop(0).to("cpu")
+                continue
             if stages["halves"] is not None:
                 attn_half, ff_half = stages["halves"][index]
                 partial = None if adaln_partials is None else adaln_partials[index]
@@ -1717,7 +1799,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         # Heads-first is a per-chip win at CP=1 (-5.6 % at TP4) but measured +13 % at TP8 x CP8, where
         # the K/V all-gather runs on the heads-first layout; keep it to CP=1 unless forced.
         # Not under sequence parallelism: the heads-first path has no TP row gather / scatter.
-        if HEADS_FIRST and not self.sequence_parallel and (
+        if HEADS_FIRST and (not self.sequence_parallel or self._sp_fused) and (
             self.cp_size == 1 or os.environ.get("MINIMAX_H3_HEADS_FIRST_CP", "0") == "1"
         ):
             for block in self.transformer_blocks:
