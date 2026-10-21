@@ -44,6 +44,12 @@ _ATTN_MAX_BS = 512
 _ATTN_MAX_SEQLEN = 131072
 _ATTN_MAX_HEAD_DIM = 128
 
+# `MINIMAX_H3_ATTN_PSUM_BF16=1` (trn3 / NeuronCore-v4 only; the kernel rejects it on trn2): bf16
+# PSUM for attention_cte's QK^T and PV accumulators (`mm_out_dtype`), halving the bytes the row-max
+# evict and MM2 accumulate move through PSUM.
+_MM_OUT_DTYPE = nl.bfloat16 if os.environ.get("MINIMAX_H3_ATTN_PSUM_BF16", "0") == "1" else nl.float32
+
+
 #: Largest score bound (nats) a block may have to run the const-max ring kernel.
 RING_MAX_SCORE_NATS = 255.0
 
@@ -76,7 +82,7 @@ def _h3_attention_kernel(q, k, v, bound_min, bound_max):
         tp_out=False,
         cache_softmax=False,
         softmax_dtype=nl.float32,
-        mm_out_dtype=nl.float32,
+        mm_out_dtype=_MM_OUT_DTYPE,
         bound_min=bound_min,
         bound_max=bound_max,
     )
@@ -228,7 +234,7 @@ def _h3_attention_kernel_dmajor(q, k, v, bound_min, bound_max):
         tp_out=True,
         cache_softmax=False,
         softmax_dtype=nl.float32,
-        mm_out_dtype=nl.float32,
+        mm_out_dtype=_MM_OUT_DTYPE,
         bound_min=bound_min,
         bound_max=bound_max,
     )
