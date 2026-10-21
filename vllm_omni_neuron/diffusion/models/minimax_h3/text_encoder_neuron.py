@@ -291,8 +291,12 @@ class NeuronQwen3VLTextLayers(nn.Module):
                 else:
                     hidden, probe = layers[index](hidden, cos, sin)
                 probes.append(probe)
-            if position + 1 < len(chunks):
-                self._place(*chunks[position + 1], device)
+                # The Lite runtime's execution queue holds ~8 launches; retire as we go.
+                while len(probes) > _MAX_IN_FLIGHT:
+                    probes.pop(0).to("cpu")
+                if index == start and position + 1 < len(chunks):
+                    # Copy the next chunk in while this one runs.
+                    self._place(*chunks[position + 1], device)
             # A launch must be retired before the weights it reads are released.
             for probe in probes:
                 probe.to("cpu")
