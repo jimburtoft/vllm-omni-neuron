@@ -70,6 +70,7 @@ from vllm_omni_neuron.diffusion.distributed.autoencoders.autoencoder_minimax_h3_
     NeuronAutoencoderKLMiniMaxH3Audio,
 )
 from vllm_omni_neuron.diffusion.models.minimax_h3.audio_encoder import MiniMaxH3AudioEncoder
+from vllm_omni_neuron.diffusion.models.minimax_h3.decode_swap import TailEvictor, evict_blocks_setting
 from vllm_omni_neuron.diffusion.models.minimax_h3.keyframes import (
     collect_keyframes,
     fit_keyframes,
@@ -335,6 +336,9 @@ class MiniMaxH3Pipeline(nn.Module):
         self._compiled_transformer = None
         self._qwen_processor = None
         self._pdd = None
+        # `MINIMAX_H3_EVICT_BLOCKS` (see `decode_swap`): built on the first decode.
+        self._dit_evictor = None
+        self._vae_evictor = None
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -344,7 +348,7 @@ class MiniMaxH3Pipeline(nn.Module):
         """Move every component to the target device."""
         # The conditioner stays on the host; see `text_encoder`.
         components = ["transformer", "vae"] + (["audio_vae"] if self._audio_on_neuron else [])
-        if os.environ.get("MINIMAX_H3_SWAP_FOR_DECODE", "0") == "1":
+        if os.environ.get("MINIMAX_H3_SWAP_FOR_DECODE", "0") == "1" or evict_blocks_setting():
             # The decoder is moved in around each decode instead (see `forward`).
             components.remove("vae")
         for attr in components:
@@ -1313,6 +1317,10 @@ class MiniMaxH3Pipeline(nn.Module):
             )
             self.vae.use_tiling = True
 
+        if self._dit_evictor is not None and self._dit_evictor.reload_mode == "next_request":
+            # Overlap the evicted tail's copy back with the host-side prompt encode.
+            self._dit_evictor.start_prefetch()
+
         geometry = (num_latent_frames, latent_height, latent_width, num_audio_latents)
         condition_latents, audio_condition_rows = [], None
         if references:
@@ -1358,6 +1366,9 @@ class MiniMaxH3Pipeline(nn.Module):
         if audio_condition_rows is not None:
             audio_rows = torch.cat([audio_condition_rows.to(audio_rows.dtype), audio_rows])
 
+        if self._dit_evictor is not None:
+            with _stage("reload_wait"):
+                self._dit_evictor.wait()
         with _stage("denoise"):
             video_rows, audio_rows = self.denoise(
                 prompt_embeds, video_rows, audio_rows, layout, num_inference_steps
@@ -1375,7 +1386,20 @@ class MiniMaxH3Pipeline(nn.Module):
         # `MINIMAX_H3_SWAP_FOR_DECODE=1` (small instances): the DiT and the 4.8 GB replicated video
         # decoder do not fit one 24 GB core together, so the decoder lives on the host during the
         # denoise loop and the DiT weights on the host during decode.
-        swap = os.environ.get("MINIMAX_H3_SWAP_FOR_DECODE", "0") == "1" and self.device.type != "cpu"
+        evict = evict_blocks_setting() if self.device.type != "cpu" else None
+        swap = not evict and os.environ.get("MINIMAX_H3_SWAP_FOR_DECODE", "0") == "1" and self.device.type != "cpu"
+        if evict:
+            # `MINIMAX_H3_EVICT_BLOCKS`: drop the DiT tail's device storage (a host copy is kept)
+            # and bring the decoder in from its own host copy. See `decode_swap`.
+            with _stage("swap_in_vae"):
+                if self._dit_evictor is None:
+                    self._dit_evictor = TailEvictor(self.transformer, evict, self.device)
+                    self._dit_evictor.snapshot()
+                    self._vae_evictor = TailEvictor(self.vae, "all_module", self.device)
+                    self._vae_evictor.snapshot()
+                    self._vae_evictor.evict()
+                self._dit_evictor.evict()
+                self._vae_evictor.reload()
         if swap:
             with _stage("swap_in_vae"):
                 self.transformer.to("cpu")
@@ -1389,6 +1413,11 @@ class MiniMaxH3Pipeline(nn.Module):
                 latent_width,
                 output_type=output_type,
             )
+        if evict:
+            with _stage("swap_out_vae"):
+                self._vae_evictor.evict()
+                if self._dit_evictor.reload_mode == "after_decode":
+                    self._dit_evictor.reload()
         if swap:
             with _stage("swap_out_vae"):
                 self.vae.to("cpu")
