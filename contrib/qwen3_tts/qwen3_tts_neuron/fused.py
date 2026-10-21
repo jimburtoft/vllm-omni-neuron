@@ -140,7 +140,12 @@ class FusedFrame(nn.Module):
 class FusedFrameRows(FusedFrame):
     """FusedFrame with per-request (per-row) sampling parameters as graph inputs, so one compiled graph serves a
     batch that mixes greedy and sampled requests with different temperature / top-k / repetition penalty.
-    rep [B] f32 (1.0 = off), temp/topk [B] (talker), sub_temp/sub_topk [B] (code predictor)."""
+    rep [B] f32 (1.0 = off), temp/topk [B] (talker), sub_temp/sub_topk [B] (code predictor).
+    ctx: static decode context bucket (KV slots attended); compile one instance per bucket."""
+
+    def __init__(self, *a, ctx=None, **k):
+        super().__init__(*a, **k)
+        self.ctx = ctx
 
     def forward(self, h, logits, seen, allow_eos, pad_embed, pos, gumbel0, gumbel_sub, rep, temp, topk, sub_temp,
                 sub_topk):
@@ -152,7 +157,7 @@ class FusedFrameRows(FusedFrame):
         seen = seen | (self.vocab_ids.view(1, -1) == cb0.view(-1, 1))
         e0 = F.embedding(cb0.view(-1, 1), self.codec_emb)
         res, es = cp_frame_vec(self.cp, h, e0, self.vec, gumbel_sub, rows=(sub_temp, sub_topk))
-        h2, lg2 = self.bt.decode(e0 + es + pad_embed, pos)
+        h2, lg2 = self.bt.decode(e0 + es + pad_embed, pos, ctx=self.ctx)
         return h2, lg2, seen, torch.cat([cb0.view(-1, 1), res], -1)
 
 

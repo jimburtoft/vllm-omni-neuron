@@ -56,7 +56,7 @@ process from claiming the Neuron runtime).
 |---|---|---|
 | `QTTS_B` | 8 | talker batch slots (= stage-0 `max_num_seqs`); keep ≤ 16 on the lite backend |
 | `QTTS_DEV0` / `QTTS_DEV1` | 0 / 1 | logical cores for talker / code2wav |
-| `QTTS_SLOT_LEN` | 512 | per-request KV slots (prompt + frames; 12.5 frames per second of audio) |
+| `QTTS_SLOT_LEN` | 2048 | per-request KV slots = stage-0 `max_model_len` (prompt + frames; 12.5 frames per second of audio, so ~2.5 min) |
 | `QTTS_GREEDY` | 1 | force greedy decoding in the YAML |
 
 Sampling is **per request** (one compiled graph serves mixed batches). Defaults come from the deploy YAML
@@ -89,7 +89,12 @@ wavs, sr = tts.generate_voice_design(["Hello there."], instruct=["Calm female vo
 ## Known limitations
 - VoiceDesign task only (CustomVoice / Base voice clone not yet wired); non-streaming text mode only.
 - `top_p` is ignored (checkpoint default is 1.0); top-k ≤ 64.
-- Prompts up to 256 tokens; generations up to `QTTS_SLOT_LEN - prompt` frames.
+- **Long text**: prompts are prefilled in chunks (any length up to the slot), and decode attends only the used KV
+  range (context buckets `QTTS_CTX_BUCKETS`, default 256/512/1024/2048). Prompts above `QTTS_MAX_PROMPT` (400 positions,
+  ~1,000 characters of English) are rejected (HTTP 400 "did not produce audio"). The checkpoint itself degrades on very
+  long single utterances (HF reference: ~500-token prompts produce unrelated speech; greedy decoding repeats on long
+  text, sampled decoding is fine). Split long text into sentences/paragraphs (the WebSocket `/v1/audio/speech/stream`
+  endpoint has `split_granularity: "sentence"`).
 - Talker batch 32 is incorrect under libtorch-neuronx-lite (fine under torch-neuronx); use ≤ 16.
 - One talker replica per server (`num_replicas > 1` is slow); run several servers instead.
 - The stage-input processor re-sends the final chunk when an utterance ends exactly on a 25-frame boundary; the

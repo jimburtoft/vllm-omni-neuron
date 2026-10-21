@@ -45,9 +45,15 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         self.requests: dict[str, Any] = {}
         self.model_intermediate_buffer: dict[str, Any] = {}
         self.B = int(vllm_config.scheduler_config.max_num_seqs)
-        self.S = int(os.environ.get("QTTS_SLOT_LEN", "512"))
+        # KV slots per request (prompt + generated frames). Must equal stage-0 max_model_len (make_deploy sets both).
+        self.S = int(os.environ.get("QTTS_SLOT_LEN", str(getattr(vllm_config.model_config, "max_model_len", 2048))))
+        # decode attends only the first `ctx` slots, bucketed by the furthest active row (one frame graph per bucket)
+        self.ctx_buckets = sorted({min(int(x), self.S) for x in os.environ.get("QTTS_CTX_BUCKETS", "256,512,1024,2048").split(",")} | {self.S})
         self.max_new = int(os.environ.get("QTTS_MAX_NEW", str(self.S - 128)))
         self._state = None
+        # Prompts longer than this (talker positions incl. instruct + codec prefix) are rejected. Greedy HF itself
+        # derails on ~500-token prompts; 400 keeps ~1500 frames (~2 min) of slot room at S=2048.
+        self.max_prompt = int(os.environ.get("QTTS_MAX_PROMPT", "400"))
         if needs_omni_connector(self.model_config):
             self.init_omni_connectors(model_config=self.model_config)
 
@@ -70,10 +76,10 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         # sub-talker params from the stage's subtalker_sampling_params, overridable per request through
         # additional_information keys subtalker_temperature / subtalker_top_k / subtalker_dosample.
         self.fe = FusedEngine(self.eng, self.B, S=self.S, vec_cp=True, compile=False)
-        self.frame_mod = FusedFrameRows(self.eng, self.fe.bt, vec_cp=True).to(self.device)
         c = compile_fn()
         self.prefill_fn = c(self.fe.prefill)
-        self.frame_fn = c(self.frame_mod)
+        self.frame_fns = {cb: c(FusedFrameRows(self.eng, self.fe.bt, vec_cp=True, ctx=cb).to(self.device))
+                          for cb in self.ctx_buckets}
         self.noise = RowNoise(self.B, self.eng.talker.cfg.vocab, self.eng.cp.cfg.vocab, self.device,
                               base_seed=int(getattr(self.model_config, "seed", 0) or 0))
         sub = getattr(self.model_config, "subtalker_sampling_params", None) or {}
@@ -104,8 +110,10 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         pad = torch.zeros(1, 1, self.H, dtype=self.eng.dtype)
         for Tb in self.eng.prefill_buckets:
             self._prefill_slot(0, torch.zeros(1, Tb - 1, self.H, dtype=self.eng.dtype), pad)
-        self._run_frame()
+        for cb in self.ctx_buckets:  # compile every decode-context bucket
+            self._run_frame(ctx=cb)
         self._reset_slot(0)
+        self.pos.zero_()
         logger.info("[NeuronTTS] talker warmup %.1fs", time.time() - t0)
         return time.time() - t0
 
@@ -114,14 +122,16 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         self.steps[b] = 0
 
     def _prefill_slot(self, b, emb, pad):
+        """Prefill slot b with a prompt of any length (< S): full largest-bucket chunks, then one padded chunk."""
+        from ..batched import prefill_plan
         e, dev, dt, S = self.eng, self.device, self.eng.dtype, self.S
         T = emb.shape[1]
-        Tb = next(x for x in e.prefill_buckets if x >= T)
-        np_ = Tb - T
-        x = torch.zeros(1, Tb, self.H, dtype=dt); x[:, np_:] = emb.to(dt)
-        p = torch.cat([torch.arange(S - np_, S), torch.arange(T)]).long()
+        if T >= S - 2:
+            raise ValueError(f"prompt of {T} positions does not fit the {S}-slot KV cache")
         bi = torch.tensor([b], device=dev)
-        hl, lg = self.prefill_fn(x.to(dev), bi, p.to(dev))
+        for start, n, Tb, p in prefill_plan(T, e.prefill_buckets, S):
+            x = torch.zeros(1, Tb, self.H, dtype=dt); x[:, Tb - n:] = emb[:, start:start + n].to(dt)
+            hl, lg = self.prefill_fn(x.to(dev), bi, p.to(dev))
         self.h = self.h.index_copy(0, bi, hl)
         self.lg = self.lg.index_copy(0, bi, lg)
         self.seen = self.seen.index_copy(0, bi, torch.zeros(1, self.V, dtype=torch.bool, device=dev))
@@ -157,11 +167,13 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         else:  # fresh stream per request (non-reproducible), independent of the slot's previous request
             self.noise.reseed(b, int.from_bytes(os.urandom(4), "little"))
 
-    def _run_frame(self):
+    def _run_frame(self, ctx=None):
         allow = torch.tensor([s >= max(self.row_min[b], 1) for b, s in enumerate(self.steps)])
         g0, gs = self.noise.draw()
         d = self.device
-        self.h, self.lg, self.seen, codes = self.frame_fn(self.h, self.lg, self.seen, allow.to(d), self.pad,
+        need = int(self.pos.max()) + 1  # every active row writes and attends slot pos
+        ctx = ctx or next(cb for cb in self.ctx_buckets if cb >= need)
+        self.h, self.lg, self.seen, codes = self.frame_fns[ctx](self.h, self.lg, self.seen, allow.to(d), self.pad,
                                                           self.pos.to(d), g0, gs, self.row_rep.to(d),
                                                           self.row_temp.to(d), self.row_topk.to(d),
                                                           self.row_stemp.to(d), self.row_stopk.to(d))
@@ -214,9 +226,16 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
             if rid not in self.slot_of:
                 st["computed"] = st.get("computed", 0) + n
                 if st["computed"] >= st["prompt_len"]:  # full prompt scheduled -> prefill + frame 0
+                    emb, pad = self._build_prompt(st["info"])
+                    if emb.shape[1] > self.max_prompt:
+                        # Too long for one utterance: the checkpoint degrades badly here (HF reference included). Stop
+                        # immediately with EOS so the request finishes cleanly; clients should split long text.
+                        logger.warning("[NeuronTTS] rid=%s prompt %d positions > QTTS_MAX_PROMPT=%d; rejecting", rid,
+                                       emb.shape[1], self.max_prompt)
+                        emitted[rid] = (self.eos, None)
+                        continue
                     b = self.free.pop(0)
                     self.slot_of[rid] = b
-                    emb, pad = self._build_prompt(st["info"])
                     self._set_row_params(b, st.get("sp"), st["info"])
                     self._prefill_slot(b, emb, pad)
                     st["new_slot"] = True
@@ -233,7 +252,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                 b = self.slot_of[rid]
                 c = codes[b]
                 cb0 = int(c[0])
-                if int(self.pos[b]) >= self.S - 2 or self.steps[b] > self.row_max[b]:  # slot full / max_tokens
+                if int(self.pos[b]) >= self.S - 1 or self.steps[b] > self.row_max[b]:  # safety; scheduler stops at max_model_len
                     cb0 = self.eos
                 emitted[rid] = (cb0, c)
                 self.requests[rid].pop("new_slot", None)
@@ -266,7 +285,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                 inter.append(None)
                 continue
             cb0, frame = e
-            if cb0 == self.eos:
+            if cb0 == self.eos or frame is None:
                 sampled.append([self.eos])
                 inter.append({"codes.audio": torch.zeros(1, 16, dtype=torch.long),
                               "meta.codec_frame_valid": torch.tensor([False])})

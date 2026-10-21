@@ -111,3 +111,30 @@ def test_rows_frame_greedy_matches_fused(ours):
     r = rows(h, lg, seen, allow, h, pos, noise0, noises, torch.full((B,), 1.05), z, zk, z, zk)
     assert torch.equal(a[3], r[3])
     assert torch.allclose(a[1], r[1])
+
+
+def test_chunked_prefill_and_ctx_buckets(model_dir):
+    """Prompt split over small prefill buckets + decode with a context bucket == single-shot prefill + full context."""
+    from qwen3_tts_neuron.batched import BatchedTalker, prefill_plan
+    from qwen3_tts_neuron.engine import TTSEngine
+    eng = TTSEngine(model_dir, device="cpu", max_ctx=256, dtype=torch.float32, compile=False, prefill_buckets=(64,))
+    bt = BatchedTalker(eng.talker, 2, 256)
+    g = torch.Generator().manual_seed(0)
+    T = 150
+    emb = torch.randn(1, T, 2048, generator=g) * 0.05
+
+    def run(buckets, ctx):
+        for i in range(28):
+            getattr(bt, f"ck{i}").zero_(); getattr(bt, f"cv{i}").zero_()
+        b = torch.tensor([1])
+        for start, n, Tb, p in prefill_plan(T, buckets, 256):
+            x = torch.zeros(1, Tb, 2048); x[:, Tb - n:] = emb[:, start:start + n]
+            hl, lg = bt.prefill(x, b, p)
+        x1 = torch.randn(2, 1, 2048, generator=torch.Generator().manual_seed(1)) * 0.05
+        h2, lg2 = bt.decode(x1, torch.tensor([0, T]), ctx=ctx)
+        return lg, lg2[1]
+
+    a = run((256,), None)        # one shot (pads into the top slots), full context
+    c = run((32, 64), 160)       # 64+64+(22 padded to 32), context bucket 160
+    assert (a[0] - c[0]).abs().max() < 1e-4
+    assert (a[1] - c[1]).abs().max() < 1e-4

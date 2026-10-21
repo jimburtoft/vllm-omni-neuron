@@ -52,8 +52,10 @@ class BatchedTalker(nn.Module):
             self.register_buffer(f"cv{i}", torch.zeros(B * c.kv * S, c.head_dim, dtype=talker.dtype), persistent=False)
         self.register_buffer("hoff", torch.arange(c.kv), persistent=False)
 
-    def _run(self, x, rows, pos, mask, cos, sin):
-        """x [R,T,H] for rows `rows` [R] at positions pos [R,T]."""
+    def _run(self, x, rows, pos, mask, cos, sin, ctx=None):
+        """x [R,T,H] for rows `rows` [R] at positions pos [R,T]. Attention reads only the first `ctx` KV slots
+        (static; default all S) -- decode context bucketing."""
+        Sc = ctx or self.S
         R, T, _ = x.shape
         # flat write index: ((row*nkv + h)*S + pos)  ordered (r, h, t) to match k.reshape(R*nkv*T, D)
         widx = ((rows.view(R, 1, 1) * self.nkv + self.hoff.view(1, -1, 1)) * self.S + pos.view(R, 1, T)).reshape(-1)
@@ -63,8 +65,8 @@ class BatchedTalker(nn.Module):
             q, k, v = _qkv_b(l, h, cos, sin)
             ck.index_copy_(0, widx, k.reshape(-1, self.D))
             cv.index_copy_(0, widx, v.reshape(-1, self.D))
-            K = ck.view(self.B, self.nkv, self.S, self.D)
-            V = cv.view(self.B, self.nkv, self.S, self.D)
+            K = ck.view(self.B, self.nkv, self.S, self.D)[:, :, :Sc]
+            V = cv.view(self.B, self.nkv, self.S, self.D)[:, :, :Sc]
             if R != self.B:
                 K, V = K.index_select(0, rows), V.index_select(0, rows)
             o = _attn_b(l, q, K, V, mask)
@@ -81,15 +83,34 @@ class BatchedTalker(nn.Module):
         sin = self.t.sin.index_select(0, pos).unsqueeze(0)
         return self._run(x, row, pos.view(1, -1), mask, cos, sin)
 
-    def decode(self, x, pos):
-        # x [B,1,H], pos [B]
-        B = self.B
-        j = torch.arange(self.S, device=x.device)
-        mask = torch.where(j.view(1, -1) <= pos.view(-1, 1), 0.0, -1e30).to(torch.float32).view(B, 1, self.S)
+    def decode(self, x, pos, ctx=None):
+        # x [B,1,H], pos [B]; ctx: static number of KV slots to attend (all rows must have pos < ctx)
+        B, Sc = self.B, ctx or self.S
+        j = torch.arange(Sc, device=x.device)
+        mask = torch.where(j.view(1, -1) <= pos.view(-1, 1), 0.0, -1e30).to(torch.float32).view(B, 1, Sc)
         cos = self.t.cos.index_select(0, pos).view(B, 1, -1)
         sin = self.t.sin.index_select(0, pos).view(B, 1, -1)
         rows = torch.arange(B, device=x.device)
-        return self._run(x, rows, pos.view(B, 1), mask, cos, sin)
+        return self._run(x, rows, pos.view(B, 1), mask, cos, sin, ctx=Sc)
+
+
+def prefill_plan(T: int, buckets, S: int):
+    """Split a T-token prompt into prefill calls over static buckets.
+
+    Returns [(start, n, bucket, pos)] where pos is the LongTensor of KV positions for the bucket: full chunks are
+    exact; the final chunk is front-padded and its pad tokens are parked in the top KV slots [S-pad, S), which stay
+    masked (positions of real tokens are < S-pad until generation overwrites them in order)."""
+    bmax = max(buckets)
+    out, start = [], 0
+    while T - start > bmax:
+        out.append((start, bmax, bmax, torch.arange(start, start + bmax)))
+        start += bmax
+    n = T - start
+    b = next(x for x in sorted(buckets) if x >= n)
+    pad = b - n
+    pos = torch.cat([torch.arange(S - pad, S), torch.arange(start, T)]).long()
+    out.append((start, n, b, pos))
+    return out
 
 
 def cp_frame_b(cp, talker_hidden, cb0_embed):
