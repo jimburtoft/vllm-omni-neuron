@@ -306,6 +306,10 @@ class NeuronTTSARWorker(OmniWorkerMixin, WorkerBase):
 
     def init_device(self):
         neuron_runtime_env()
+        from .backports import apply as _backports
+        applied = _backports()  # before the scheduler resolves the stage-input processor (same process, created later)
+        if applied:
+            logger.info("[NeuronTTS] applied vllm-omni backports: %s", applied)
         if not cpu_mode():
             import libtorch_neuronx_lite  # noqa: F401
         self.device = torch_device()

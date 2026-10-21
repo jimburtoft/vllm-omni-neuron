@@ -50,7 +50,6 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
         self.requests: dict[str, Any] = {}
         self.model_intermediate_buffer: dict[str, Any] = {}
         self.hist: dict[str, torch.Tensor] = {}   # req -> last ctx frames [<=ctx, Q]
-        self.last_chunk: dict[str, torch.Tensor] = {}
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
         if needs_omni_connector(self.model_config):
             self.init_omni_connectors(model_config=self.model_config)
@@ -90,13 +89,6 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
         if n == 0:
             return torch.zeros(0)
         codes = torch.tensor(flat, dtype=torch.long).view(Q, n).t().contiguous()  # [F,Q]
-        last = self.last_chunk.get(rid)
-        if lctx == 0 and last is not None and last.shape == codes.shape and torch.equal(last, codes):
-            # talker2code2wav_async_chunk re-ships the final full chunk when a request ends exactly on a chunk
-            # boundary (finished flush with length % chunk == 0). Decoding it again would repeat ~2 s of audio.
-            logger.debug("[NeuronC2W] rid=%s duplicate final chunk (%d frames) skipped", rid, n)
-            return torch.zeros(0)
-        self.last_chunk[rid] = codes
         if lctx > 0:  # processor-provided context (e.g. ICL ref codes): drop it from output
             codes_new = codes[lctx:]
             prev = codes[:lctx][-self.ctx:]
@@ -126,7 +118,6 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
         for rid in scheduler_output.finished_req_ids:
             self.requests.pop(rid, None)
             self.hist.pop(rid, None)
-            self.last_chunk.pop(rid, None)
         from vllm_omni.engine.serialization import deserialize_additional_information
         ncomp = {}
         for nr in scheduler_output.scheduled_new_reqs:
@@ -184,6 +175,8 @@ class NeuronCode2WavWorker(OmniWorkerMixin, WorkerBase):
 
     def init_device(self):
         neuron_runtime_env()
+        from .backports import apply as _backports
+        _backports()
         if not cpu_mode():
             import libtorch_neuronx_lite  # noqa: F401
         self.device = torch_device()

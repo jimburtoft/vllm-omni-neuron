@@ -97,5 +97,6 @@ wavs, sr = tts.generate_voice_design(["Hello there."], instruct=["Calm female vo
   endpoint has `split_granularity: "sentence"`).
 - Talker batch 32 is incorrect under libtorch-neuronx-lite (fine under torch-neuronx); use ≤ 16.
 - One talker replica per server (`num_replicas > 1` is slow); run several servers instead.
-- The stage-input processor re-sends the final chunk when an utterance ends exactly on a 25-frame boundary; the
-  code2wav worker drops the exact repeat.
+- vllm-omni 0.29.0rc1's `talker2code2wav_async_chunk` re-sends the final chunk when an utterance ends exactly on a
+  25-frame boundary (fixed upstream on main). `qwen3_tts_neuron.serving.backports` applies the same fix at worker
+  start when the installed version lacks it.

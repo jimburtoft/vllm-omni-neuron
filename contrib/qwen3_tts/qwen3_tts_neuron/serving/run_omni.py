@@ -53,6 +53,8 @@ def main():
     audio_s = 0.0
     n = 0
     for so in omni.generate(inputs):
+        if not getattr(so, "final_output", True) or not hasattr(so.outputs[0], "multimodal_output"):
+            continue
         mm = so.outputs[0].multimodal_output
         a = mm["audio"]
         a = torch.cat(a, dim=-1) if isinstance(a, list) else a
