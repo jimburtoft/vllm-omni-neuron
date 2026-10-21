@@ -87,3 +87,27 @@ def test_code2wav(ref, ours):
     mine = ours.c2w.decode(codes)
     snr = 10 * torch.log10((hf ** 2).sum() / ((mine - hf) ** 2).sum().clamp_min(1e-20))
     assert snr > 60, float(snr)
+
+
+def test_rows_frame_greedy_matches_fused(ours):
+    """FusedFrameRows with all-greedy rows must reproduce FusedFrame (and therefore the unbatched engine) exactly."""
+    from qwen3_tts_neuron.fused import FusedFrameRows
+    fe = ours.fe
+    rows = FusedFrameRows(ours.eng, fe.bt, vec_cp=True)
+    B, V, H = fe.B, ours.eng.talker.cfg.vocab, ours.eng.talker.cfg.hidden
+    g = torch.Generator().manual_seed(0)
+    h = torch.randn(B, 1, H, generator=g) * 0.1
+    lg = torch.randn(B, V, generator=g)
+    seen = torch.zeros(B, V, dtype=torch.bool); seen[:, ::7] = True
+    allow = torch.ones(B, dtype=torch.bool); pos = torch.full((B,), 40)
+    z = torch.zeros(B); zk = torch.zeros(B, dtype=torch.long)
+    noise0 = torch.randn(B, V); noises = torch.randn(B, 15, 1, ours.eng.cp.cfg.vocab)
+    for b in range(B):  # identical KV state for both runs
+        pass
+    snap = [(getattr(fe.bt, f"ck{i}").clone(), getattr(fe.bt, f"cv{i}").clone()) for i in range(28)]
+    a = fe.ff(h, lg, seen, allow, h, pos)
+    for i, (k, v) in enumerate(snap):
+        getattr(fe.bt, f"ck{i}").copy_(k); getattr(fe.bt, f"cv{i}").copy_(v)
+    r = rows(h, lg, seen, allow, h, pos, noise0, noises, torch.full((B,), 1.05), z, zk, z, zk)
+    assert torch.equal(a[3], r[3])
+    assert torch.allclose(a[1], r[1])

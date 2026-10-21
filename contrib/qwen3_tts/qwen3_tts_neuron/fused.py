@@ -53,7 +53,27 @@ def sample_topk(logits, gumbel, temperature, top_k):
     return torch.argmax(l + gumbel, dim=-1)
 
 
-def cp_frame_vec(cp, talker_hidden, cb0_embed, vec=True, gumbel=None, temperature=0.0, top_k=0):
+TOPK_MAX = 64  # static upper bound for per-row top-k (checkpoint default 50)
+
+
+def sample_rows(logits, gumbel, temp, topk):
+    """Per-row sampling in one static graph. logits [B,...,V] f32; gumbel same shape; temp [B] f32 (<=0 -> greedy);
+    topk [B] int (0 -> full vocab, else <= TOPK_MAX). Greedy rows reduce exactly to argmax(logits)."""
+    B = logits.shape[0]
+    shape = (B,) + (1,) * (logits.dim() - 1)
+    t = temp.view(shape)
+    greedy = t <= 0
+    l = logits / torch.where(greedy, 1.0, t)
+    kmax = min(TOPK_MAX, l.shape[-1])
+    vals = torch.topk(l, kmax, dim=-1).values  # [..., kmax] descending
+    k = topk.view(shape).clamp(min=0, max=kmax)
+    kth = torch.gather(vals, -1, (torch.where(k > 0, k, kmax) - 1).long())  # value of the k-th largest
+    l = torch.where((k > 0) & (l < kth), float("-inf"), l)
+    noisy = torch.where(greedy, l, l + gumbel)
+    return torch.argmax(noisy, dim=-1)
+
+
+def cp_frame_vec(cp, talker_hidden, cb0_embed, vec=True, gumbel=None, temperature=0.0, top_k=0, rows=None):
     cfg = cp.cfg
     B, dev, L = talker_hidden.shape[0], talker_hidden.device, len(cp.layers)
     kc = [torch.zeros(B, cfg.kv, cp.S, cfg.head_dim, dtype=cp.dtype, device=dev) for _ in range(L)]
@@ -75,7 +95,10 @@ def cp_frame_vec(cp, talker_hidden, cb0_embed, vec=True, gumbel=None, temperatur
     codes, emb_sum = [], torch.zeros_like(talker_hidden)
     for g in range(cfg.groups - 1):
         lg = (h @ cp.heads[g]).float()  # [B,1,V]
-        c = sample_topk(lg, gumbel[:, g] if gumbel is not None else None, temperature, top_k)  # [B,1]
+        if rows is not None:  # per-row params (sub_temp [B], sub_topk [B])
+            c = sample_rows(lg, gumbel[:, g], rows[0], rows[1])
+        else:
+            c = sample_topk(lg, gumbel[:, g] if gumbel is not None else None, temperature, top_k)  # [B,1]
         codes.append(c)
         e = F.embedding(c, cp.embeds[g])
         emb_sum = emb_sum + e
@@ -112,6 +135,43 @@ class FusedFrame(nn.Module):
         res, es = cp_frame_vec(self.cp, h, e0, self.vec, gumbel_sub, self.sub_temperature, self.sub_top_k)
         h2, lg2 = self.bt.decode(e0 + es + pad_embed, pos)
         return h2, lg2, seen, torch.cat([cb0.view(-1, 1), res], -1)
+
+
+class FusedFrameRows(FusedFrame):
+    """FusedFrame with per-request (per-row) sampling parameters as graph inputs, so one compiled graph serves a
+    batch that mixes greedy and sampled requests with different temperature / top-k / repetition penalty.
+    rep [B] f32 (1.0 = off), temp/topk [B] (talker), sub_temp/sub_topk [B] (code predictor)."""
+
+    def forward(self, h, logits, seen, allow_eos, pad_embed, pos, gumbel0, gumbel_sub, rep, temp, topk, sub_temp,
+                sub_topk):
+        r = rep.view(-1, 1)
+        l = torch.where(seen, torch.where(logits > 0, logits / r, logits * r), logits)
+        l = l + self.ban
+        l = torch.where(self.eos_mask.view(1, -1) & ~allow_eos.view(-1, 1), float("-inf"), l)
+        cb0 = sample_rows(l, gumbel0, temp, topk)  # [B]
+        seen = seen | (self.vocab_ids.view(1, -1) == cb0.view(-1, 1))
+        e0 = F.embedding(cb0.view(-1, 1), self.codec_emb)
+        res, es = cp_frame_vec(self.cp, h, e0, self.vec, gumbel_sub, rows=(sub_temp, sub_topk))
+        h2, lg2 = self.bt.decode(e0 + es + pad_embed, pos)
+        return h2, lg2, seen, torch.cat([cb0.view(-1, 1), res], -1)
+
+
+class RowNoise:
+    """Per-slot seeded Gumbel noise. A slot reseeded with a request's seed reproduces that request's stream regardless
+    of batch composition."""
+
+    def __init__(self, B, V, Vc, device, base_seed=0):
+        self.B, self.V, self.Vc, self.device = B, V, Vc, device
+        self.gens = [torch.Generator().manual_seed(base_seed + b) for b in range(B)]
+
+    def reseed(self, b, seed):
+        self.gens[b] = torch.Generator().manual_seed(int(seed))
+
+    def draw(self):
+        g = lambda gen, *shape: -torch.log(-torch.log(torch.rand(*shape, generator=gen).clamp_(1e-10, 1.0 - 1e-7)))
+        g0 = torch.stack([g(gen, self.V) for gen in self.gens])
+        gs = torch.stack([g(gen, 15, 1, self.Vc) for gen in self.gens])
+        return g0.to(self.device), gs.to(self.device)
 
 
 class FusedEngine:

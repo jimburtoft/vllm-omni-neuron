@@ -59,8 +59,17 @@ process from claiming the Neuron runtime).
 | `QTTS_SLOT_LEN` | 512 | per-request KV slots (prompt + frames; 12.5 frames per second of audio) |
 | `QTTS_GREEDY` | 1 | force greedy decoding in the YAML |
 
-Server-side sampling (static per server for now): `QTTS_TEMPERATURE`, `QTTS_TOP_K`, `QTTS_SUB_TEMPERATURE`, `QTTS_SUB_TOP_K`
-(checkpoint defaults: 0.9 / 50 / 0.9 / 50).
+Sampling is **per request** (one compiled graph serves mixed batches). Defaults come from the deploy YAML
+(`default_sampling_params` for the talker, `subtalker_sampling_params` for the code predictor; checkpoint defaults
+T=0.9, top-k 50 for both; `QTTS_GREEDY=1` writes greedy defaults). Per request over HTTP:
+
+```json
+{"seed": 7, "max_new_tokens": 600,
+ "extra_params": {"temperature": 0.9, "top_k": 50,
+                  "subtalker_dosample": true, "subtalker_temperature": 0.9, "subtalker_top_k": 50}}
+```
+`temperature: 0` gives greedy. A request with a `seed` is reproducible regardless of what else is in the batch.
+top-k is capped at 64.
 
 ## Offline (vLLM-Omni `Omni` API)
 ```bash
@@ -79,7 +88,7 @@ wavs, sr = tts.generate_voice_design(["Hello there."], instruct=["Calm female vo
 
 ## Known limitations
 - VoiceDesign task only (CustomVoice / Base voice clone not yet wired); non-streaming text mode only.
-- Sampling parameters are per server, not per request.
+- `top_p` is ignored (checkpoint default is 1.0); top-k ≤ 64.
 - Prompts up to 256 tokens; generations up to `QTTS_SLOT_LEN - prompt` frames.
 - Talker batch 32 is incorrect under libtorch-neuronx-lite (fine under torch-neuronx); use ≤ 16.
 - One talker replica per server (`num_replicas > 1` is slow); run several servers instead.

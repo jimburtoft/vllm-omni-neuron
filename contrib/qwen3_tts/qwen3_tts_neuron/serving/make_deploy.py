@@ -4,7 +4,7 @@ import os, sys, yaml, vllm_omni
 src = os.path.join(os.path.dirname(vllm_omni.__file__), "deploy", "qwen3_tts.yaml")
 d = yaml.safe_load(open(src))
 B = int(os.environ.get("QTTS_B", "8"))
-greedy = os.environ.get("QTTS_GREEDY", "1") == "1"
+greedy = os.environ.get("QTTS_GREEDY", "0") == "1"
 d["model_runner"] = "v1"
 d.pop("platforms", None)
 s0, s1 = d["stages"]

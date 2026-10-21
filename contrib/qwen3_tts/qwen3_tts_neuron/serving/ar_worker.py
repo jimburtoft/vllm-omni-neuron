@@ -53,10 +53,9 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
 
     # ---------------------------------------------------------------- load / warmup
     def load_model(self):
-        from transformers import AutoTokenizer
-
         from ..engine import TTSEngine
-        from ..fused import FusedEngine
+        from ..fused import FusedEngine, FusedFrameRows, RowNoise
+        from ..tokenizer import TextTokenizer
 
         from ..utils import model_path
         path = model_path(self.model_config.model)
@@ -65,17 +64,25 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         t0 = time.time()
         self.eng = TTSEngine(path, device=self.device, max_ctx=self.S, dtype=dt, compile=False,
                              prefill_buckets=tuple(int(x) for x in os.environ.get("QTTS_PREFILL_BUCKETS", "64,128,256").split(",")))
-        # Sampling: stage-0 default_sampling_params (talker) + subtalker_sampling_params, read from the deploy YAML via env
-        # (set by make_deploy.py). Static per server: temperature/top-k are compiled into the frame graph.
-        t, k = float(os.environ.get("QTTS_TEMPERATURE", "0")), int(os.environ.get("QTTS_TOP_K", "0"))
-        st, sk = float(os.environ.get("QTTS_SUB_TEMPERATURE", "0")), int(os.environ.get("QTTS_SUB_TOP_K", "0"))
-        sampling = dict(temperature=t, top_k=k, sub_temperature=st, sub_top_k=sk) if (t > 0 or st > 0) else None
-        self.fe = FusedEngine(self.eng, self.B, S=self.S, vec_cp=True, compile=False, sampling=sampling,
-                              seed=int(os.environ.get("QTTS_SEED", "0")))
+        # Per-request sampling: the frame graph takes per-row temperature / top-k / repetition-penalty tensors and
+        # host-drawn per-slot Gumbel noise, so one compiled graph serves mixed greedy + sampled batches.
+        # Talker params come from each request's SamplingParams (stage-0 default_sampling_params in the deploy YAML);
+        # sub-talker params from the stage's subtalker_sampling_params, overridable per request through
+        # additional_information keys subtalker_temperature / subtalker_top_k / subtalker_dosample.
+        self.fe = FusedEngine(self.eng, self.B, S=self.S, vec_cp=True, compile=False)
+        self.frame_mod = FusedFrameRows(self.eng, self.fe.bt, vec_cp=True).to(self.device)
         c = compile_fn()
         self.prefill_fn = c(self.fe.prefill)
-        self.frame_fn = c(self.fe.frame)
-        self.tok = AutoTokenizer.from_pretrained(path)
+        self.frame_fn = c(self.frame_mod)
+        self.noise = RowNoise(self.B, self.eng.talker.cfg.vocab, self.eng.cp.cfg.vocab, self.device,
+                              base_seed=int(getattr(self.model_config, "seed", 0) or 0))
+        sub = getattr(self.model_config, "subtalker_sampling_params", None) or {}
+        self.sub_default = dict(do_sample=bool(sub.get("do_sample", True)), temperature=float(sub.get("temperature", 0.9)),
+                                top_k=int(sub.get("top_k", 50)))
+        self.row_rep = torch.ones(self.B); self.row_temp = torch.zeros(self.B); self.row_topk = torch.zeros(self.B, dtype=torch.long)
+        self.row_stemp = torch.zeros(self.B); self.row_stopk = torch.zeros(self.B, dtype=torch.long)
+        self.row_min = [2] * self.B; self.row_max = [self.S] * self.B
+        self.tok = TextTokenizer(path)
         self.eos = int(self.eng.eos)
         assert self.eos == 2150, f"unexpected codec eos {self.eos}"
         self.V = self.eng.talker.cfg.vocab
@@ -122,11 +129,42 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         self.pos[b] = T
         self.steps[b] = 0
 
+    def _set_row_params(self, b, sp, info):
+        """Bind a request's sampling parameters to slot b."""
+        from .common import info_first
+        temp = float(getattr(sp, "temperature", 0.0) or 0.0) if sp is not None else 0.0
+        topk = int(getattr(sp, "top_k", 0) or 0) if sp is not None else 0
+        if topk < 0:
+            topk = 0
+        rep = float(getattr(sp, "repetition_penalty", 1.05) or 1.0) if sp is not None else 1.05
+        self.row_temp[b], self.row_topk[b], self.row_rep[b] = temp, min(topk, 64), rep
+        ex = (getattr(sp, "extra_args", None) or {}) if sp is not None else {}
+        pick = lambda k: ex.get(k) if ex.get(k) is not None else info_first(info, k, None)
+        sd, st, sk = pick("subtalker_dosample"), pick("subtalker_temperature"), pick("subtalker_top_k")
+        do = self.sub_default["do_sample"] if sd is None else bool(sd)
+        self.row_stemp[b] = (float(st) if st is not None else self.sub_default["temperature"]) if do else 0.0
+        self.row_stopk[b] = min(int(sk) if sk is not None else self.sub_default["top_k"], 64) if do else 0
+        self.row_min[b] = int(getattr(sp, "min_tokens", 2) or 0) if sp is not None else 2
+        mt = getattr(sp, "max_tokens", None) if sp is not None else None
+        mn = info_first(info, "max_new_tokens", None)
+        lim = [x for x in (mt, mn) if x]
+        self.row_max[b] = min(lim) if lim else self.S
+        seed = getattr(sp, "seed", None) if sp is not None else None
+        if seed is None:
+            seed = ex.get("tts_local_seed")
+        if seed is not None:
+            self.noise.reseed(b, seed)
+        else:  # fresh stream per request (non-reproducible), independent of the slot's previous request
+            self.noise.reseed(b, int.from_bytes(os.urandom(4), "little"))
+
     def _run_frame(self):
-        allow = torch.tensor([s >= 2 for s in self.steps])
-        g0, gs = self.fe.noise()
-        self.h, self.lg, self.seen, codes = self.frame_fn(self.h, self.lg, self.seen, allow.to(self.device), self.pad,
-                                                          self.pos.to(self.device), g0, gs)
+        allow = torch.tensor([s >= max(self.row_min[b], 1) for b, s in enumerate(self.steps)])
+        g0, gs = self.noise.draw()
+        d = self.device
+        self.h, self.lg, self.seen, codes = self.frame_fn(self.h, self.lg, self.seen, allow.to(d), self.pad,
+                                                          self.pos.to(d), g0, gs, self.row_rep.to(d),
+                                                          self.row_temp.to(d), self.row_topk.to(d),
+                                                          self.row_stemp.to(d), self.row_stopk.to(d))
         occupied = set(self.slot_of.values())
         for b in range(self.B):
             if b in occupied:
@@ -142,8 +180,9 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         text = info_first(info, "text", "")
         instruct = info_first(info, "instruct", "") or ""
         language = info_first(info, "language", "Auto") or "Auto"
-        ids = self.tok(f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n", return_tensors="pt").input_ids
-        iids = self.tok(f"<|im_start|>user\n{instruct}<|im_end|>\n", return_tensors="pt").input_ids if instruct.strip() else None
+        from ..utils import assistant_text, instruct_text
+        ids = torch.tensor([self.tok.encode(assistant_text(text))])
+        iids = torch.tensor([self.tok.encode(instruct_text(instruct))]) if instruct.strip() else None
         with torch.no_grad():
             emb, pad = self.eng.build_prompt(ids, iids, language)
         return emb, pad
@@ -164,7 +203,8 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
             self.requests.pop(rid, None)
         for nr in scheduler_output.scheduled_new_reqs:
             self.requests[nr.req_id] = dict(info=_deser_info(nr), prompt_len=len(nr.prompt_token_ids or []),
-                                            computed=nr.num_computed_tokens, external_req_id=getattr(nr, "external_req_id", None))
+                                            computed=nr.num_computed_tokens, sp=nr.sampling_params,
+                                            external_req_id=getattr(nr, "external_req_id", None))
         emitted: dict[str, tuple[int, torch.Tensor | None]] = {}
         decode_rids = []
         for rid, n in scheduler_output.num_scheduled_tokens.items():
@@ -177,6 +217,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                     b = self.free.pop(0)
                     self.slot_of[rid] = b
                     emb, pad = self._build_prompt(st["info"])
+                    self._set_row_params(b, st.get("sp"), st["info"])
                     self._prefill_slot(b, emb, pad)
                     st["new_slot"] = True
                     n_prefill += 1
@@ -192,7 +233,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                 b = self.slot_of[rid]
                 c = codes[b]
                 cb0 = int(c[0])
-                if int(self.pos[b]) >= self.S - 2:  # KV slot full: force-stop this request
+                if int(self.pos[b]) >= self.S - 2 or self.steps[b] > self.row_max[b]:  # slot full / max_tokens
                     cb0 = self.eos
                 emitted[rid] = (cb0, c)
                 self.requests[rid].pop("new_slot", None)
