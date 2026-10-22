@@ -1336,6 +1336,20 @@ class MiniMaxH3Pipeline(nn.Module):
         else:
             with _stage("encode_prompt"):
                 prompt_embeds, token_tags = self.encode_prompt(prompt, keyframes=keyframes)
+            # Debug: `MINIMAX_H3_PROMPT_EMBEDS_OVERRIDE=none,a.pt,...` replaces request n's embeddings
+            # with file n (a tensor, or a dict holding `prompt_embeds`); `none` keeps the encoder's.
+            self._debug_request = getattr(self, "_debug_request", -1) + 1
+            overrides = os.environ.get("MINIMAX_H3_PROMPT_EMBEDS_OVERRIDE", "")
+            if overrides:
+                entries = overrides.split(",")
+                entry = entries[min(self._debug_request, len(entries) - 1)]
+                if entry and entry != "none":
+                    loaded = torch.load(entry, map_location="cpu")
+                    loaded = loaded["prompt_embeds"] if isinstance(loaded, dict) else loaded
+                    if tuple(loaded.shape) != tuple(prompt_embeds.shape):
+                        raise ValueError(f"override {entry}: {tuple(loaded.shape)} != {tuple(prompt_embeds.shape)}")
+                    prompt_embeds = loaded.to(prompt_embeds.dtype).contiguous()
+                    logger.info("H3 debug: request %d uses prompt embeddings from %s", self._debug_request, entry)
             layers = self.text_encoder.neuron_layers
             if layers is not None and getattr(layers, "_stream", 0) and _profiling_stages():
                 if not dist.is_initialized() or dist.get_rank() == 0:
@@ -1389,6 +1403,8 @@ class MiniMaxH3Pipeline(nn.Module):
             )
 
         dump = os.environ.get("MINIMAX_H3_DUMP_LATENTS")
+        if dump and "{n}" in dump:
+            dump = dump.replace("{n}", str(getattr(self, "_debug_request", 0)))
         if dump and (not dist.is_initialized() or dist.get_rank() == 0):
             torch.save(
                 {"video_rows": video_rows, "audio_rows": audio_rows, "prompt_embeds": prompt_embeds.cpu()},
