@@ -137,6 +137,7 @@ def _issue_kv_permute(cur_k, nxt_k, cur_v, nxt_v, replica_group):
     """
     if _KV_TWO_CHANNELS:
         # `MINIMAX_H3_RING_KV_CHANNELS=2`: K on channel 0 and V on channel 1 in one permute.
+        # Experimental: fails to trace for H3's CP8 replica groups on trn2 (2026-10-22); keep off.
         ncc.collective_permute_implicit(
             srcs_by_channel=[[cur_k], [cur_v]],
             dsts_by_channel=[[nxt_k], [nxt_v]],
