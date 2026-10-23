@@ -100,3 +100,16 @@ WAN22_T2V = Wan22EnvProfile()
 WAN22_I2V = Wan22EnvProfile()
 # MiniMax-H3 compiles and runs under the same settings as Wan2.2.
 MINIMAX_H3 = Wan22EnvProfile()
+
+#: MiniMax-H3 on one trn2 device (TP=4): the DiT runs as per-block graphs with AdaLN on the host,
+#: 10 blocks make room for the video decoder around each decode, and the conditioner's 50 layers
+#: stream through the device 4 at a time (docs/models/minimax-h3.md, "One device").
+MINIMAX_H3_SINGLE_DEVICE = {
+    "MINIMAX_H3_PER_BLOCK_MIN_ROWS": "0",
+    "MINIMAX_H3_ADALN_ON_HOST": "1",
+    "MINIMAX_H3_HEADS_FIRST": "bmm",
+    "MINIMAX_H3_FUSED_ADALN": "1",
+    "MINIMAX_H3_ATTN_MASK_FIRST_TILE": "1",
+    "MINIMAX_H3_EVICT_BLOCKS": "10",
+    "MINIMAX_H3_TE_STREAM": "4",
+}

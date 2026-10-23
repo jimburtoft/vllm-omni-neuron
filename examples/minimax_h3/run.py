@@ -5,6 +5,7 @@ Usage:
     python examples/minimax_h3/run.py --model-path /path/to/MiniMax-H3            # 64 cores
     python examples/minimax_h3/run.py --model-path ... --dev                      # quick smoke
     python examples/minimax_h3/run.py --model-path ... --tensor-parallel-size 8 --ring-degree 4
+    python examples/minimax_h3/run.py --model-path ... --single-device            # one trn2 device
     python examples/minimax_h3/run.py --model-path ... --image first.png [--last-image last.png]  # fl2va
     python examples/minimax_h3/run.py --model-path ... --reference image:a.png --reference video:b.mp4  # ref2va
 """
@@ -66,7 +67,17 @@ DEFAULT_PROMPT = (
     "A street busker plays a bright melody on a violin under warm evening light, "
     "passers-by slowing to listen, shallow depth of field, cinematic"
 )
+parser.add_argument(
+    "--single-device",
+    action="store_true",
+    help="One trn2 device (4 NeuronCores, e.g. a trn2.3xlarge): TP=4 and the single-device settings "
+    "(see docs/models/minimax-h3.md, 'One device'); any MINIMAX_H3_* already set wins.",
+)
 args = parser.parse_args()
+if args.single_device:
+    args.tensor_parallel_size, args.ring_degree = 4, 1
+    for name, value in env_profiles.MINIMAX_H3_SINGLE_DEVICE.items():
+        os.environ.setdefault(name, value)
 
 world_size = args.tensor_parallel_size * args.ring_degree
 env_profiles.apply(env_profiles.MINIMAX_H3, env_profiles.thread_limits(world_size))
@@ -157,6 +168,9 @@ def main():
         model_config["text_encoder_device"] = args.text_encoder_device
     if args.num_layers is not None or args.dev:
         model_config["num_layers"] = args.num_layers or 2
+    if args.single_device and not (args.image or args.last_image or args.reference):
+        # t2va only: no keyframe encoder (110M float32 parameters of HBM a single device lacks).
+        model_config["enable_keyframes"] = False
 
     # A cold compile of the DiT exceeds vllm-omni's 600 s worker handshake.
     timeout = int(os.environ.get("MINIMAX_H3_HANDSHAKE_TIMEOUT_S", "7200"))
