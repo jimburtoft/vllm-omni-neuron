@@ -31,6 +31,7 @@ import os
 import nki
 import nki.language as nl
 import torch
+import torch.nn.functional as F
 from nkilib.core.attention.attention_cte import attention_cte
 
 from vllm_omni_neuron.diffusion.models.wan2_2.wan2_2_transformer import (
@@ -122,6 +123,20 @@ def can_run_ring_attention(query: torch.Tensor) -> bool:
 
 def _torch_attend(query, key, value, scale, key_start=None, key_end=None):
     """``softmax(scale Q K^T) V`` over the keys ``[key_start, key_end)``; token-major ``[B, S, N, D]``."""
+    if query.device.type == "cpu" and query.shape[1] * key.shape[1] > (1 << 26):
+        # CPU reference path at full size: slice the keys to [key_start, key_end) (exact: the masked
+        # keys get zero weight) and run SDPA over head chunks, never materializing the S x S scores.
+        start = int(key_start.reshape(-1)[0]) if key_start is not None else 0
+        end = key_end if key_end is not None else key.shape[1]
+        q, k, v = (t.transpose(1, 2) for t in (query, key[:, start:end], value[:, start:end]))
+        out = torch.cat(
+            [
+                F.scaled_dot_product_attention(q[:, h : h + 1].float(), k[:, h : h + 1].float(), v[:, h : h + 1].float(), scale=scale)
+                for h in range(q.shape[1])
+            ],
+            dim=1,
+        )
+        return out.transpose(1, 2).to(query.dtype)
     q, k, v = (t.transpose(1, 2).float() for t in (query, key, value))
     scores = torch.matmul(q * scale, k.transpose(-2, -1))
     if key_start is not None:
