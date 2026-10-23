@@ -356,8 +356,13 @@ class MiniMaxH3Pipeline(nn.Module):
             if component is not None:
                 component.to(*args, **kwargs)
         for module in (self.text_encoder.neuron_layers, self.text_encoder.neuron_vision):
-            if module is not None:
-                module.to(*args, **kwargs)
+            if module is None:
+                continue
+            if module is self.text_encoder.neuron_layers and getattr(module, "_stream", 0):
+                # `MINIMAX_H3_TE_STREAM`: the layers stay on the host and stream through the device.
+                module.set_stream_device(self.device)
+                continue
+            module.to(*args, **kwargs)
         return self
 
     def load_weights(self, weights=None):
@@ -1331,6 +1336,15 @@ class MiniMaxH3Pipeline(nn.Module):
         else:
             with _stage("encode_prompt"):
                 prompt_embeds, token_tags = self.encode_prompt(prompt, keyframes=keyframes)
+            layers = self.text_encoder.neuron_layers
+            if layers is not None and getattr(layers, "_stream", 0) and _profiling_stages():
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    logger.info(
+                        "H3 text encoder: %d tokens, 50 layers streamed %d at a time in %.2f s.",
+                        prompt_embeds.shape[1],
+                        layers._stream,
+                        layers.last_stream_seconds,
+                    )
             with _stage("pack_layout"):
                 layout = build_packed_sequence(
                     text_token_tags=token_tags,
