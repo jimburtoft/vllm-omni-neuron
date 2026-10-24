@@ -13,6 +13,7 @@ as usual. One `--subdir` per such combination.
 
 import argparse
 import os
+import shutil
 import sys
 
 from huggingface_hub import HfApi, snapshot_download
@@ -42,12 +43,14 @@ def main():
     dirs = _dirs()
     if args.action == "pull":
         local = snapshot_download(args.repo_id, allow_patterns=[f"{args.subdir}/*"], max_workers=16)
+        if not os.path.isdir(os.path.join(local, args.subdir)):
+            sys.exit(f"{args.repo_id} has no {args.subdir}/.")
         for name, target in dirs.items():
             source = os.path.join(local, args.subdir, name)
             if not os.path.isdir(source):
                 continue
-            os.makedirs(target, exist_ok=True)
-            os.system(f"cp -rn {source}/. {target}/")
+            # The hub snapshot is relative symlinks into its blob store: copy the files, not the links.
+            shutil.copytree(source, target, symlinks=False, dirs_exist_ok=True)
             print(f"pulled {name} -> {target}")
         return
     api = HfApi()
