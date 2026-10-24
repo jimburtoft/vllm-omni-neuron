@@ -17,7 +17,7 @@ Measured warm request times (second and later requests of a running process, 29-
 | Configuration | PDD8 (8 steps) | Base (50 steps) |
 |---|---:|---:|
 | `trn2.48xlarge`, 64 cores | 14.2 s | 59.4 s |
-| `trn2.3xlarge`, 4 cores | 136 s | pending measurement |
+| `trn2.3xlarge`, 4 cores | 136 s | 765 s |
 
 ## What you need
 
@@ -41,7 +41,7 @@ requests on a fork; the branch below contains all of them, in order:
 | [whn09/vllm-omni-neuron#1](https://github.com/whn09/vllm-omni-neuron/pull/1) | PDD8 heads, AdaLN on the host, single-device attention options | single device, PDD8 |
 | [whn09/vllm-omni-neuron#2](https://github.com/whn09/vllm-omni-neuron/pull/2) | partial DiT eviction around the video decode | single device |
 | [whn09/vllm-omni-neuron#3](https://github.com/whn09/vllm-omni-neuron/pull/3) | conditioner on the NeuronCores, streamed from host memory | single device |
-| `h3-single-device` (this branch) | `run.py --single-device`, `merge_pdd.py`, `neuron_cache.py`, this README | single device |
+| `h3-single-device` (this branch) | `run.py --single-device`, `neuron_cache.py`, this README | single device |
 
 Use the branch as one unit; do not cherry-pick between the pull requests.
 
@@ -70,7 +70,7 @@ sudo swapon /swapfile
 
 ```bash
 export H3=/home/ubuntu/h3
-mkdir -p $H3/out $H3/vllm-cache $H3/nki-cache $H3/hf
+mkdir -p $H3/out $H3/neff-cache $H3/nki-cache $H3/hf
 python3 -m venv $H3/hfvenv && $H3/hfvenv/bin/pip install -q -U "huggingface_hub[hf_xet]"
 $H3/hfvenv/bin/python - <<EOF
 from huggingface_hub import snapshot_download
@@ -96,7 +96,7 @@ sudo docker run -d --name h3 $DEVICES \
   -e VLLM_NEURON_LIBTORCH_NEURONX_LITE=1 \
   -e VLLM_NEURON_DISABLE_GRAPH_CAPTURE_BACKEND=1 \
   -e HF_HOME=/workspace/hf \
-  -e VLLM_CACHE_ROOT=/workspace/vllm-cache \
+  -e TORCH_NEURONX_NEFF_CACHE_DIR=/workspace/neff-cache \
   -e NKI_COMPILE_CACHE_URL=/workspace/nki-cache \
   $IMAGE -c 'sleep infinity'
 
@@ -107,13 +107,14 @@ sudo docker exec h3 bash -c '
       "libtorch-neuronx-lite==2.11.0.1.0.2651+723ba691"'
 ```
 
-The caches under `$H3/vllm-cache` and `$H3/nki-cache` persist on the host, so restarting the
-container does not recompile.
+The compiled graphs (`$H3/neff-cache`) and NKI kernels (`$H3/nki-cache`) persist on the host, so
+restarting the container does not recompile. Without `TORCH_NEURONX_NEFF_CACHE_DIR` the graphs go to
+`/tmp/neff_cache` inside the container and are lost with it.
 
 ## 5. (PDD8 only) Merge the LoRA
 
 ```bash
-sudo docker exec h3 python plugin/examples/minimax_h3/merge_pdd.py \
+sudo docker exec h3 python plugin/examples/minimax_h3/tools/merge_fewstep_lora.py pdd \
   /workspace/MiniMax-H3 /workspace/pdd/MiniMax-H3-FL2VA-Acc-8Step.safetensors /workspace/MiniMax-H3-PDD8
 ```
 

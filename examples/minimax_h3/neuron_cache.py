@@ -4,8 +4,8 @@
     python examples/minimax_h3/neuron_cache.py pull <repo_id> [--subdir trn2-tp4-1344x768-124f]
     python examples/minimax_h3/neuron_cache.py push <repo_id> [--subdir ...]
 
-The caches are `$VLLM_CACHE_ROOT/neuron/compile_cache` (the DiT, conditioner and decoder NEFFs) and
-`$NKI_COMPILE_CACHE_URL` (the NKI kernels). Both are keyed on the traced graph and the compiler
+The caches are `$TORCH_NEURONX_NEFF_CACHE_DIR` (default `/tmp/neff_cache`: the DiT, conditioner and
+decoder NEFFs) and `$NKI_COMPILE_CACHE_URL` (the NKI kernels). Both are keyed on the traced graph and the compiler
 arguments, so a pulled cache only hits for the same plugin commit, the same SDK image, the same
 parallel layout and the same geometry (canvas, frame count, prompt-length bucket); a miss compiles
 as usual. One `--subdir` per such combination.
@@ -19,11 +19,17 @@ from huggingface_hub import HfApi, snapshot_download
 
 
 def _dirs():
-    vllm = os.environ.get("VLLM_CACHE_ROOT")
+    # The native backend (`neuron_native_lite`, what this pipeline compiles with) writes its NEFFs to
+    # TORCH_NEURONX_NEFF_CACHE_DIR, default /tmp/neff_cache; VLLM_CACHE_ROOT holds only the
+    # neuron_libtorch backend's cache, which this pipeline does not use.
     nki = os.environ.get("NKI_COMPILE_CACHE_URL")
-    if not vllm or not nki:
-        sys.exit("Set VLLM_CACHE_ROOT and NKI_COMPILE_CACHE_URL first (the run uses the same values).")
-    return {"compile_cache": os.path.join(vllm, "neuron", "compile_cache"), "nki": nki}
+    if not nki:
+        sys.exit("Set NKI_COMPILE_CACHE_URL first (the run uses the same value).")
+    dirs = {"neff": os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR", "/tmp/neff_cache"), "nki": nki}
+    vllm = os.environ.get("VLLM_CACHE_ROOT")
+    if vllm:
+        dirs["compile_cache"] = os.path.join(vllm, "neuron", "compile_cache")
+    return dirs
 
 
 def main():
@@ -50,7 +56,7 @@ def main():
         if os.path.isdir(source):
             api.upload_folder(
                 repo_id=args.repo_id, folder_path=source, path_in_repo=f"{args.subdir}/{name}",
-                ignore_patterns=["*.lock", "locks/*"],
+                ignore_patterns=["*.lock", "locks/*", "*.tmp"],
             )
             print(f"pushed {source} -> {args.repo_id}/{args.subdir}/{name}")
 
