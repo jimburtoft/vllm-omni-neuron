@@ -17,7 +17,7 @@ Measured warm request times (second and later requests of a running process, 29-
 | Configuration | PDD8 (8 steps) | Base (50 steps) |
 |---|---:|---:|
 | `trn2.48xlarge`, 64 cores | 14.2 s | 59.4 s |
-| `trn2.3xlarge`, 4 cores | 136 s | 765 s |
+| `trn2.3xlarge`, 4 cores | 130 s (up to ~285 s, see "Memory") | 765 s |
 
 ## What you need
 
@@ -172,8 +172,9 @@ The first request on a new instance compiles the model's graphs for that canvas 
 
 | | `trn2.48xlarge` | `trn2.3xlarge` |
 |---|---:|---:|
-| First request (compile + load) | ~12 min | ~35 min |
-| Second request (one-time graph load) | normal | +~8 min |
+| First request, nothing cached | ~12 min | ~45 min |
+| First request, cache pulled from Hugging Face | — | ~30 min (graph loading; no compile) |
+| Second request (one-time graph load) | normal | +~2–8 min |
 | Later requests | warm times above | warm times above |
 
 Run requests from one long-lived process (`--repeat`, several `--prompt`s, or your own loop around
@@ -217,10 +218,12 @@ Other variables:
 
 ## Memory on a `trn2.3xlarge`
 
-Device memory peaks at 22.6 GiB of 24 GiB per NeuronCore. Host memory holds about 75 GB of weight
-copies (the streamed text encoder and the evicted DiT blocks) next to the process itself, so other
-large processes on the same host will push it into swap and slow requests down. Run one generation
-process per `trn2.3xlarge`.
+Device memory peaks at 22.6 GiB of 24 GiB per NeuronCore. On the host, the process needs more than
+the instance's 124 GB: about 75 GB of weight copies (the streamed text encoder and the evicted DiT
+blocks) plus the four workers, so part of it lives in swap. When the text encoder's host copy has
+been swapped out, that request's prompt encoding takes 1-5 minutes instead of ~3.6 s; in our runs
+this happened on some warm requests (130 s typical, 284 s worst). Do not run anything else large on
+the same host, and run one generation process per `trn2.3xlarge`.
 
 ## Troubleshooting
 
