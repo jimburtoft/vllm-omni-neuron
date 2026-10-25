@@ -48,7 +48,7 @@ def evict_blocks_setting() -> str | None:
 class TailEvictor:
     """Evict the last ``k`` transformer blocks to a pinned host copy and bring them back."""
 
-    def __init__(self, transformer: nn.Module, setting: str, device: torch.device):
+    def __init__(self, transformer: nn.Module, setting: str, device: torch.device, map_key: str | None = None):
         if setting == "all_module":
             # The whole of ``transformer`` (any module, e.g. the video decoder).
             self.modules = [transformer]
@@ -75,6 +75,9 @@ class TailEvictor:
         self.last_reload_seconds = 0.0
         self.last_wait_seconds = 0.0
         self.host_bytes = 0
+        # `MINIMAX_H3_HOST_WEIGHTS_DIR`: the host copy as a file mapping, under this key (ranks with
+        # identical copies pass the same key and share one file).
+        self.map_key = map_key
 
     def _slots(self) -> list[tuple[nn.Module, str, bool]]:
         """``(owner, name, is_parameter)`` for every parameter and buffer of the evicted modules."""
@@ -113,6 +116,13 @@ class TailEvictor:
                 except RuntimeError:
                     pass
             self._host[(id(owner), name)] = host
+        from vllm_omni_neuron.diffusion.models.minimax_h3.host_weights import host_weights_dir, to_mapped
+
+        directory = host_weights_dir()
+        if directory and self.map_key and not pin:
+            # Keys of `_host` are (id(owner), name): stable within the process, and the file layout
+            # only depends on their order, which `_slots` fixes.
+            self._host = to_mapped(self._host, self.map_key, directory)
         self.host_bytes = sum(h.numel() * h.element_size() for h in self._host.values())
         logger.info(
             "MiniMax-H3 decode swap: %d tensors from block %d on (%.2f GB per rank) kept on the host.",

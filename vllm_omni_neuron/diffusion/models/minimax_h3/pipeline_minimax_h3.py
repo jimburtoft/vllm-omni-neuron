@@ -1407,9 +1407,14 @@ class MiniMaxH3Pipeline(nn.Module):
             # and bring the decoder in from its own host copy. See `decode_swap`.
             with _stage("swap_in_vae"):
                 if self._dit_evictor is None:
-                    self._dit_evictor = TailEvictor(self.transformer, evict, self.device)
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                    world = dist.get_world_size() if dist.is_initialized() else 1
+                    tag = os.path.basename(os.path.abspath(self.model_path))
+                    # The DiT tail is TP-sharded (one file per rank); the decoder is replicated, so
+                    # every rank maps the same file.
+                    self._dit_evictor = TailEvictor(self.transformer, evict, self.device, map_key=f"dit_{tag}_{evict}_r{rank}of{world}")
                     self._dit_evictor.snapshot()
-                    self._vae_evictor = TailEvictor(self.vae, "all_module", self.device)
+                    self._vae_evictor = TailEvictor(self.vae, "all_module", self.device, map_key=f"vae_{tag}")
                     self._vae_evictor.snapshot()
                     self._vae_evictor.evict()
                 self._dit_evictor.evict()

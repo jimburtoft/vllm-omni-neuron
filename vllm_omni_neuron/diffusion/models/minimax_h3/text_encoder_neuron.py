@@ -231,6 +231,16 @@ class NeuronQwen3VLTextLayers(nn.Module):
                         except RuntimeError:
                             pass
                     self._host[(index_, name)] = host
+            from vllm_omni_neuron.diffusion.models.minimax_h3.host_weights import host_weights_dir, to_mapped
+
+            directory = host_weights_dir()
+            if directory and not pin:
+                # File-backed shards (see `host_weights`): page cache the kernel can drop and re-read.
+                key = f"te_{os.path.basename(os.path.dirname(os.path.abspath(self.path)))}_r{self.rank}of{self.world}"
+                self._host = to_mapped(self._host, key, directory)
+                for index_, layer in enumerate(self.layers):
+                    for name in list(layer._parameters):
+                        layer._parameters[name] = nn.Parameter(self._host[(index_, name)], requires_grad=False)
 
     def set_stream_device(self, device) -> None:
         """Streaming: where the layers run. The module itself stays on the host."""
