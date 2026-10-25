@@ -17,7 +17,7 @@ Measured warm request times (second and later requests of a running process, 29-
 | Configuration | PDD8 (8 steps) | Base (50 steps) |
 |---|---:|---:|
 | `trn2.48xlarge`, 64 cores | 14.2 s | 59.4 s |
-| `trn2.3xlarge`, 4 cores | 130 s (up to ~285 s, see "Memory") | 765 s |
+| `trn2.3xlarge`, 4 cores | 130–138 s | 765 s |
 
 ## What you need
 
@@ -52,19 +52,27 @@ Launch a `trn2.48xlarge` or `trn2.3xlarge` with the AMI above and a 600 GB gp3 r
 [EC2 Capacity Blocks for ML](https://aws.amazon.com/ec2/capacityblocks/); launch into your block with
 `--instance-market-options '{"MarketType":"capacity-block"}'` and your reservation ID.
 
-## 2. Add swap
+## 2. Prepare the local NVMe disk and swap
 
-The DLAMI has no swap, and the first-time compile needs far more host memory than the instance has
-(about 150 GB on a `trn2.3xlarge`). Without enough swap the compiler is killed and the run fails with
-a misleading compilation error.
+The DLAMI has no swap, and the first-time compile needs far more host memory than a `trn2.3xlarge`
+has (about 150 GB). Without enough swap the compiler is killed and the run fails with a misleading
+compilation error.
+
+Put the swap, and on a `trn2.3xlarge` the host copies of the weights (step 6), on the instance's local
+NVMe disk (437 GB, ~1 GB/s), not on the EBS root volume, which a `trn2.3xlarge` limits to 625 MB/s:
 
 ```bash
-# trn2.3xlarge (124 GB RAM): 192 GB of swap. A trn2.48xlarge (2 TB RAM) can skip this step.
-sudo fallocate -l 192G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap --force /swapfile     # --force is required on the DLAMI kernel
-sudo swapon /swapfile
+NVME=/dev/nvme1n1                 # the instance-store disk: `lsblk`, the unmounted ~437 GB disk
+sudo mkfs.ext4 -q -F $NVME
+sudo mkdir -p /mnt/nvme && sudo mount -o noatime $NVME /mnt/nvme && sudo chmod 777 /mnt/nvme
+sudo fallocate -l 192G /mnt/nvme/swapfile
+sudo chmod 600 /mnt/nvme/swapfile
+sudo mkswap --force /mnt/nvme/swapfile     # --force is required on the DLAMI kernel
+sudo swapon /mnt/nvme/swapfile
 ```
+
+The instance-store disk is erased when the instance stops; repeat this step after a stop/start.
+A `trn2.48xlarge` (2 TB of RAM) can skip this step.
 
 ## 3. Download the weights
 
@@ -91,7 +99,7 @@ sudo docker pull $IMAGE
 DEVICES=$(for d in /dev/neuron*; do printf -- "--device=%s " $d; done)
 sudo docker run -d --name h3 $DEVICES \
   --cap-add SYS_ADMIN --cap-add IPC_LOCK --shm-size=16g --ipc=host \
-  --entrypoint /bin/bash --workdir /workspace -v $H3:/workspace \
+  --entrypoint /bin/bash --workdir /workspace -v $H3:/workspace -v /mnt/nvme:/mnt/nvme \
   -e VLLM_NEURON_BACKEND=neuron_native \
   -e VLLM_NEURON_LIBTORCH_NEURONX_LITE=1 \
   -e VLLM_NEURON_DISABLE_GRAPH_CAPTURE_BACKEND=1 \
@@ -160,6 +168,10 @@ sudo docker exec h3 bash -c 'cd plugin && python examples/minimax_h3/run.py --si
 `--single-device` sets TP=4 and the settings a single device needs to fit the model (listed under
 "Settings" below); it is text-to-video only.
 
+On a `trn2.3xlarge`, also pass `-e MINIMAX_H3_HOST_WEIGHTS_DIR=/mnt/nvme/h3w` to `docker exec`: the
+host copies of the weights are then files on the NVMe disk instead of process memory (see "Memory on
+a `trn2.3xlarge`"). The first run writes ~58 GB there.
+
 `--steps 9` with PDD8 is 9 sigmas, i.e. 8 denoising steps; the PDD heads require exactly that.
 
 `run.py` options: `--prompt` (repeatable: prompts run in order in one process), `--repeat N` (send
@@ -213,17 +225,30 @@ Other variables:
 | Variable | Default | What it does |
 |---|---|---|
 | `MINIMAX_H3_PDD_HEADS` | unset | path to `pdd_heads.safetensors`; required for PDD8 |
+| `MINIMAX_H3_HOST_WEIGHTS_DIR` | unset | directory on local disk for file-backed host weight copies (single device; recommended on a `trn2.3xlarge`) |
 | `MINIMAX_H3_STAGE_PROFILE` | `0` | `1` logs each stage's time (encode, denoise, decode) per request |
 | `MINIMAX_H3_HANDSHAKE_TIMEOUT_S` | `7200` | worker start-up timeout; raise it if a first-time compile is slower |
 
 ## Memory on a `trn2.3xlarge`
 
-Device memory peaks at 22.6 GiB of 24 GiB per NeuronCore. On the host, the process needs more than
-the instance's 124 GB: about 75 GB of weight copies (the streamed text encoder and the evicted DiT
-blocks) plus the four workers, so part of it lives in swap. When the text encoder's host copy has
-been swapped out, that request's prompt encoding takes 1-5 minutes instead of ~3.6 s; in our runs
-this happened on some warm requests (130 s typical, 284 s worst). Do not run anything else large on
-the same host, and run one generation process per `trn2.3xlarge`.
+Device memory peaks at 22.6 GiB of 24 GiB per NeuronCore. On the host, a single device needs ~58 GB
+of weight copies (the text encoder's shards, which stream to the device for every prompt; the DiT
+blocks moved out around the video decode; the video decoder), next to ~60 GB of process memory, on an
+instance with 124 GB.
+
+With `MINIMAX_H3_HOST_WEIGHTS_DIR` those copies are files on the NVMe disk, mapped into the process:
+the kernel keeps them cached while there is room and drops and re-reads them otherwise, without
+swapping. Measured, PDD8, 6 requests each, same output:
+
+| | Without | With `MINIMAX_H3_HOST_WEIGHTS_DIR` |
+|---|---:|---:|
+| Process memory, steady state | 122–127 GB | ~61 GB |
+| Available memory, steady state | 0.4–5.8 GB | ~66 GB |
+| Swap in use, steady state | 94 GB | 34 GB (from model load, not touched again) |
+| Warm requests | 134.7 / 137.6 / 138.0 s | 134.4 / 137.5 / 138.1 / 137.8 s |
+| Slow warm requests (prompt encode 40–51 s) | 2 of 5 | 1 of 5 |
+
+Do not run anything else large on the same host, and run one generation process per `trn2.3xlarge`.
 
 ## Troubleshooting
 
