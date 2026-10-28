@@ -74,6 +74,9 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
         else:
             self.c2w = Code2WavRunner(st, device=self.device, dtype=model_dtype(), compile=False)
         self.ctx, self.up = self.c2w.ctx, self.c2w.up
+        # full-context windows from different requests decoded together (B<=4 measured 12.3 vs 18.1 ms/window)
+        self.c2w_batch = int(os.environ.get("QTTS_C2W_BATCH", "4"))
+        self.max_inflight = int(os.environ.get("QTTS_C2W_MAX_INFLIGHT", "16"))
         logger.info("[NeuronC2W] code2wav loaded in %.1fs device=%s", time.time() - t0, self.device)
 
     @torch.inference_mode()  # same grad mode as execute_model, or dynamo recompiles every graph on first real use
@@ -83,12 +86,16 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
         self.c2w.decode_window(w[:4])
         self.c2w.decode_window(w, ctx_frames=self.ctx)
         self.c2w.decode_window(w)
+        for b in (2, 4, 8):
+            if b <= self.c2w_batch:
+                self.c2w.decode_crop_batch([w] * b, buckets=(b,))
         return time.time() - t0
 
-    def _decode(self, rid, flat: list[int], lctx: int):
+    def _windows(self, rid, flat: list[int], lctx: int):
+        """Split a request's new codes into decode windows: [(win [k + n, Q], k)], k = left-context frames."""
         n = len(flat) // Q
         if n == 0:
-            return torch.zeros(0)
+            return []
         codes = torch.tensor(flat, dtype=torch.long).view(Q, n).t().contiguous()  # [F,Q]
         if lctx > 0:  # processor-provided context (e.g. ICL ref codes): drop it from output
             codes_new = codes[lctx:]
@@ -96,19 +103,39 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
         else:
             codes_new = codes
             prev = self.hist.get(rid)
-        outs = []
-        s = 0
+        wins, s = [], 0
         while s < codes_new.shape[0]:
             e = min(s + self.c2w.chunk, codes_new.shape[0])
             k = 0 if prev is None else prev.shape[0]
             win = codes_new[s:e] if k == 0 else torch.cat([prev, codes_new[s:e]])
-            w = self.c2w.decode_window(win, ctx_frames=k)
-            w = w if (self.c2w.crop and k == self.ctx) else w[:, k * self.up:]
-            outs.append(w.cpu().float().reshape(-1))
+            wins.append((win, k))
             prev = win[-self.ctx:]
             s = e
         self.hist[rid] = prev
-        return torch.cat(outs)
+        return wins
+
+    def _decode_all(self, per_req):
+        """per_req: [[(win, k), ...] per request] -> [wav per request]. Full-context windows of all requests are
+        decoded together in batched crop-graph calls; the rest (first windows, short context) one by one."""
+        out = [[None] * len(ws) for ws in per_req]
+        crop = [(i, j) for i, ws in enumerate(per_req) for j, (w, k) in enumerate(ws)
+                if self.c2w.crop and k == self.ctx and self.c2w_batch > 1]
+        if crop:
+            ys = self.c2w.decode_crop_batch([per_req[i][j][0] for i, j in crop],
+                                            buckets=tuple(b for b in (1, 2, 4, 8) if b <= self.c2w_batch))
+            for (i, j), y in zip(crop, ys):
+                out[i][j] = y
+        n_inflight = 0
+        for i, ws in enumerate(per_req):
+            for j, (w, k) in enumerate(ws):
+                if out[i][j] is None:
+                    y = self.c2w.decode_window(w, ctx_frames=k)
+                    out[i][j] = y if (self.c2w.crop and k == self.ctx) else y[:, k * self.up:]
+                    n_inflight += 1
+                    if n_inflight >= self.max_inflight:  # bound queued executions (runtime queue holds <= 63)
+                        out[i][j] = out[i][j].cpu()
+                        n_inflight = 0
+        return [torch.cat([y.cpu().float().reshape(-1) for y in ys]) if ys else torch.zeros(0) for ys in out]
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output, intermediate_tensors=None):
@@ -142,7 +169,8 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
                     st["info"] = deserialize_additional_information(ainfo[rid]) or st["info"]
                 except Exception:
                     st["info"] = ainfo[rid] if isinstance(ainfo[rid], dict) else st["info"]
-        req_ids, wavs = [], []
+        req_ids, per_req = [], []
+        _t = time.perf_counter()
         for rid, n in scheduler_output.num_scheduled_tokens.items():
             st = self.requests.get(rid)
             if st is None:
@@ -150,12 +178,11 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
             req_ids.append(rid)
             lctx = int(_meta(st["info"], "left_context_size", 0) or 0)
             nc = ncomp.get(rid, 0)
-            toks = st["tokens"][nc: nc + n]
-            _t = time.perf_counter()
-            wavs.append(self._decode(rid, toks, lctx))
-            _dt = time.perf_counter() - _t
-            if _dt > 0.2 or os.environ.get("QTTS_C2W_TRACE") == "1":
-                logger.info("[NeuronC2W] rid=%s decode %d tok lctx=%d in %.3fs", rid, len(toks), lctx, _dt)
+            per_req.append(self._windows(rid, st["tokens"][nc: nc + n], lctx))
+        wavs = self._decode_all(per_req)
+        _dt = time.perf_counter() - _t
+        if _dt > 0.2 or os.environ.get("QTTS_C2W_TRACE") == "1":
+            logger.info("[NeuronC2W] step: %d reqs, %d windows in %.3fs", len(req_ids), sum(len(w) for w in per_req), _dt)
         self._last = (req_ids, wavs)
         return None
 

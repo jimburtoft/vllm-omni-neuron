@@ -275,6 +275,30 @@ class Code2WavRunner:
         return self.fn(c.to(self.dev))[:, : n * self.up]
 
     @torch.no_grad()
+    def decode_crop_batch(self, wins, buckets=(1, 2, 4), max_inflight=16):
+        """Several full-context windows (each [ctx + n_i, 16], n_i <= chunk) in batched crop-graph calls.
+        Returns one wav per window (only the new frames' audio). Rows are independent, so the result per window is
+        the same function of its codes as decode_window(win, ctx_frames=ctx)."""
+        W, out, i = self.ctx + self.chunk, [None] * len(wins), 0
+        bmax = max(buckets)
+        while i < len(wins):
+            group = list(range(i, min(i + bmax, len(wins))))
+            Bb = next(b for b in buckets if b >= len(group))
+            c = torch.zeros(Bb, 16, W, dtype=torch.long)
+            for r, j in enumerate(group):
+                c[r, :, : wins[j].shape[0]] = wins[j].t()
+            y = self.fn_crop(c.to(self.dev))
+            for r, j in enumerate(group):
+                out[j] = y[r : r + 1, : (wins[j].shape[0] - self.ctx) * self.up]
+            i += len(group)
+            calls = getattr(self, "_inflight", 0) + 1
+            if calls >= max_inflight:  # bound queued device executions (runtime queue holds <= 63)
+                y.cpu()
+                calls = 0
+            self._inflight = calls
+        return out
+
+    @torch.no_grad()
     def decode(self, codes):
         """codes [F,16] -> wav [F*1920] float32 cpu. Same windows as reference chunked_decode(chunk, ctx)."""
         outs, s, Fn = [], 0, codes.shape[0]
