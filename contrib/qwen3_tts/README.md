@@ -1,6 +1,7 @@
 # Qwen3-TTS (12Hz) on AWS Neuron — contrib
 
-Status: **experimental contrib**. Runs `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` on Trainium2 and serves it through
+Status: **experimental contrib**. Runs the Qwen3-TTS 12Hz 1.7B checkpoints (`-VoiceDesign`, `-CustomVoice`, `-Base`)
+on Trainium2 and serves them through
 **vLLM-Omni** (`vllm-omni serve --omni`, OpenAI `/v1/audio/speech`, streaming) on the public SDK 2.33 DLAMI.
 
 vLLM-Omni-Neuron 0.29.0.0.2.0 implements diffusion workers only; autoregressive omni stages (`LLM_AR`,
@@ -57,7 +58,7 @@ process from claiming the Neuron runtime).
 | `QTTS_B` | 8 | talker batch slots (= stage-0 `max_num_seqs`); keep ≤ 16 on the lite backend |
 | `QTTS_DEV0` / `QTTS_DEV1` | 0 / 1 | logical cores for talker / code2wav |
 | `QTTS_SLOT_LEN` | 2048 | per-request KV slots = stage-0 `max_model_len` (prompt + frames; 12.5 frames per second of audio, so ~2.5 min) |
-| `QTTS_GREEDY` | 1 | force greedy decoding in the YAML |
+| `QTTS_GREEDY` | 0 | `1` writes greedy defaults into the YAML |
 
 Sampling is **per request** (one compiled graph serves mixed batches). Defaults come from the deploy YAML
 (`default_sampling_params` for the talker, `subtalker_sampling_params` for the code predictor; checkpoint defaults
@@ -70,6 +71,21 @@ T=0.9, top-k 50 for both; `QTTS_GREEDY=1` writes greedy defaults). Per request o
 ```
 `temperature: 0` gives greedy. A request with a `seed` is reproducible regardless of what else is in the batch.
 top-k is capped at 64.
+
+## Task types
+
+All three checkpoints use the same graphs. Talker prompts are built on the host by vLLM-Omni's own
+`Qwen3TTSPromptEmbedsBuilder` (`serving/prompts.py`), so request fields match the GPU path:
+
+| checkpoint | `task_type` | fields |
+|---|---|---|
+| `-VoiceDesign` | `VoiceDesign` | `instructions` (voice description) |
+| `-CustomVoice` | `CustomVoice` | `voice` (preset speaker: aiden, dylan, eric, ono_anna, ryan, serena, sohee, uncle_fu, vivian), optional `instructions` |
+| `-Base` | `Base` | `ref_audio` (URL / base64 / path) + `ref_text` for in-context cloning; `x_vector_only_mode: true` for speaker embedding only |
+
+Base checkpoints also load the speaker encoder and the speech-tokenizer encoder. Both run on CPU, once per reference
+clip (results are cached by clip hash). Streaming-text mode (`non_streaming_mode: false`, the default for Base) is
+supported: the remaining text embeddings are fed one per frame.
 
 ## Offline (vLLM-Omni `Omni` API)
 ```bash
@@ -87,7 +103,9 @@ wavs, sr = tts.generate_voice_design(["Hello there."], instruct=["Calm female vo
 `pytest tests/` (CPU, fp32; the equivalence tests need the `qwen-tts` package for the reference).
 
 ## Known limitations
-- VoiceDesign task only (CustomVoice / Base voice clone not yet wired); non-streaming text mode only.
+- The reference encoders for Base voice cloning run on CPU (about 0.1-0.5 s per new reference clip).
+- Greedy decoding with CustomVoice + `instructions` can loop until `max_new_tokens`; the HF reference does the same.
+  Use the sampled defaults.
 - `top_p` is ignored (checkpoint default is 1.0); top-k ≤ 64.
 - **Long text**: prompts are prefilled in chunks (any length up to the slot), and decode attends only the used KV
   range (context buckets `QTTS_CTX_BUCKETS`, default 256/512/1024/2048). Prompts above `QTTS_MAX_PROMPT` (400 positions,

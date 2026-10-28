@@ -2,8 +2,11 @@
 
 Protocol (one scheduler token == one audio frame):
   * new request (prefill, possibly chunked by the scheduler): when the full placeholder prompt has been scheduled, we
-    build the VoiceDesign prompt embeds from `additional_information` (text/instruct/language), run the slot prefill,
-    then frame 0. Returned: sampled token = CB0(frame0), inter_stage `codes.audio=[1,16]`, `meta.codec_frame_valid`.
+    build the prompt embeds from `additional_information` with vllm-omni's own prompt builder (VoiceDesign,
+    CustomVoice, Base x-vector / ICL; streaming or non-streaming text), run the slot prefill, then frame 0.
+    Streaming-text prompts leave a per-request queue of text embeddings; each decode step adds the next one (then
+    tts_pad) to the frame input through the per-row `pad` tensor. ICL requests also ship their reference codes
+    (`codes.ref`) with frame 0 so Code2Wav can use them as left context. Returned: sampled token = CB0(frame0), inter_stage `codes.audio=[1,16]`, `meta.codec_frame_valid`.
   * decode step: one FusedFrame over all B slots. Each scheduled request returns its CB0 and frame.
   * EOS: when the fused frame samples CB0 == 2150 we report token 2150 (pipeline stop id) and no frame.
 The KV cache is owned by the model (static per-slot buffers); `get_kv_cache_spec()` returns {} (attention-free stage).
@@ -89,6 +92,10 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         self.row_stemp = torch.zeros(self.B); self.row_stopk = torch.zeros(self.B, dtype=torch.long)
         self.row_min = [2] * self.B; self.row_max = [self.S] * self.B
         self.tok = TextTokenizer(path)
+        from .prompts import PromptBuilder
+        self.prompts = PromptBuilder(self.eng, path)
+        self.trailing: dict[int, torch.Tensor] = {}  # slot -> remaining streaming-text rows [N,H] (host)
+        self.ref_codes: dict[str, torch.Tensor] = {}  # rid -> ICL ref codes, shipped with frame 0
         self.eos = int(self.eng.eos)
         assert self.eos == 2150, f"unexpected codec eos {self.eos}"
         self.V = self.eng.talker.cfg.vocab
@@ -98,6 +105,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         self.lg = torch.zeros(self.B, self.V, device=dev)
         self.seen = torch.zeros(self.B, self.V, dtype=torch.bool, device=dev)
         self.pad = torch.zeros(self.B, 1, self.H, dtype=dt, device=dev)
+        self.pad_host = torch.zeros(self.B, 1, self.H, dtype=dt)
         self.pos = torch.zeros(self.B, dtype=torch.long)
         self.steps = [0] * self.B
         self.slot_of: dict[str, int] = {}
@@ -135,6 +143,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         self.h = self.h.index_copy(0, bi, hl)
         self.lg = self.lg.index_copy(0, bi, lg)
         self.seen = self.seen.index_copy(0, bi, torch.zeros(1, self.V, dtype=torch.bool, device=dev))
+        self.pad_host[b] = pad.to(dt).reshape(1, -1)
         self.pad = self.pad.index_copy(0, bi, pad.to(dt).reshape(1, 1, -1).to(dev))
         self.pos[b] = T
         self.steps[b] = 0
@@ -167,7 +176,21 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         else:  # fresh stream per request (non-reproducible), independent of the slot's previous request
             self.noise.reseed(b, int.from_bytes(os.urandom(4), "little"))
 
+    def _advance_text(self):
+        """Streaming text: frame k of a row adds trailing[k] (then tts_pad) to its next talker input."""
+        if not self.trailing:
+            return
+        for b in list(self.trailing):
+            tail, k = self.trailing[b], self.steps[b]
+            if k < tail.shape[0]:
+                self.pad_host[b, 0] = tail[k]
+            else:
+                self.pad_host[b, 0] = self.prompts.tts_pad.reshape(-1).to(self.pad_host.dtype)
+                del self.trailing[b]
+        self.pad = self.pad_host.to(self.device)
+
     def _run_frame(self, ctx=None):
+        self._advance_text()
         allow = torch.tensor([s >= max(self.row_min[b], 1) for b, s in enumerate(self.steps)])
         g0, gs = self.noise.draw()
         d = self.device
@@ -189,15 +212,8 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         return codes.cpu()
 
     def _build_prompt(self, info):
-        text = info_first(info, "text", "")
-        instruct = info_first(info, "instruct", "") or ""
-        language = info_first(info, "language", "Auto") or "Auto"
-        from ..utils import assistant_text, instruct_text
-        ids = torch.tensor([self.tok.encode(assistant_text(text))])
-        iids = torch.tensor([self.tok.encode(instruct_text(instruct))]) if instruct.strip() else None
-        with torch.no_grad():
-            emb, pad = self.eng.build_prompt(ids, iids, language)
-        return emb, pad
+        """-> (prompt [1,T,H], trailing [N,H], tts_pad [1,1,H], ref_code [R,16] | None)."""
+        return self.prompts.build(info)
 
     # ---------------------------------------------------------------- engine-core API
     @torch.inference_mode()
@@ -210,9 +226,11 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         for rid in scheduler_output.finished_req_ids:
             b = self.slot_of.pop(rid, None)
             if b is not None:
+                self.trailing.pop(b, None)
                 self.free.append(b)
                 self.pos[b] = 0
             self.requests.pop(rid, None)
+            self.ref_codes.pop(rid, None)
         for nr in scheduler_output.scheduled_new_reqs:
             self.requests[nr.req_id] = dict(info=_deser_info(nr), prompt_len=len(nr.prompt_token_ids or []),
                                             computed=nr.num_computed_tokens, sp=nr.sampling_params,
@@ -226,7 +244,12 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
             if rid not in self.slot_of:
                 st["computed"] = st.get("computed", 0) + n
                 if st["computed"] >= st["prompt_len"]:  # full prompt scheduled -> prefill + frame 0
-                    emb, pad = self._build_prompt(st["info"])
+                    try:
+                        emb, trailing, pad, ref_code = self._build_prompt(st["info"])
+                    except Exception as e:  # bad request (unknown speaker, wrong task for checkpoint, ...)
+                        logger.warning("[NeuronTTS] rid=%s prompt build failed: %s", rid, e)
+                        emitted[rid] = (self.eos, None)
+                        continue
                     if emb.shape[1] > self.max_prompt:
                         # Too long for one utterance: the checkpoint degrades badly here (HF reference included). Stop
                         # immediately with EOS so the request finishes cleanly; clients should split long text.
@@ -238,6 +261,12 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                     self.slot_of[rid] = b
                     self._set_row_params(b, st.get("sp"), st["info"])
                     self._prefill_slot(b, emb, pad)
+                    if trailing.shape[0] > 1 or (trailing.shape[0] == 1 and not torch.equal(trailing[0], pad.reshape(-1))):
+                        self.trailing[b] = trailing
+                    else:
+                        self.trailing.pop(b, None)
+                    if isinstance(ref_code, torch.Tensor) and ref_code.numel():
+                        self.ref_codes[rid] = ref_code.to(torch.long).cpu().contiguous()
                     st["new_slot"] = True
                     n_prefill += 1
                 else:
@@ -291,8 +320,11 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                               "meta.codec_frame_valid": torch.tensor([False])})
             else:
                 sampled.append([cb0])
-                inter.append({"codes.audio": frame.view(1, 16).to(torch.long),
-                              "meta.codec_frame_valid": torch.tensor([True])})
+                d = {"codes.audio": frame.view(1, 16).to(torch.long), "meta.codec_frame_valid": torch.tensor([True])}
+                ref = self.ref_codes.pop(rid, None)
+                if ref is not None:
+                    d["codes.ref"] = ref
+                inter.append(d)
         out = OmniModelRunnerOutput(req_ids=out_ids, req_id_to_index={r: i for i, r in enumerate(out_ids)},
                                     sampled_token_ids=sampled, logprobs=None, prompt_logprobs_dict={},
                                     pooler_output=None, multimodal_outputs=None,

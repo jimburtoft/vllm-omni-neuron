@@ -410,8 +410,10 @@ class TTSEngine:
 
     # -- generation --------------------------------------------------------------------------
     @torch.no_grad()
-    def generate(self, inputs_embeds, tts_pad_embed, max_new=600, rep_penalty=1.05, min_new=2, timings=None):
-        """Greedy generation (talker + code predictor). Returns codes [F,16] int64 (cpu)."""
+    def generate(self, inputs_embeds, tts_pad_embed, max_new=600, rep_penalty=1.05, min_new=2, timings=None,
+                 trailing=None):
+        """Greedy generation (talker + code predictor). Returns codes [F,16] int64 (cpu).
+        trailing: optional [N,H] streaming-text rows; decode step k adds trailing[k] (k < N) instead of tts_pad."""
         import time
         dev = self.device
         T = inputs_embeds.shape[1]
@@ -452,7 +454,9 @@ class TTSEngine:
             cb0_e = F.embedding(cb0_t, self.codec_emb_dev).view(1, 1, -1)
             res, emb_sum = self._cp_frame(h, cb0_e)
             tc = time.perf_counter()
-            h, logits = self._talker_step_dec(cb0_e + emb_sum + pad_dev, torch.tensor([p], device=dev))
+            txt = pad_dev if trailing is None or step >= trailing.shape[0] else \
+                trailing[step].to(self.dtype).view(1, 1, -1).to(dev)
+            h, logits = self._talker_step_dec(cb0_e + emb_sum + txt, torch.tensor([p], device=dev))
             lg = logits.cpu()
             td = time.perf_counter()
             frames.append(torch.cat([torch.tensor([cb0]), res.cpu()]))

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Drive Qwen3-TTS VoiceDesign through vLLM-Omni (Omni offline API) with the Neuron workers.
+"""Drive Qwen3-TTS through vLLM-Omni (Omni offline API) with the Neuron workers.
 
 usage: run_omni.py <deploy_yaml> <out_dir> [n_repeat]
-Uses the 3 reference prompts (en_calm, en_excited, zh_soft). Placeholder prompt length is computed with the same
+Cases follow the checkpoint type: VoiceDesign -> en_calm/en_excited/zh_soft; CustomVoice -> preset speakers;
+Base -> voice clone of QTTS_REF_AUDIO (+ QTTS_REF_TEXT for ICL) in x-vector and ICL modes. Placeholder prompt length is computed with the same
 builder the shipped example uses; our runner ignores the placeholder ids and builds embeds itself.
 """
 import os, sys, time, json
@@ -21,14 +22,49 @@ CASES = [
 ]
 
 
-def placeholder_len(info):
+REF_TEXT = os.environ.get("QTTS_REF_TEXT", "")
+TEXT2 = "The library closes at nine, so please return your books before then."
+MODEL_TYPE = json.load(open(f"{MODEL}/config.json")).get("tts_model_type", "voice_design")
+if MODEL_TYPE == "custom_voice":
+    CASES = [dict(tag="cv_ryan", text=TEXT2, language="English", speaker="ryan"),
+             dict(tag="cv_vivian", text=TEXT2, language="English", speaker="vivian", instruct="Speak slowly and softly."),
+             dict(tag="cv_ryan_stream", text=TEXT2, language="English", speaker="ryan", non_streaming_mode=False),
+             dict(tag="cv_dylan_zh", text="哥哥，你回来啦，人家等了你好久好久了。", language="Chinese", speaker="dylan")]
+elif MODEL_TYPE == "base":
+    CASES = [dict(tag="base_xvec", text=TEXT2, language="English", x_vector_only_mode=True),
+             dict(tag="base_icl", text=TEXT2, language="English", ref_text=REF_TEXT),
+             dict(tag="base_icl_ns", text=TEXT2, language="English", ref_text=REF_TEXT, non_streaming_mode=True)]
+
+
+def to_info(c):
+    task = {"custom_voice": "CustomVoice", "base": "Base"}.get(MODEL_TYPE, "VoiceDesign")
+    info = {"task_type": [task], "text": [c["text"]], "language": [c["language"]], "max_new_tokens": [2048],
+            "non_streaming_mode": [c.get("non_streaming_mode", task != "Base")]}
+    for k in ("instruct", "speaker", "ref_text", "x_vector_only_mode"):
+        if c.get(k) is not None:
+            info[k] = [c[k]]
+    if task == "Base":
+        info["ref_audio"] = [os.environ["QTTS_REF_AUDIO"]]
+    return info, task
+
+
+def placeholder_len(info, task="VoiceDesign"):
     from transformers import AutoTokenizer
     from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder
     cfg = json.load(open(f"{MODEL}/config.json"))["talker_config"]
     tok = AutoTokenizer.from_pretrained(MODEL)
     return Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
-        info, task_type="VoiceDesign", tokenize_prompt=lambda s: tok(s, padding=False)["input_ids"],
-        codec_language_id=cfg.get("codec_language_id"), spk_is_dialect=cfg.get("spk_is_dialect"))
+        info, task_type=task, tokenize_prompt=lambda s: tok(s, padding=False)["input_ids"],
+        codec_language_id=cfg.get("codec_language_id"), spk_is_dialect=cfg.get("spk_is_dialect"),
+        estimate_ref_code_len=_ref_code_len)
+
+
+def _ref_code_len(ref_audio):
+    """Codec frames (12.5 Hz) of a reference clip path, for the placeholder length only."""
+    import math
+    ra = ref_audio[0] if isinstance(ref_audio, list) else ref_audio
+    info = sf.info(ra)
+    return math.ceil(info.frames / info.samplerate * 12.5)
 
 
 def main():
@@ -39,9 +75,8 @@ def main():
     inputs, tags = [], []
     for r in range(rep):
         for c in CASES:
-            info = {"task_type": ["VoiceDesign"], "text": [c["text"]], "language": [c["language"]],
-                    "instruct": [c["instruct"]], "max_new_tokens": [2048], "non_streaming_mode": [True]}
-            inputs.append({"prompt_token_ids": [0] * placeholder_len(info), "additional_information": info})
+            info, task = to_info(c)
+            inputs.append({"prompt_token_ids": [0] * placeholder_len(info, task), "additional_information": info})
             tags.append(f"{c['tag']}_{r}")
     t0 = time.time()
     omni = Omni(model=MODEL, deploy_config=deploy, init_timeout=int(os.environ.get("QTTS_INIT_TIMEOUT", "2400")), stage_init_timeout=int(os.environ.get("QTTS_INIT_TIMEOUT", "2400")))
