@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ASR (WER/CER) + duration stats for one or more generation dirs against a cases file.
 
-usage: score.py <cases.jsonl> <out.jsonl> <dir> [<dir> ...]
+usage: score.py <cases.jsonl> <out.jsonl> <dir> [<dir> ...]     (SHARD=i/n scores every n-th file)
 ASR model: $ASR_MODEL (default openai/whisper-large-v3). CER for zh/ja/ko, WER otherwise.
 """
 import glob, json, os, re, sys, unicodedata
@@ -40,8 +40,15 @@ def ed(a, b):
     return d[len(b)]
 
 
-for d in sys.argv[3:]:
-    for f in sorted(glob.glob(f"{d}/*.wav")):
+si, sn = (int(x) for x in os.environ.get("SHARD", "0/1").split("/"))
+files = [(d, f) for d in sys.argv[3:] for f in sorted(glob.glob(f"{d}/*.wav"))][si::sn]
+done = set()
+if os.path.exists(sys.argv[2]):
+    done = {(r["dir"], r["file"]) for r in (json.loads(l) for l in open(sys.argv[2]) if l.strip())}
+for d, f in files:
+    if (d, os.path.basename(f)[:-4]) in done:
+        continue
+    if True:
         tag = os.path.basename(f)[:-4]
         tag = re.sub(r"_\d+$", "", tag) if tag not in cases else tag
         c = cases.get(tag)
@@ -56,4 +63,4 @@ for d in sys.argv[3:]:
         out.write(json.dumps(dict(dir=d, file=os.path.basename(f)[:-4], tag=tag, lang=c["language"], sec=round(len(w) / sr, 3),
                                   chars=len(c["text"]), n=len(r), err=ed(r, h), hyp=hyp[:400]), ensure_ascii=False) + "\n")
         out.flush()
-    print("scored", d, flush=True)
+print("scored", len(files), flush=True)

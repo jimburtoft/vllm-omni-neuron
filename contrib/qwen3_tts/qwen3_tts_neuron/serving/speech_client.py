@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Online client: POST /v1/audio/speech (VoiceDesign) with concurrency; saves wavs, reports latency + RTFx.
-usage: speech_client.py <api_base> <out_dir> <concurrency> <n_requests> [model]"""
+"""Online client: POST /v1/audio/speech with concurrency; saves wavs, reports latency + RTFx.
+usage: speech_client.py <api_base> <out_dir> <concurrency> <n_requests> [model]
+QTTS_TASK=VoiceDesign (default) | CustomVoice (QTTS_VOICE, default ryan) | Base (QTTS_REF_AUDIO wav path,
+QTTS_REF_TEXT for ICL, else x-vector only). QTTS_STREAM=1 streams PCM and reports time to first audio."""
 import io, sys, os, time, json, asyncio
 import httpx
 import soundfile as sf
@@ -16,13 +18,33 @@ CASES = [
 
 
 STREAM = os.environ.get("QTTS_STREAM", "0") == "1"
+TASK = os.environ.get("QTTS_TASK", "VoiceDesign")
+_REF = None
+
+
+def payload_for(model, c):
+    global _REF
+    p = dict(model=model, input=c["input"], language=c["language"], task_type=TASK)
+    if TASK == "VoiceDesign":
+        p["instructions"] = c["instructions"]
+    elif TASK == "CustomVoice":
+        p["voice"] = os.environ.get("QTTS_VOICE", "ryan")
+    elif TASK == "Base":
+        if _REF is None:
+            import base64
+            _REF = "data:audio/wav;base64," + base64.b64encode(open(os.environ["QTTS_REF_AUDIO"], "rb").read()).decode()
+        p["ref_audio"] = _REF
+        if os.environ.get("QTTS_REF_TEXT"):
+            p["ref_text"] = os.environ["QTTS_REF_TEXT"]
+        else:
+            p["x_vector_only_mode"] = True
+    return p
 
 
 async def one_stream(client, url, model, i, out):
     import numpy as np
     c = CASES[i % 3]
-    payload = dict(model=model, input=c["input"], instructions=c["instructions"], language=c["language"],
-                   task_type="VoiceDesign", response_format="pcm", stream=True, stream_format="audio")
+    payload = dict(payload_for(model, c), response_format="pcm", stream=True, stream_format="audio")
     t0 = time.perf_counter()
     ttfa, buf = None, bytearray()
     async with client.stream("POST", url, json=payload) as r:
@@ -43,8 +65,7 @@ async def one(client, url, model, i, out):
     if STREAM:
         return await one_stream(client, url, model, i, out)
     c = CASES[i % 3]
-    payload = dict(model=model, input=c["input"], instructions=c["instructions"], language=c["language"],
-                   task_type="VoiceDesign", response_format="wav")
+    payload = dict(payload_for(model, c), response_format="wav")
     t0 = time.perf_counter()
     r = await client.post(url, json=payload)
     dt = time.perf_counter() - t0
