@@ -80,7 +80,17 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         # additional_information keys subtalker_temperature / subtalker_top_k / subtalker_dosample.
         self.fe = FusedEngine(self.eng, self.B, S=self.S, vec_cp=True, compile=False)
         c = compile_fn()
-        self.prefill_fn = c(self.fe.prefill)
+        from ..batched import _M
+        # prefill attends only the first `pctx` KV slots when the chunk's real tokens fit (almost every prompt);
+        # attending all S slots made a 128-token prefill ~6x slower and stalled every decode step that admitted one.
+        self.pctx = min(int(os.environ.get("QTTS_PREFILL_CTX", "256")), self.S)
+        # buckets that use the ctx-limited graph (measured B=32 lite: Tb=128 16 ms vs 65 ms full-S; Tb=64 is faster
+        # full-S, 10 vs 15 ms; Tb=256 no gain)
+        self.pctx_buckets = {int(x) for x in os.environ.get("QTTS_PREFILL_CTX_BUCKETS", "128").split(",") if x.strip()}
+        bt = self.fe.bt
+        self.prefill_fns = {None: c(self.fe.prefill)}
+        if self.pctx < self.S:
+            self.prefill_fns[self.pctx] = c(_M(lambda x, r, p: bt.prefill(x, r, p, ctx=self.pctx), bt))
         self.frame_fns = {cb: c(FusedFrameRows(self.eng, self.fe.bt, vec_cp=True, ctx=cb).to(self.device))
                           for cb in self.ctx_buckets}
         self.noise = RowNoise(self.B, self.eng.talker.cfg.vocab, self.eng.cp.cfg.vocab, self.device,
@@ -119,6 +129,9 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         pad = torch.zeros(1, 1, self.H, dtype=self.eng.dtype)
         for Tb in self.eng.prefill_buckets:
             self._prefill_slot(0, torch.zeros(1, Tb - 1, self.H, dtype=self.eng.dtype), pad)
+        for Tb in sorted(self.pctx_buckets & set(self.eng.prefill_buckets)):  # full-S variant of ctx-limited buckets
+            self._prefill_slot(0, torch.zeros(1, max(self.pctx, max(self.eng.prefill_buckets)) + Tb - 1, self.H,
+                                              dtype=self.eng.dtype), pad)
         for cb in self.ctx_buckets:  # compile every decode-context bucket
             self._run_frame(ctx=cb)
         self._reset_slot(0)
@@ -141,7 +154,8 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         for start, n, Tb, p in prefill_plan(T, e.prefill_buckets, S):
             x = torch.zeros(1, Tb, self.H, dtype=dt); x[:, Tb - n:] = emb[:, start:start + n].to(dt)
             _t = time.perf_counter()
-            hl, lg = self.prefill_fn(x.to(dev), bi, p.to(dev))
+            key = self.pctx if (start + n <= self.pctx and Tb in self.pctx_buckets and self.pctx in self.prefill_fns) else None
+            hl, lg = self.prefill_fns[key](x.to(dev), bi, p.to(dev))
             if os.environ.get("QTTS_PREFILL_TRACE") == "1":
                 lg.cpu()
                 logger.info("[NeuronTTS] prefill slot=%d T=%d chunk start=%d n=%d Tb=%d %.3fs", b, T, start, n, Tb,
@@ -182,6 +196,11 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         else:  # fresh stream per request (non-reproducible), independent of the slot's previous request
             self.noise.reseed(b, int.from_bytes(os.urandom(4), "little"))
 
+    def _acc(self, k, v):
+        if os.environ.get("QTTS_STEP_STATS") == "1":
+            d = self.__dict__.setdefault("_pre_parts", {})
+            d[k] = d.get(k, 0.0) + v
+
     def _advance_text(self):
         """Streaming text: frame k of a row adds trailing[k] (then tts_pad) to its next talker input."""
         if not self.trailing:
@@ -217,6 +236,13 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         if (self.pos >= self.S).any():
             raise RuntimeError(f"slot position overflow (max {int(self.pos.max())} >= S={self.S}); raise QTTS_SLOT_LEN")
         return codes.cpu()
+
+    def _build_prompt_safe(self, info):
+        try:
+            with torch.inference_mode():
+                return self._build_prompt(info)
+        except Exception as e:  # noqa: BLE001 - reported per request
+            return e
 
     def _build_prompt(self, info):
         """-> (prompt [1,T,H], trailing [N,H], tts_pad [1,1,H], ref_code [R,16] | None)."""
@@ -256,12 +282,16 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
             if rid not in self.slot_of:
                 st["computed"] = st.get("computed", 0) + n
                 if st["computed"] >= st["prompt_len"]:  # full prompt scheduled -> prefill + frame 0
-                    try:
-                        emb, trailing, pad, ref_code = self._build_prompt(st["info"])
-                    except Exception as e:  # bad request (unknown speaker, wrong task for checkpoint, ...)
-                        logger.warning("[NeuronTTS] rid=%s prompt build failed: %s", rid, e)
+                    _tb = time.perf_counter()
+                    # (a fully scheduled request must emit a token this step: vLLM does not reschedule one that
+                    # emits nothing, so the prompt cannot be built asynchronously across steps)
+                    out = self._build_prompt_safe(st["info"])
+                    self._acc("build", time.perf_counter() - _tb)
+                    if isinstance(out, Exception):  # bad request (unknown speaker, wrong task for checkpoint, ...)
+                        logger.warning("[NeuronTTS] rid=%s prompt build failed: %s", rid, out)
                         emitted[rid] = (self.eos, None)
                         continue
+                    emb, trailing, pad, ref_code = out
                     if emb.shape[1] > self.max_prompt:
                         # Too long for one utterance: the checkpoint degrades badly here (HF reference included). Stop
                         # immediately with EOS so the request finishes cleanly; clients should split long text.
@@ -271,8 +301,11 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                         continue
                     b = self.free.pop(0)
                     self.slot_of[rid] = b
+                    _tb = time.perf_counter()
                     self._set_row_params(b, st.get("sp"), st["info"])
+                    _tc = time.perf_counter()
                     self._prefill_slot(b, emb, pad)
+                    self._acc("params", _tc - _tb); self._acc("prefill", time.perf_counter() - _tc)
                     if trailing.shape[0] > 1 or (trailing.shape[0] == 1 and not torch.equal(trailing[0], pad.reshape(-1))):
                         self.trailing[b] = trailing
                     else:
@@ -314,6 +347,11 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                             1000 * self._ss["pre"] / 200, 1000 * self._ss["frame"] / 200,
                             1000 * (self._ss["gap"] - self._ss["pre"] - self._ss["frame"]) / 200, self._ss["active"] / 200,
                             self._ss["prefills"])
+                pp = getattr(self, "_pre_parts", {})
+                if pp:
+                    logger.info("[NeuronTTS] per-prefill ms: %s", {k: round(1000 * v / max(1, self._ss["prefills"]), 2)
+                                                                  for k, v in pp.items()})
+                    self._pre_parts = {}
                 self._ss.update(gap=0.0, active=0, frame=0.0, pre=0.0, prefills=0)
         return None
 

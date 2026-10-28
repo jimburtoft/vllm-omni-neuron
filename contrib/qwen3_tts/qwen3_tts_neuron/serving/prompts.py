@@ -19,6 +19,13 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+class _Ids:
+    """Token ids passed from the cached text-embedding stand-in to the cached projection."""
+
+    def __init__(self, ids):
+        self.ids = ids
+
+
 class _NoSpeakerEncoder(nn.Module):
     def forward(self, *_a, **_k):
         raise ValueError("this checkpoint has no speaker encoder (voice clone needs a Base checkpoint)")
@@ -79,7 +86,37 @@ class PromptBuilder:
         hp = torch.float32  # prompt math in fp32 on host; cast to the engine dtype at the end
         self._text_table = nn.Embedding.from_pretrained(eng.text_emb.to(hp), freeze=True)
         w1, b1, w2, b2 = (t.to(hp) for t in (eng.tp_w1, eng.tp_b1, eng.tp_w2, eng.tp_b2))
-        proj = lambda e: F.linear(F.silu(F.linear(e.to(hp), w1, b1)), w2, b2)
+        raw_proj = lambda e: F.linear(F.silu(F.linear(e.to(hp), w1, b1)), w2, b2)
+        # The text projection is a per-position MLP over a fixed table, so proj(text_emb(ids)) is a per-token lookup.
+        # Cache it by token id (exact; ~6 ms of fp32 matmuls per prompt otherwise, on the talker's critical path).
+        self._tp_cache: dict[int, torch.Tensor] = {}
+        self._tp_cache_max = int(os.environ.get("QTTS_TEXT_PROJ_CACHE", "65536"))
+        table = self._text_table
+
+        class _CachedText(nn.Module):
+            """text_embedding stand-in that returns token ids tagged for the cached projection."""
+
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(table.weight, requires_grad=False)  # builder reads .parameters() for device
+
+            def forward(self, ids):
+                return _Ids(ids)
+
+        def proj(e):
+            if not isinstance(e, _Ids):
+                return raw_proj(e)
+            ids = e.ids
+            flat = ids.reshape(-1).tolist()
+            miss = sorted({t for t in flat if t not in self._tp_cache})
+            if miss:
+                rows = raw_proj(F.embedding(torch.tensor(miss), table.weight))
+                if len(self._tp_cache) + len(miss) > self._tp_cache_max:
+                    self._tp_cache.clear()
+                for t, r in zip(miss, rows):
+                    self._tp_cache[t] = r
+            return torch.stack([self._tp_cache[t] for t in flat]).view(*ids.shape, -1)
+        text_mod = _CachedText()
         codec = eng.codec_emb.to(hp)
         codec_embed = lambda ids: F.embedding(ids.to(torch.long), codec)
         self._res = None
@@ -110,7 +147,7 @@ class PromptBuilder:
         except Exception:
             cache = None
         self.b = Qwen3TTSPromptEmbedsBuilder(
-            config=cfg, talker_config=cfg.talker_config, model_path=model_path, text_embedding=self._text_table,
+            config=cfg, talker_config=cfg.talker_config, model_path=model_path, text_embedding=text_mod,
             text_projection=proj, codec_embed=codec_embed, residual_code_embeddings=residual, speaker_encoder=spk,
             tts_pad_embed=self.tts_pad, encode_ref_audio_batch=_LazyCodecEncoder(model_path), speaker_cache=cache)
         self.b._embedding_dtype = hp

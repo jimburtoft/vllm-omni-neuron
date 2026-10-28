@@ -75,13 +75,16 @@ class BatchedTalker(nn.Module):
         hl = rms(h[:, -1:, :], self.t.norm, self.t.cfg.eps)
         return hl, (hl @ self.t.codec_head).float().view(R, -1)
 
-    def prefill(self, x, row, pos):
-        # x [1,Tb,H], row [1], pos [Tb]
-        j = torch.arange(self.S, device=x.device)
-        mask = torch.where(j.view(1, -1) <= pos.view(-1, 1), 0.0, -1e30).to(torch.float32).view(1, -1, self.S)
+    def prefill(self, x, row, pos, ctx=None):
+        # x [1,Tb,H], row [1], pos [Tb]. ctx: attend only the first `ctx` KV slots (static). Valid when every real
+        # token's position is < ctx; front-pad tokens (parked in the top slots) then see garbage, but their outputs
+        # are never used and their KV slots are never read by real tokens.
+        Sc = ctx or self.S
+        j = torch.arange(Sc, device=x.device)
+        mask = torch.where(j.view(1, -1) <= pos.view(-1, 1), 0.0, -1e30).to(torch.float32).view(1, -1, Sc)
         cos = self.t.cos.index_select(0, pos).unsqueeze(0)
         sin = self.t.sin.index_select(0, pos).unsqueeze(0)
-        return self._run(x, row, pos.view(1, -1), mask, cos, sin)
+        return self._run(x, row, pos.view(1, -1), mask, cos, sin, ctx=Sc)
 
     def decode(self, x, pos, ctx=None):
         # x [B,1,H], pos [B]; ctx: static number of KV slots to attend (all rows must have pos < ctx)
