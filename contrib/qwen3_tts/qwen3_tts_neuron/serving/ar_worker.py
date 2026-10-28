@@ -206,6 +206,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                                                           self.pos.to(d), g0, gs, self.row_rep.to(d),
                                                           self.row_temp.to(d), self.row_topk.to(d),
                                                           self.row_stemp.to(d), self.row_stopk.to(d))
+        self.noise.prefetch()  # overlaps the host-side RNG with the device frame (codes.cpu() below waits for it)
         occupied = set(self.slot_of.values())
         for b in range(self.B):
             if b in occupied:

@@ -26,6 +26,10 @@ def neuron_runtime_env():
     os.environ.setdefault("NEURON_RT_ROOT_COMM_ID", "127.0.0.1:46820")
     os.environ.setdefault("NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS", "128")
     os.environ.setdefault("NEURON_RT_IO_RING_CACHE_SIZE", "32")
+    # Host-side torch work per step is small (noise, index ops, prompt build); the default intra-op pool spins ~3
+    # cores per stage process and starves the other stages on a 12-vCPU trn2.3xlarge. 2 threads measured best.
+    if not cpu_mode():
+        torch.set_num_threads(int(os.environ.get("QTTS_HOST_THREADS", "2")))
 
 
 def cpu_mode() -> bool:

@@ -54,18 +54,23 @@ cache), and the default `--init-timeout` (600 s) is too short for that first sta
 Streaming: add `"stream": true, "stream_format": "audio", "response_format": "pcm"` (16-bit PCM, 24 kHz).
 Client with concurrency and streaming: `python -m qwen3_tts_neuron.serving.speech_client <base> <out_dir> <conc> <n>`.
 
-A trn2.3xlarge has 4 logical cores (LNC=2). Layouts measured with the online server (VoiceDesign, B=8 per talker,
-~4 s utterances, sampled; RTFx = seconds of audio per second for the whole device):
+A trn2.3xlarge has 4 logical cores (LNC=2). Layouts measured with the online server (VoiceDesign, sampled, ~4 s
+utterances; RTFx = seconds of audio per second for the whole device):
 
-| layout | RTFx | p50 latency |
-|---|---|---|
-| 2 servers x (1 talker + 1 vocoder) | 42.9 | 4.3 s |
-| 1 server, **2 talkers (cores 0,2) + 1 shared vocoder (core 1)** | **44.0** | **2.8 s** |
-| 1 server, 3 talkers + 1 shared vocoder | 35.3 | 5.2 s |
+| layout | talker B | RTFx | p50 latency |
+|---|---|---|---|
+| 2 servers x (1 talker + 1 vocoder) | 8 | 42.9 | 4.3 s |
+| 2 servers x (1 talker + 1 vocoder) | 16 | 52.0 | 7.1 s |
+| 1 server, 2 talkers (cores 0,2) + 1 shared vocoder (core 1) | 8 | 44.0 | 2.8 s |
+| 1 server, 2 talkers + 1 shared vocoder | 16 | 59.6 | 3.8 s |
+| **1 server, 3 talkers (cores 0,2,3) + 1 shared vocoder (core 1)** | **16** | **61.5** | 5.6 s |
 
 ```bash
-QTTS_REP0=2 QTTS_DEV0=0,2 QTTS_DEV1=1 python -m qwen3_tts_neuron.serving.make_deploy /tmp/qtts.yaml
+QTTS_B=16 QTTS_REP0=3 QTTS_DEV0=0,2,3 QTTS_DEV1=1 QTTS_B1=48 python -m qwen3_tts_neuron.serving.make_deploy /tmp/qtts.yaml
 ```
+Each stage process caps torch host threads at `QTTS_HOST_THREADS` (default 2). The default thread pool spins ~3
+cores per process and starved the other stages on the 12-vCPU host (3 talkers + vocoder: 35x before the cap, 61x
+after).
 A replicated stage must list one core per replica. A single core with `num_replicas > 1` is read by vLLM-Omni as a
 per-replica template, so replica r would land on core r; `make_deploy` rejects that. For two independent servers,
 generate a second YAML with `QTTS_DEV0=2 QTTS_DEV1=3` and start it on another port with the same launcher

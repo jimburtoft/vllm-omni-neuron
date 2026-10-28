@@ -168,14 +168,30 @@ class RowNoise:
     def __init__(self, B, V, Vc, device, base_seed=0):
         self.B, self.V, self.Vc, self.device = B, V, Vc, device
         self.gens = [torch.Generator().manual_seed(base_seed + b) for b in range(B)]
+        self._next = None  # host-side noise for the next frame, drawn while the device runs the current one
+
+    @staticmethod
+    def _g(gen, *shape):
+        return -torch.log(-torch.log(torch.rand(*shape, generator=gen).clamp_(1e-10, 1.0 - 1e-7)))
+
+    def _rows(self):
+        return (torch.stack([self._g(gen, self.V) for gen in self.gens]),
+                torch.stack([self._g(gen, 15, 1, self.Vc) for gen in self.gens]))
 
     def reseed(self, b, seed):
         self.gens[b] = torch.Generator().manual_seed(int(seed))
+        if self._next is not None:  # replace the prefetched row so the slot's stream starts at the new seed
+            self._next[0][b] = self._g(self.gens[b], self.V)
+            self._next[1][b] = self._g(self.gens[b], 15, 1, self.Vc)
+
+    def prefetch(self):
+        """Draw the next frame's noise now (call after dispatching a frame, before waiting on it)."""
+        if self._next is None:
+            self._next = self._rows()
 
     def draw(self):
-        g = lambda gen, *shape: -torch.log(-torch.log(torch.rand(*shape, generator=gen).clamp_(1e-10, 1.0 - 1e-7)))
-        g0 = torch.stack([g(gen, self.V) for gen in self.gens])
-        gs = torch.stack([g(gen, 15, 1, self.Vc) for gen in self.gens])
+        g0, gs = self._next if self._next is not None else self._rows()
+        self._next = None
         return g0.to(self.device), gs.to(self.device)
 
 
