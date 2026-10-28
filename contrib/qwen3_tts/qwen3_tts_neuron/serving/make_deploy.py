@@ -20,10 +20,19 @@ for s in (s0, s1):
     s["additional_config"] = {"encoder_neuron_config": {"num_encoder_input_buckets": [2048],
                                                         "encoder_attention_block_size": 2048}}
 r0, r1 = int(os.environ.get("QTTS_REP0", "1")), int(os.environ.get("QTTS_REP1", "1"))
-if r0 > 1:
-    s0["num_replicas"] = r0
-if r1 > 1:
-    s1["num_replicas"] = r1
+# Replicated stages need one explicit core per replica (vllm-omni "pool" device mode). A single core id with
+# num_replicas > 1 is read as a per-replica *template* and replica r gets core r, which lands talker replicas on
+# the vocoder's core (or fails NRT init). Default layout: talkers on 0,2,3,... and the vocoder on 1.
+for st, r, key in ((s0, r0, "QTTS_DEV0"), (s1, r1, "QTTS_DEV1")):
+    devs = [d for d in str(st["devices"]).split(",") if d.strip()]
+    if r > 1:
+        st["num_replicas"] = r
+        if len(devs) != r:
+            raise SystemExit(f"{key} must list {r} cores for {r} replicas (got {st['devices']!r}), e.g. "
+                             f"QTTS_REP0=3 QTTS_DEV0=0,2,3 QTTS_DEV1=1")
+used = [d.strip() for st in (s0, s1) for d in str(st["devices"]).split(",")]
+if len(set(used)) != len(used):
+    raise SystemExit(f"stages share a core: {used}")
 if os.environ.get("QTTS_B1"):
     s1["max_num_seqs"] = int(os.environ["QTTS_B1"])
 if greedy:
