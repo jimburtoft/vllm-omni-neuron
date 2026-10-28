@@ -78,7 +78,10 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         # Talker params come from each request's SamplingParams (stage-0 default_sampling_params in the deploy YAML);
         # sub-talker params from the stage's subtalker_sampling_params, overridable per request through
         # additional_information keys subtalker_temperature / subtalker_top_k / subtalker_dosample.
-        self.fe = FusedEngine(self.eng, self.B, S=self.S, vec_cp=True, compile=False)
+        # code-predictor attention form: matmul (default) is 2.3x faster than elementwise at B=32 under the lite
+        # backend (10.3 vs 24.0 ms) and ~7 % faster at B=1; elementwise was faster under torch-neuronx at B=8.
+        vec = os.environ.get("QTTS_CP_VEC", "0") == "1"
+        self.fe = FusedEngine(self.eng, self.B, S=self.S, vec_cp=vec, compile=False)
         c = compile_fn()
         from ..batched import _M
         # prefill attends only the first `pctx` KV slots when the chunk's real tokens fit (almost every prompt);
@@ -91,7 +94,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         self.prefill_fns = {None: c(self.fe.prefill)}
         if self.pctx < self.S:
             self.prefill_fns[self.pctx] = c(_M(lambda x, r, p: bt.prefill(x, r, p, ctx=self.pctx), bt))
-        self.frame_fns = {cb: c(FusedFrameRows(self.eng, self.fe.bt, vec_cp=True, ctx=cb).to(self.device))
+        self.frame_fns = {cb: c(FusedFrameRows(self.eng, self.fe.bt, vec_cp=vec, ctx=cb).to(self.device))
                           for cb in self.ctx_buckets}
         self.noise = RowNoise(self.B, self.eng.talker.cfg.vocab, self.eng.cp.cfg.vocab, self.device,
                               base_seed=int(getattr(self.model_config, "seed", 0) or 0))

@@ -75,8 +75,9 @@ with torch.inference_mode():
             break
 C = torch.stack(codes_all, 1)  # [B, steps, 16]
 frames = [int((C[b, :, 0] == eng.eos).nonzero()[0]) if (C[b, :, 0] == eng.eos).any() else C.shape[1] for b in range(B)]
-print("frames per prompt:", {CASES[k][0]: sorted(set(frames[k::3])) for k in range(3)})
-for k in range(3):
+K = min(3, B)
+print("frames per prompt:", {CASES[k][0]: sorted(set(frames[k::3])) for k in range(K)})
+for k in range(K):
     ref = C[k, :frames[k]]
     agree = [float((C[b, :frames[k]] == ref).all(-1).float().mean()) for b in range(k, B, 3)]
     print(CASES[k][0], "row agreement vs row", k, ":", [round(x, 3) for x in agree])

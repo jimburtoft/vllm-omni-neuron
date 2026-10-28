@@ -62,10 +62,11 @@ utterances; RTFx = seconds of audio per second for the whole device):
 | 2 servers x (1 talker + 1 vocoder) | 8 | 42.9 | 4.3 s |
 | 1 server, 2 talkers (cores 0,2) + 1 shared vocoder (core 1) | 8 | 44.0 | 2.8 s |
 | 1 server, 3 talkers (cores 0,2,3) + 1 shared vocoder (core 1) | 16 | 61.5 | 5.6 s |
-| **1 server, 2 talkers (cores 0,2) + 2 vocoders (cores 1,3)** | **32** | **102.1** | 5.7 s |
+| **1 server, 2 talkers (cores 0,2) + 2 vocoders (cores 1,3)** | **32** | **119.0** | 5.0 s |
+| 1 server, 3 talkers + 1 vocoder | 32 | 61.5 | 9.8 s (vocoder-bound) |
 
-Concurrency 160 for the B=32 row; at concurrency 96 the same server gives 97.7x at p50 3.3 s. Streaming TTFA p50:
-68 ms at concurrency 1, 115 ms at 32.
+The B=32 row is at concurrency 160; at concurrency 96 the same server gives 117x at p50 2.9 s. Streaming TTFA p50 is
+118 ms at concurrency 32. For latency, use a B=1 talker: 0.74 s per ~4 s utterance, TTFA 44 ms.
 
 ```bash
 QTTS_B=32 QTTS_REP0=2 QTTS_DEV0=0,2 QTTS_REP1=2 QTTS_DEV1=1,3 QTTS_B1=64 python -m qwen3_tts_neuron.serving.make_deploy /tmp/qtts.yaml
@@ -88,6 +89,7 @@ generate a second YAML with `QTTS_DEV0=2 QTTS_DEV1=3` and start it on another po
 | `QTTS_SLOT_LEN` | 2048 | per-request KV slots = stage-0 `max_model_len` (prompt + frames; 12.5 frames per second of audio, so ~2.5 min) |
 | `QTTS_PREFILL_CTX` / `QTTS_PREFILL_CTX_BUCKETS` | 256 / 128 | prefill buckets that attend only the first N KV slots when the prompt fits (exact; Tb=128 prefill 65 -> 16 ms at B=32) |
 | `QTTS_HOST_THREADS` | 2 | torch host threads per stage process |
+| `QTTS_CP_VEC` | 0 | `1` = elementwise code-predictor attention (slower under lite: 24 vs 10 ms at B=32) |
 | `QTTS_GREEDY` | 0 | `1` writes greedy defaults into the YAML |
 
 Sampling is **per request** (one compiled graph serves mixed batches). Defaults come from the deploy YAML
