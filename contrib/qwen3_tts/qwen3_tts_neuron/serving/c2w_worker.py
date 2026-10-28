@@ -76,6 +76,7 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
         self.ctx, self.up = self.c2w.ctx, self.c2w.up
         logger.info("[NeuronC2W] code2wav loaded in %.1fs device=%s", time.time() - t0, self.device)
 
+    @torch.inference_mode()  # same grad mode as execute_model, or dynamo recompiles every graph on first real use
     def warmup(self):
         t0 = time.time()
         w = torch.randint(0, 2048, (self.c2w.ctx + self.c2w.chunk, Q))
@@ -150,7 +151,11 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
             lctx = int(_meta(st["info"], "left_context_size", 0) or 0)
             nc = ncomp.get(rid, 0)
             toks = st["tokens"][nc: nc + n]
+            _t = time.perf_counter()
             wavs.append(self._decode(rid, toks, lctx))
+            _dt = time.perf_counter() - _t
+            if _dt > 0.2 or os.environ.get("QTTS_C2W_TRACE") == "1":
+                logger.info("[NeuronC2W] rid=%s decode %d tok lctx=%d in %.3fs", rid, len(toks), lctx, _dt)
         self._last = (req_ids, wavs)
         return None
 

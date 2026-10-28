@@ -113,6 +113,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         self.pending_frames: dict[str, torch.Tensor] = {}
         logger.info("[NeuronTTS] talker loaded in %.1fs (B=%d S=%d dtype=%s device=%s)", time.time() - t0, self.B, self.S, dt, dev)
 
+    @torch.inference_mode()  # same grad mode as execute_model, or dynamo recompiles every graph on first real use
     def warmup(self):
         t0 = time.time()
         pad = torch.zeros(1, 1, self.H, dtype=self.eng.dtype)
@@ -139,7 +140,12 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         bi = torch.tensor([b], device=dev)
         for start, n, Tb, p in prefill_plan(T, e.prefill_buckets, S):
             x = torch.zeros(1, Tb, self.H, dtype=dt); x[:, Tb - n:] = emb[:, start:start + n].to(dt)
+            _t = time.perf_counter()
             hl, lg = self.prefill_fn(x.to(dev), bi, p.to(dev))
+            if os.environ.get("QTTS_PREFILL_TRACE") == "1":
+                lg.cpu()
+                logger.info("[NeuronTTS] prefill slot=%d T=%d chunk start=%d n=%d Tb=%d %.3fs", b, T, start, n, Tb,
+                            time.perf_counter() - _t)
         self.h = self.h.index_copy(0, bi, hl)
         self.lg = self.lg.index_copy(0, bi, lg)
         self.seen = self.seen.index_copy(0, bi, torch.zeros(1, self.V, dtype=torch.bool, device=dev))
@@ -213,7 +219,12 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
 
     def _build_prompt(self, info):
         """-> (prompt [1,T,H], trailing [N,H], tts_pad [1,1,H], ref_code [R,16] | None)."""
-        return self.prompts.build(info)
+        t0 = time.perf_counter()
+        out = self.prompts.build(info)
+        dt = time.perf_counter() - t0
+        if dt > 0.05:
+            logger.info("[NeuronTTS] prompt build %.3fs (T=%d, torch threads=%d)", dt, out[0].shape[1], torch.get_num_threads())
+        return out
 
     # ---------------------------------------------------------------- engine-core API
     @torch.inference_mode()
@@ -286,6 +297,9 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                 emitted[rid] = (cb0, c)
                 self.requests[rid].pop("new_slot", None)
         _t_frame = time.perf_counter()
+        if _t_frame - _t_enter > 0.5:
+            logger.info("[NeuronTTS] slow step: setup+prefill %.3fs (%d prefills) frame %.3fs active=%d maxpos=%d",
+                        _t_pre - _t_enter, n_prefill, _t_frame - _t_pre, len(active), int(self.pos.max()))
         self._last = (list(scheduler_output.num_scheduled_tokens.keys()), emitted)
         if os.environ.get("QTTS_STEP_STATS") == "1":
             now = time.perf_counter()

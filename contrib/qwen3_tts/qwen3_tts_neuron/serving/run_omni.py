@@ -36,9 +36,13 @@ elif MODEL_TYPE == "base":
              dict(tag="base_icl_ns", text=TEXT2, language="English", ref_text=REF_TEXT, non_streaming_mode=True)]
 
 
+if os.environ.get("QTTS_CASES"):  # jsonl of {tag, text, language, instruct, ...}
+    CASES = [json.loads(l) for l in open(os.environ["QTTS_CASES"]) if l.strip()]
+
+
 def to_info(c):
     task = {"custom_voice": "CustomVoice", "base": "Base"}.get(MODEL_TYPE, "VoiceDesign")
-    info = {"task_type": [task], "text": [c["text"]], "language": [c["language"]], "max_new_tokens": [2048],
+    info = {"task_type": [task], "text": [c["text"]], "language": [c["language"]], "max_new_tokens": [int(os.environ.get("QTTS_EVAL_MAX_NEW", "2048"))],
             "non_streaming_mode": [c.get("non_streaming_mode", task != "Base")]}
     for k in ("instruct", "speaker", "ref_text", "x_vector_only_mode"):
         if c.get(k) is not None:

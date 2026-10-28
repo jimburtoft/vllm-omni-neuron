@@ -114,6 +114,9 @@ class PromptBuilder:
             text_projection=proj, codec_embed=codec_embed, residual_code_embeddings=residual, speaker_encoder=spk,
             tts_pad_embed=self.tts_pad, encode_ref_audio_batch=_LazyCodecEncoder(model_path), speaker_cache=cache)
         self.b._embedding_dtype = hp
+        if self.model_type == "base":  # load the codec encoder and code-predictor tables now, not on the first request
+            self.b._encode_ref_audio_batch_fn._load()
+            residual()
 
     @torch.no_grad()
     def build(self, info: dict):

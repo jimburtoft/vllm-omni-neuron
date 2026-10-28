@@ -25,6 +25,9 @@ exactly (`tests/`).
 - vLLM-Omni venv: `/opt/aws_neuronx_venv_pytorch_inference_vllm_omni_0_29_0_0_2_0` (vllm 0.29.0, vllm-omni 0.29.0rc1).
 - Optional bare-engine venv: `/opt/aws_neuronx_venv_torch_neuronx_2_14_0`.
 
+Activate the venv (`source .../bin/activate`) rather than calling its `python` directly: the compiler is found
+through `PATH` (otherwise compilation fails with `posix_spawn failed: No such file or directory`).
+
 ```bash
 git clone -b contrib/qwen3-tts https://github.com/jimburtoft/vllm-omni-neuron.git
 export PYTHONPATH=$PWD/vllm-omni-neuron/contrib/qwen3_tts NEURON_SKIP_EFA_AFFINITY=1
