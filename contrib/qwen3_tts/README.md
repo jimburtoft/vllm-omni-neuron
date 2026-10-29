@@ -64,6 +64,7 @@ utterances; RTFx = seconds of audio per second for the whole device):
 | 1 server, 3 talkers (cores 0,2,3) + 1 shared vocoder (core 1) | 16 | 61.5 | 5.6 s |
 | **1 server, 2 talkers (cores 0,2) + 2 vocoders (cores 1,3)** | **32** | **138.4** | 4.3 s |
 | 1 server, 3 talkers + 1 vocoder | 32 | 71.3 | 12.7 s (vocoder-bound) |
+| 1 server, 3 talkers + 1 vocoder, NKI vocoder (`QTTS_C2W_NKI_BLOCKS=1,2,3`) | 32 | 100.2 | 9.1 s |
 
 The B=32 row is at concurrency 160; at concurrency 96 the same server gives 117x at p50 2.9 s (measured before
 vocoder batching). Streaming TTFA p50 is 118 ms at concurrency 32. For latency, use a B=1 talker: 0.74 s per ~4 s utterance, TTFA 44 ms.
@@ -90,6 +91,7 @@ generate a second YAML with `QTTS_DEV0=2 QTTS_DEV1=3` and start it on another po
 | `QTTS_PREFILL_CTX` / `QTTS_PREFILL_CTX_BUCKETS` | 256 / 128 | prefill buckets that attend only the first N KV slots when the prompt fits (exact; Tb=128 prefill 65 -> 16 ms at B=32) |
 | `QTTS_HOST_THREADS` | 2 | torch host threads per stage process |
 | `QTTS_C2W_BATCH` | 4 | full-context vocoder windows decoded per call across requests (exact in fp32) |
+| `QTTS_C2W_NKI_BLOCKS` | (off) | decoder blocks run as fused NKI kernels (`1,2,3` measured: vocoder window 19.2 -> 10.6 ms at B=1, 12.5 -> 8.7 ms/window at B=4; block 0 does not fit SBUF) |
 | `QTTS_CP_VEC` | 0 | `1` = elementwise code-predictor attention (slower under lite: 24 vs 10 ms at B=32) |
 | `QTTS_GREEDY` | 0 | `1` writes greedy defaults into the YAML |
 
