@@ -151,6 +151,8 @@ class Code2Wav(nn.Module):
         from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
         from .kernels.vocoder_nki import ctconv_params, out_params, snake_conv_out, snake_ctconv, snake_resunit
         self._nki_k = wrap_nki(snake_resunit)
+        from .kernels.vocoder_nki import SNAKE_IMPL
+        self._snake_impl = SNAKE_IMPL
         dev = self.fw.device
         # block heads (snake + transposed conv) of the NKI blocks, and the output conv
         self._nki_head = os.environ.get("QTTS_C2W_NKI_HEAD", "1") == "1" and bool(self.nki_blocks)
@@ -171,7 +173,7 @@ class Code2Wav(nn.Module):
         names = self._nki_p[(bi, ri)]
         args = [getattr(self, f"_nki_{bi}_{ri}_{k}") for k in names]
         return self._nki_k[self._nki_grid](x.to(torch.bfloat16).contiguous(), *args, dil,
-                                            int(os.environ.get("QTTS_C2W_NKI_TILE", "512"))).to(x.dtype)
+                                            int(os.environ.get("QTTS_C2W_NKI_TILE", "512")), self._snake_impl).to(x.dtype)
 
     # ------------------------------------------------------------------ building blocks
     @staticmethod
@@ -260,7 +262,7 @@ class Code2Wav(nn.Module):
             if bi in self.nki_blocks and self._nki_head:
                 x = self._nki_k_head[self._nki_grid](x.to(torch.bfloat16).contiguous(),
                                                      *[getattr(self, f"_nkih_{bi}_{k}") for k in ("wt", "bias", "a", "b")],
-                                                     r, int(os.environ.get("QTTS_C2W_NKI_TILEQ", "256")))
+                                                     r, int(os.environ.get("QTTS_C2W_NKI_TILEQ", "256")), self._snake_impl)
             else:
                 x = _snake(x, Bk["a"], Bk["b"])
                 x = self._ctconv(x, Bk["tw"], Bk["tb"], r)
@@ -276,7 +278,8 @@ class Code2Wav(nn.Module):
                 x = res + y
         if self._nki_out:
             x = self._nki_k_out[self._nki_grid](x.to(torch.bfloat16).contiguous(),
-                                                *[getattr(self, f"_nkio_{k}") for k in ("wt", "bias", "a", "b")], 512)
+                                                *[getattr(self, f"_nkio_{k}") for k in ("wt", "bias", "a", "b")], 512,
+                                                self._snake_impl)
         else:
             x = _snake(x, self.fa, self.fb)
             x = self._cconv(x, self.fw, self.fcb)

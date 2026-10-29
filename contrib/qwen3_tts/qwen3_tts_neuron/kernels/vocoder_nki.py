@@ -32,15 +32,35 @@ import nki.language as nl
 PI = math.pi
 
 
+import os as _os
+
+# NOTE: libtorch-neuronx-lite keys its NKI cache on the TOP-LEVEL kernel source + args only. Variants that live in
+# helpers must be selected through a kernel argument (snake_impl), never a module global, or a stale NEFF is reused.
+SNAKE_IMPL = int(_os.environ.get("QTTS_C2W_SNAKE_IMPL", "1"))  # 1 = 6-instruction snake (default), 0 = 7
 ROUND_C = 12582912.0  # 1.5 * 2**23: (v + C) - C rounds an fp32 |v| < 2**22 to the nearest integer
 
 
-def _snake_tile(dst, src, ap_t, b_t, rows, cols, s_v, s_k):
+def _snake_tile(dst, src, ap_t, b_t, rows, cols, s_v, s_k, impl=0):
     """dst[rows, cols] = src + b * sin(a * src)^2  (src fp32 or bf16 in SBUF; ap = a / pi, b fp32 [rows, 1]).
 
     sin on the scalar engine accepts [-pi, pi] only, and the ALU has no mod/floor, so range-reduce with the fp32
     rounding trick: v = a*x/pi, k = round(v), sin^2(a*x) = sin^2(pi * (v - k)) with pi*(v-k) in [-pi/2, pi/2].
     """
+    if impl == 1:
+        # 4 instructions: v = a*x/pi (DVE) | k = round(v) in 1 two-op tensor_scalar (Pool) | sin(pi*(v-k)) via
+        # scalar_tensor_tensor (DVE: v - k, then ACT sin+scale) | square + b*() + x fused in one STT
+        nisa.tensor_scalar(dst=s_v[0:rows, 0:cols], data=src, op0=nl.multiply, operand0=ap_t)
+        nisa.tensor_scalar(dst=s_k[0:rows, 0:cols], data=s_v[0:rows, 0:cols], op0=nl.add, operand0=ROUND_C,
+                           op1=nl.subtract, operand1=ROUND_C)
+        nisa.tensor_tensor(dst=s_v[0:rows, 0:cols], data1=s_v[0:rows, 0:cols], data2=s_k[0:rows, 0:cols],
+                           op=nl.subtract)
+        nisa.activation(dst=s_k[0:rows, 0:cols], op=nl.sin, data=s_v[0:rows, 0:cols], scale=PI)
+        # (sin * sin) * b + x : scalar_tensor_tensor computes (data op0 operand0) op1 operand1
+        nisa.tensor_tensor(dst=s_v[0:rows, 0:cols], data1=s_k[0:rows, 0:cols], data2=s_k[0:rows, 0:cols],
+                           op=nl.multiply)
+        nisa.scalar_tensor_tensor(dst=dst, data=s_v[0:rows, 0:cols], op0=nl.multiply, operand0=b_t,
+                                  op1=nl.add, operand1=src)
+        return
     nisa.tensor_scalar(dst=s_v[0:rows, 0:cols], data=src, op0=nl.multiply, operand0=ap_t)            # v
     nisa.tensor_scalar(dst=s_k[0:rows, 0:cols], data=s_v[0:rows, 0:cols], op0=nl.add, operand0=ROUND_C)
     nisa.tensor_scalar(dst=s_k[0:rows, 0:cols], data=s_k[0:rows, 0:cols], op0=nl.subtract, operand0=ROUND_C)  # k
@@ -53,7 +73,7 @@ def _snake_tile(dst, src, ap_t, b_t, rows, cols, s_v, s_k):
 
 
 @nki.jit
-def snake_resunit(x, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t=512):
+def snake_resunit(x, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t=512, snake_impl=0):
     """One fused residual unit. C channels are split into channel tiles of <= 128 (C = 96 / 192 / 384 / 768).
 
     Args:
@@ -108,7 +128,7 @@ def snake_resunit(x, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t=512):
                     nisa.memset(dst=sn[0:cs, ci, 0:z0], value=0.0)
                 nisa.dma_copy(dst=xr[0:cs, ci, z0:H + n], src=x[b, ci * CT:ci * CT + cs, lo + z0:t0 + n])
                 _snake_tile(sn[0:cs, ci, z0:H + n], xr[0:cs, ci, z0:H + n], prm[0:cs, ci, 2:3], prm[0:cs, ci, 3:4],
-                            cs, H + n - z0, sr, ss)
+                            cs, H + n - z0, sr, ss, snake_impl)
             # dilated causal conv per output-channel tile: 7 taps x NC input tiles accumulate in PSUM
             sn2 = nl.ndarray((CT, NC, TT), dtype=nl.bfloat16, buffer=nl.sbuf)
             for co in range(NC):
@@ -122,7 +142,7 @@ def snake_resunit(x, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t=512):
                 z = nl.ndarray((CT, TT), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.activation(dst=z[0:os_, 0:n], op=nl.copy, data=ps[0:os_, 0:n], bias=prm[0:os_, co, 0:1])
                 _snake_tile(sn2[0:os_, co, 0:n], z[0:os_, 0:n], prm[0:os_, co, 4:5], prm[0:os_, co, 5:6], os_, n,
-                            sr, ss)
+                            sr, ss, snake_impl)
             # 1x1 conv + bias + residual per output-channel tile
             for co in range(NC):
                 os_ = min(CT, C - co * CT)
@@ -139,7 +159,7 @@ def snake_resunit(x, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t=512):
 
 
 @nki.jit
-def snake_ctconv(x, wt, bias, a, b, rate, tile_q=256):
+def snake_ctconv(x, wt, bias, a, b, rate, tile_q=256, snake_impl=0):
     """Block head: snake, then causal transposed conv (kernel 2*rate, stride rate, right-trimmed by rate).
 
     y[:, q*r + j] = W_j^T s[:, q] + W_{j+r}^T s[:, q-1] + bias   (s = snake(x), s[:, -1] = 0)
@@ -191,7 +211,7 @@ def snake_ctconv(x, wt, bias, a, b, rate, tile_q=256):
                     nisa.memset(dst=sn[0:cs, ci, 0:1], value=0.0)
                 nisa.dma_copy(dst=xr[0:cs, ci, z0:n + 1], src=x[bb, ci * CI:ci * CI + cs, q0 - 1 + z0:q0 + n])
                 _snake_tile(sn[0:cs, ci, z0:n + 1], xr[0:cs, ci, z0:n + 1], prm[0:cs, ci, 0:1], prm[0:cs, ci, 1:2],
-                            cs, n + 1 - z0, sv, sk)
+                            cs, n + 1 - z0, sv, sk, snake_impl)
             for co in range(NCO):
                 os_ = min(CO, Cout - co * CO)
                 yo = nl.ndarray((CO, TQ, r), dtype=x.dtype, buffer=nl.sbuf)
@@ -209,7 +229,7 @@ def snake_ctconv(x, wt, bias, a, b, rate, tile_q=256):
 
 
 @nki.jit
-def snake_conv_out(x, wt, bias, a, b, tile_t=512):
+def snake_conv_out(x, wt, bias, a, b, tile_t=512, snake_impl=0):
     """Decoder output: snake, causal conv (k=7, Cout=1), clamp to [-1, 1].
 
     Args:
@@ -247,7 +267,7 @@ def snake_conv_out(x, wt, bias, a, b, tile_t=512):
             if z0 > 0:
                 nisa.memset(dst=sn[0:C, 0:z0], value=0.0)
             nisa.dma_copy(dst=xr[0:C, z0:H + n], src=x[bb, 0:C, lo + z0:t0 + n])
-            _snake_tile(sn[0:C, z0:H + n], xr[0:C, z0:H + n], prm[0:C, 0:1], prm[0:C, 1:2], C, H + n - z0, sv, sk)
+            _snake_tile(sn[0:C, z0:H + n], xr[0:C, z0:H + n], prm[0:C, 0:1], prm[0:C, 1:2], C, H + n - z0, sv, sk, snake_impl)
             ps = nl.ndarray((1, TT), dtype=nl.float32, buffer=nl.psum)
             for k in range(K):
                 nisa.nc_matmul(dst=ps[0:1, 0:n], stationary=w_sb[0:C, k, 0:1], moving=sn[0:C, k:k + n])
