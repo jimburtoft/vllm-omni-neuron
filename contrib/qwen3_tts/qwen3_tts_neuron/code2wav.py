@@ -131,6 +131,8 @@ class Code2Wav(nn.Module):
         self.fw, self.fcb = P(g(f"decoder.{nb + 2}.conv.weight")), P(g(f"decoder.{nb + 2}.conv.bias"))
 
     nki_blocks: frozenset = frozenset()
+    _nki_head = False
+    _nki_out = False
 
     def prepare_nki(self, blocks=None):
         """Route the residual units of `blocks` (default QTTS_C2W_NKI_BLOCKS) through the NKI kernel. Call after
@@ -147,9 +149,23 @@ class Code2Wav(nn.Module):
                     self.register_buffer(f"_nki_{bi}_{ri}_{k}", buf, persistent=False)
                 self._nki_p[(bi, ri)] = list(p)
         from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
-        from .kernels.vocoder_nki import snake_resunit
+        from .kernels.vocoder_nki import ctconv_params, out_params, snake_conv_out, snake_ctconv, snake_resunit
         self._nki_k = wrap_nki(snake_resunit)
-        self._nki_grid = int(os.environ.get("QTTS_C2W_NKI_GRID", "1"))
+        dev = self.fw.device
+        # block heads (snake + transposed conv) of the NKI blocks, and the output conv
+        self._nki_head = os.environ.get("QTTS_C2W_NKI_HEAD", "1") == "1" and bool(self.nki_blocks)
+        if self._nki_head:
+            self._nki_k_head = wrap_nki(snake_ctconv)
+            for bi in self.nki_blocks:
+                for k, v in ctconv_params(self.blocks[bi]).items():
+                    self.register_buffer(f"_nkih_{bi}_{k}", v.to(dev), persistent=False)
+        self._nki_out = os.environ.get("QTTS_C2W_NKI_OUT", "1") == "1" and 3 in self.nki_blocks
+        if self._nki_out:
+            self._nki_k_out = wrap_nki(snake_conv_out)
+            for k, v in out_params(self.fw, self.fcb, self.fa, self.fb).items():
+                self.register_buffer(f"_nkio_{k}", v.to(dev), persistent=False)
+        # grid must equal the compile LNC (NCC_EVRF066 otherwise); the kernel itself does not shard across programs
+        self._nki_grid = int(os.environ.get("QTTS_C2W_NKI_GRID", os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2")))
 
     def _nki_unit(self, x, bi, ri, dil):
         names = self._nki_p[(bi, ri)]
@@ -241,8 +257,13 @@ class Code2Wav(nn.Module):
         for bi, (Bk, r) in enumerate(zip(self.blocks, self.rates)):
             if bi == 1 and b > a:
                 x = x[..., (b - a) * per * self.rates[0]:]
-            x = _snake(x, Bk["a"], Bk["b"])
-            x = self._ctconv(x, Bk["tw"], Bk["tb"], r)
+            if bi in self.nki_blocks and self._nki_head:
+                x = self._nki_k_head[self._nki_grid](x.to(torch.bfloat16).contiguous(),
+                                                     *[getattr(self, f"_nkih_{bi}_{k}") for k in ("wt", "bias", "a", "b")],
+                                                     r, int(os.environ.get("QTTS_C2W_NKI_TILEQ", "256")))
+            else:
+                x = _snake(x, Bk["a"], Bk["b"])
+                x = self._ctconv(x, Bk["tw"], Bk["tb"], r)
             for ri, dil in enumerate((1, 3, 9)):
                 if bi in self.nki_blocks:
                     x = self._nki_unit(x, bi, ri, dil)
@@ -253,8 +274,12 @@ class Code2Wav(nn.Module):
                 y = _snake(y, Bk[f"r{ri}a2"], Bk[f"r{ri}b2"])
                 y = self._cconv(y, Bk[f"r{ri}w2"], Bk[f"r{ri}c2"])
                 x = res + y
-        x = _snake(x, self.fa, self.fb)
-        x = self._cconv(x, self.fw, self.fcb)
+        if self._nki_out:
+            x = self._nki_k_out[self._nki_grid](x.to(torch.bfloat16).contiguous(),
+                                                *[getattr(self, f"_nkio_{k}") for k in ("wt", "bias", "a", "b")], 512)
+        else:
+            x = _snake(x, self.fa, self.fb)
+            x = self._cconv(x, self.fw, self.fcb)
         if crop_ctx:
             x = x[..., (crop_ctx - b) * self.upsample_total:]
         return x.clamp(-1, 1).view(Bt, -1)

@@ -89,5 +89,21 @@ for ri in [int(u) for u in a.units.split(",")]:
             ts = []
             for _ in range(20):
                 t0 = time.perf_counter(); fn(xd).cpu(); ts.append(time.perf_counter() - t0)
+        # stock graph for the same unit (bf16 convs, fp32 snake), same device
+        Bd = {kk: v.to(dev) for kk, v in Bk.items()}
+        def stock(xx):
+            xf = xx.to(torch.bfloat16)
+            y = _snake(xf, Bd[f"r{ri}a1"].to(torch.bfloat16), Bd[f"r{ri}b1"].to(torch.bfloat16))
+            y = F.conv1d(F.pad(y, ((7 - 1) * dil, 0)), Bd[f"r{ri}w1"].to(torch.bfloat16), Bd[f"r{ri}c1"].to(torch.bfloat16), dilation=dil)
+            y = _snake(y, Bd[f"r{ri}a2"].to(torch.bfloat16), Bd[f"r{ri}b2"].to(torch.bfloat16))
+            y = F.conv1d(y, Bd[f"r{ri}w2"].to(torch.bfloat16), Bd[f"r{ri}c2"].to(torch.bfloat16))
+            return xf + y
+        sfn = compile_fn()(stock)
+        with torch.inference_mode():
+            so = sfn(xd).cpu()
+            ts2 = []
+            for _ in range(20):
+                t0 = time.perf_counter(); sfn(xd).cpu(); ts2.append(time.perf_counter() - t0)
+        print(f"[neuron] stock graph same unit: vs fp32 {stats(so, r)} | {1000 * sorted(ts2)[10]:.2f} ms", flush=True)
         print(f"[neuron] block {a.block} unit {ri} dil {dil} C {C} T {a.T}: kernel vs fp32 {stats(o, r)} | "
               f"stock-bf16 vs fp32 {stats(rb, r)} | {1000 * sorted(ts)[10]:.2f} ms", flush=True)
