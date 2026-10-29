@@ -26,6 +26,9 @@ from safetensors import safe_open
 
 
 SNAKE_FP32 = os.environ.get("C2W_SNAKE_FP32", "1") == "1"
+# Fused NKI residual units (snake -> dilated conv -> snake -> 1x1 conv -> +x) for decoder blocks listed here
+# (indices into the 4 upsample blocks; "" = off). Needs a Neuron device or NKI_SIMULATOR=1.
+NKI_BLOCKS = {int(b) for b in os.environ.get("QTTS_C2W_NKI_BLOCKS", "").split(",") if b.strip()}
 
 
 def _snake(x, a_exp, inv_b):
@@ -127,6 +130,33 @@ class Code2Wav(nn.Module):
         self.fa, self.fb = snake_params(f"decoder.{nb + 1}")
         self.fw, self.fcb = P(g(f"decoder.{nb + 2}.conv.weight")), P(g(f"decoder.{nb + 2}.conv.bias"))
 
+    nki_blocks: frozenset = frozenset()
+
+    def prepare_nki(self, blocks=None):
+        """Route the residual units of `blocks` (default QTTS_C2W_NKI_BLOCKS) through the NKI kernel. Call after
+        .to(device); parameters are packed once into device buffers."""
+        from .kernels.vocoder_nki import resunit_params
+        self.nki_blocks = frozenset(NKI_BLOCKS if blocks is None else blocks)
+        self._nki_p = {}
+        for bi in self.nki_blocks:
+            for ri in range(3):
+                p = resunit_params(self.blocks[bi], ri)
+                dev = self.blocks[bi][f"r{ri}w1"].device
+                for k, v in p.items():
+                    buf = v.to(dev)
+                    self.register_buffer(f"_nki_{bi}_{ri}_{k}", buf, persistent=False)
+                self._nki_p[(bi, ri)] = list(p)
+        from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+        from .kernels.vocoder_nki import snake_resunit
+        self._nki_k = wrap_nki(snake_resunit)
+        self._nki_grid = int(os.environ.get("QTTS_C2W_NKI_GRID", "1"))
+
+    def _nki_unit(self, x, bi, ri, dil):
+        names = self._nki_p[(bi, ri)]
+        args = [getattr(self, f"_nki_{bi}_{ri}_{k}") for k in names]
+        return self._nki_k[self._nki_grid](x.to(torch.bfloat16).contiguous(), *args, dil,
+                                            int(os.environ.get("QTTS_C2W_NKI_TILE", "512"))).to(x.dtype)
+
     # ------------------------------------------------------------------ building blocks
     @staticmethod
     def _cconv(x, w, b, dilation=1, groups=1):
@@ -214,6 +244,9 @@ class Code2Wav(nn.Module):
             x = _snake(x, Bk["a"], Bk["b"])
             x = self._ctconv(x, Bk["tw"], Bk["tb"], r)
             for ri, dil in enumerate((1, 3, 9)):
+                if bi in self.nki_blocks:
+                    x = self._nki_unit(x, bi, ri, dil)
+                    continue
                 res = x
                 y = _snake(x, Bk[f"r{ri}a1"], Bk[f"r{ri}b1"])
                 y = self._cconv(y, Bk[f"r{ri}w1"], Bk[f"r{ri}c1"], dilation=dil)
@@ -249,6 +282,8 @@ class Code2WavRunner:
     def __init__(self, st_dir, device="neuron", dtype=torch.bfloat16, chunk=25, left_ctx=25, compile=True, model=None,
                  crop=True, small=8):
         self.m = (model or Code2Wav(st_dir, dtype)).to(device).eval()
+        if NKI_BLOCKS:
+            self.m.prepare_nki()
         self.dev, self.chunk, self.ctx = device, chunk, left_ctx
         self.up = self.m.upsample_total
         self.crop = crop
