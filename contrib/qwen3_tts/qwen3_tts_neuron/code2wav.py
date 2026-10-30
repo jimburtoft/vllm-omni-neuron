@@ -355,6 +355,51 @@ class Code2WavRunner:
         return self.fn(c.to(self.dev))[:, : n * self.up]
 
     @torch.no_grad()
+    def decode_full_batch(self, wins, buckets=(1, 2, 4), max_inflight=16):
+        """Several no-context windows (each [n_i, 16], 8 < n_i <= ctx+chunk) through the full (uncropped) graph in
+        batched calls; returns wav per window for its n_i frames. Rows are independent (right padding is causal-safe)."""
+        W, out, i = self.ctx + self.chunk, [None] * len(wins), 0
+        bmax = max(buckets)
+        while i < len(wins):
+            group = list(range(i, min(i + bmax, len(wins))))
+            Bb = next(b for b in buckets if b >= len(group))
+            c = torch.zeros(Bb, 16, W, dtype=torch.long)
+            for r, j in enumerate(group):
+                c[r, :, : wins[j].shape[0]] = wins[j].t()
+            y = self.fn(c.to(self.dev))
+            for r, j in enumerate(group):
+                out[j] = y[r : r + 1, : wins[j].shape[0] * self.up]
+            i += len(group)
+            calls = getattr(self, "_inflight", 0) + 1
+            if calls >= max_inflight:
+                y.cpu()
+                calls = 0
+            self._inflight = calls
+        return out
+
+    @torch.no_grad()
+    def decode_small_batch(self, wins, buckets=(1, 2, 4, 8), max_inflight=16):
+        """Short windows (each [n_i <= small, 16]) through the small graph in batched calls."""
+        out, i = [None] * len(wins), 0
+        bmax = max(buckets)
+        while i < len(wins):
+            group = list(range(i, min(i + bmax, len(wins))))
+            Bb = next(b for b in buckets if b >= len(group))
+            c = torch.zeros(Bb, 16, self.small, dtype=torch.long)
+            for r, j in enumerate(group):
+                c[r, :, : wins[j].shape[0]] = wins[j].t()
+            y = self.fn_small(c.to(self.dev))
+            for r, j in enumerate(group):
+                out[j] = y[r : r + 1, : wins[j].shape[0] * self.up]
+            i += len(group)
+            calls = getattr(self, "_inflight", 0) + 1
+            if calls >= max_inflight:
+                y.cpu()
+                calls = 0
+            self._inflight = calls
+        return out
+
+    @torch.no_grad()
     def decode_crop_batch(self, wins, buckets=(1, 2, 4), max_inflight=16):
         """Several full-context windows (each [ctx + n_i, 16], n_i <= chunk) in batched crop-graph calls.
         Returns one wav per window (only the new frames' audio). Rows are independent, so the result per window is

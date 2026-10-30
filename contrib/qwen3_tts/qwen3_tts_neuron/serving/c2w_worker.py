@@ -89,6 +89,9 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
         for b in (2, 4, 8):
             if b <= self.c2w_batch:
                 self.c2w.decode_crop_batch([w] * b, buckets=(b,))
+                self.c2w.decode_full_batch([w[:25]] * b, buckets=(b,))
+                if self.c2w.small:
+                    self.c2w.decode_small_batch([w[:1]] * b, buckets=(b,))
         return time.time() - t0
 
     def _windows(self, rid, flat: list[int], lctx: int):
@@ -125,6 +128,34 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
                                             buckets=tuple(b for b in (1, 2, 4, 8) if b <= self.c2w_batch))
             for (i, j), y in zip(crop, ys):
                 out[i][j] = y
+        # first windows of new requests (no left context): batch the small-graph and full-graph ones too
+        bk = tuple(b for b in (1, 2, 4, 8) if b <= self.c2w_batch)
+        if self.c2w_batch > 1:
+            small = [(i, j) for i, ws in enumerate(per_req) for j, (w, k) in enumerate(ws)
+                     if out[i][j] is None and k == 0 and self.c2w.small and w.shape[0] <= self.c2w.small]
+            if small:
+                ys = self.c2w.decode_small_batch([per_req[i][j][0] for i, j in small], buckets=bk)
+                for (i, j), y in zip(small, ys):
+                    out[i][j] = y
+            full = [(i, j) for i, ws in enumerate(per_req) for j, (w, k) in enumerate(ws) if out[i][j] is None and k == 0]
+            if full:
+                ys = self.c2w.decode_full_batch([per_req[i][j][0] for i, j in full], buckets=bk)
+                for (i, j), y in zip(full, ys):
+                    out[i][j] = y
+        if os.environ.get("QTTS_C2W_TRACE") == "1":
+            kinds = {"crop": 0, "small": 0, "full": 0}
+            for ws in per_req:
+                for w, k in ws:
+                    if self.c2w.crop and k == self.ctx:
+                        kinds["crop"] += 1
+                    elif self.c2w.small and w.shape[0] <= self.c2w.small:
+                        kinds["small"] += 1
+                    else:
+                        kinds["full"] += 1
+            self._kinds = {kk: getattr(self, "_kinds", {}).get(kk, 0) + v for kk, v in kinds.items()}
+            self._kn = getattr(self, "_kn", 0) + 1
+            if self._kn % 100 == 0:
+                logger.info("[NeuronC2W] window kinds so far: %s", self._kinds)
         n_inflight = 0
         for i, ws in enumerate(per_req):
             for j, (w, k) in enumerate(ws):
