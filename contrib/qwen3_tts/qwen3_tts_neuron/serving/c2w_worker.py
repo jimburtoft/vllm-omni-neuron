@@ -213,6 +213,18 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
             per_req.append(self._windows(rid, st["tokens"][nc: nc + n], lctx))
         wavs = self._decode_all(per_req)
         _dt = time.perf_counter() - _t
+        if os.environ.get("QTTS_STEP_STATS") == "1":
+            st = self.__dict__.setdefault("_st", dict(n=0, busy=0.0, w=0, reqs=0, t0=time.perf_counter(), last=0.0, gap=0.0))
+            now = time.perf_counter()
+            if st["last"]:
+                st["gap"] += _t - st["last"]
+            st["last"] = now
+            st["n"] += 1; st["busy"] += _dt; st["reqs"] += len(req_ids); st["w"] += sum(len(w) for w in per_req)
+            if st["n"] % 200 == 0:
+                logger.info("[NeuronC2W] steps=%d: decode %.1f%% of wall, %.2f ms/step decode, %.2f ms/step between "
+                            "steps, %.1f reqs/step, %.1f windows/step", st["n"], 100 * st["busy"] / (now - st["t0"]),
+                            1000 * st["busy"] / 200, 1000 * st["gap"] / 200, st["reqs"] / 200, st["w"] / 200)
+                st.update(n=st["n"], busy=0.0, w=0, reqs=0, t0=now, gap=0.0)
         if _dt > 0.2 or os.environ.get("QTTS_C2W_TRACE") == "1":
             logger.info("[NeuronC2W] step: %d reqs, %d windows in %.3fs", len(req_ids), sum(len(w) for w in per_req), _dt)
         self._last = (req_ids, wavs)

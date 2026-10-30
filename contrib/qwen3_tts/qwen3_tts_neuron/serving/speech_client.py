@@ -82,7 +82,9 @@ async def main():
     os.makedirs(out, exist_ok=True)
     url = f"{base}/v1/audio/speech"
     sem = asyncio.Semaphore(conc)
-    async with httpx.AsyncClient(timeout=600.0) as client:
+    # httpx defaults to max_connections=100, which silently caps concurrency above 100
+    limits = httpx.Limits(max_connections=conc + 8, max_keepalive_connections=conc + 8)
+    async with httpx.AsyncClient(timeout=600.0, limits=limits) as client:
         async def run(i):
             async with sem:
                 return await one(client, url, model, i, out)
