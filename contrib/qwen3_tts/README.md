@@ -62,12 +62,13 @@ utterances; RTFx = seconds of audio per second for the whole device):
 | 2 servers x (1 talker + 1 vocoder) | 8 | 42.9 | 4.3 s |
 | 1 server, 2 talkers (cores 0,2) + 1 shared vocoder (core 1) | 8 | 44.0 | 2.8 s |
 | 1 server, 2 talkers (cores 0,2) + 2 vocoders (cores 1,3) | 32 | 143.8 | 5.4 s |
-| 1 server, 3 talkers + 1 vocoder | 48 | 107-109 | 4.8-8.0 s |
+| 1 server, 3 talkers + 1 vocoder | 48 | 111.5 (conc 160) / 132.6 (conc 300) | 4.6 / 7.8 s |
 | **1 server, 2 talkers + 2 vocoders** | **48** | **150.7 / 153.7 / 158.2** at concurrency 128 / 300 / 400 | 3.0 / 7.4 / 9.8 s |
 
 The NKI vocoder (default on device) is on in all rows from B=32 down. Streaming, B=48 2+2: TTFA p50 59 ms at
 concurrency 1, 118 ms at 64; 158.9x at concurrency 160. Single stream: 0.74 s per ~4 s utterance with a B=1 talker.
-Note: clients must allow enough connections (httpx defaults to 100, which caps concurrency silently).
+3 talkers + 1 vocoder is limited by the single stage-1 replica's per-step loop (requests wait ~1 s there after the
+talker finishes; vocoder compute ~40 % busy), not by the device. Note: clients must allow enough connections (httpx defaults to 100, which caps concurrency silently).
 
 ```bash
 QTTS_B=48 QTTS_REP0=2 QTTS_DEV0=0,2 QTTS_REP1=2 QTTS_DEV1=1,3 QTTS_B1=96 python -m qwen3_tts_neuron.serving.make_deploy /tmp/qtts.yaml
