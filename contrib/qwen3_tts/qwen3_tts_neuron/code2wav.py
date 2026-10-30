@@ -132,6 +132,7 @@ class Code2Wav(nn.Module):
 
     nki_blocks: frozenset = frozenset()
     _nki_head = False
+    _nki_fuse = False
     _nki_out = False
 
     def prepare_nki(self, blocks=None):
@@ -154,6 +155,16 @@ class Code2Wav(nn.Module):
         from .kernels.vocoder_nki import SNAKE_IMPL
         self._snake_impl = SNAKE_IMPL
         dev = self.fw.device
+        # all 3 residual units of a block in one kernel call
+        self._nki_fuse = os.environ.get("QTTS_C2W_NKI_FUSE_UNITS", "0") == "1" and bool(self.nki_blocks)
+        if self._nki_fuse:
+            from .kernels.vocoder_nki import resblock_params, snake_resblock
+            self._nki_k_blk = wrap_nki(snake_resblock)
+            for bi in self.nki_blocks:
+                p = resblock_params(self.blocks[bi])
+                self._nkib_names = list(p)
+                for k, v in p.items():
+                    self.register_buffer(f"_nkib_{bi}_{k}", v.to(dev), persistent=False)
         # block heads (snake + transposed conv) of the NKI blocks, and the output conv
         self._nki_head = os.environ.get("QTTS_C2W_NKI_HEAD", "1") == "1" and bool(self.nki_blocks)
         if self._nki_head:
@@ -267,6 +278,11 @@ class Code2Wav(nn.Module):
             else:
                 x = _snake(x, Bk["a"], Bk["b"])
                 x = self._ctconv(x, Bk["tw"], Bk["tb"], r)
+            if bi in self.nki_blocks and self._nki_fuse:
+                x = self._nki_k_blk[self._nki_grid](x.to(torch.bfloat16).contiguous(),
+                                                    *[getattr(self, f"_nkib_{bi}_{k}") for k in self._nkib_names],
+                                                    int(os.environ.get("QTTS_C2W_NKI_TILE", "512")), self._snake_impl)
+                continue
             for ri, dil in enumerate((1, 3, 9)):
                 if bi in self.nki_blocks:
                     x = self._nki_unit(x, bi, ri, dil)

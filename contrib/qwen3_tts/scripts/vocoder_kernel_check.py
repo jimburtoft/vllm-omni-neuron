@@ -67,7 +67,8 @@ for ri in [int(u) for u in a.units.split(",")]:
         except ImportError:
             cv = lambda t: t.float().numpy()
         t0 = time.time()
-        out = nki.simulate(snake_resunit)(args[0], cv(p["w1t"]), cv(p["c1"]), cv(p["w2t"]), cv(p["c2"]), cv(p["a1"]),
+        kk = snake_resunit[int(os.environ.get("SIM_GRID", "1"))] if os.environ.get("SIM_GRID") else snake_resunit
+        out = nki.simulate(kk)(args[0], cv(p["w1t"]), cv(p["c1"]), cv(p["w2t"]), cv(p["c2"]), cv(p["a1"]),
                                            cv(p["b1"]), cv(p["a2"]), cv(p["b2"]), dil, a.tile)
         o = torch.from_numpy(np.asarray(out).astype(np.float32))
         print(f"[sim] block {a.block} unit {ri} dil {dil} C {C} T {a.T}: kernel vs fp32 {stats(o, r)} | "

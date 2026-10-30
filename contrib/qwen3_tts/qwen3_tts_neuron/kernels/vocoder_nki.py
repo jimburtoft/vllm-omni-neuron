@@ -15,6 +15,9 @@ one HBM read of x and one write of out per unit, everything else stays in SBUF/P
 Layout: channels on partitions (tiles of <= 128 channels: C = 96 -> 1, 192 -> 2, 384 -> 3, 768 -> 6), time
 on the free dimension. Conv taps are 7 accumulating matmuls on shifted SBUF slices.
 
+Sharding: every kernel splits its time tiles across the programs of the launch grid (LNC=2 -> the 2 physical cores
+of the logical core), so the grid must equal the compile LNC.
+
 Precision: x / out / weights bf16; snake math in fp32; matmuls bf16 with fp32 PSUM accumulation. The reference
 (`code2wav._snake` with SNAKE_FP32) computes snake in fp32 and the convs in bf16.
 
@@ -40,12 +43,29 @@ SNAKE_IMPL = int(_os.environ.get("QTTS_C2W_SNAKE_IMPL", "1"))  # 1 = 6-instructi
 ROUND_C = 12582912.0  # 1.5 * 2**23: (v + C) - C rounds an fp32 |v| < 2**22 to the nearest integer
 
 
-def _snake_tile(dst, src, ap_t, b_t, rows, cols, s_v, s_k, impl=0):
+def _snake_tile(dst, src, ap_t, b_t, rows, cols, s_v, s_k, impl=0, c_t=None, nc_t=None):
     """dst[rows, cols] = src + b * sin(a * src)^2  (src fp32 or bf16 in SBUF; ap = a / pi, b fp32 [rows, 1]).
 
     sin on the scalar engine accepts [-pi, pi] only, and the ALU has no mod/floor, so range-reduce with the fp32
     rounding trick: v = a*x/pi, k = round(v), sin^2(a*x) = sin^2(pi * (v - k)) with pi*(v-k) in [-pi/2, pi/2].
     """
+    if impl == 4 or impl == 5:
+        # rounding on ACT: t = round(a*x/pi + C) (fp32 output rounds to an integer + C), k = t - C (exact);
+        # w = a*x/pi - k on DVE in one scalar_tensor_tensor; sin(pi*w) on ACT; square on DVE (4) or ACT (5);
+        # out = q*b + x on DVE.  DVE 3 / ACT 3 (impl 4), DVE 2 / ACT 4 (impl 5).
+        nisa.activation(dst=s_v[0:rows, 0:cols], op=nl.copy, data=src, scale=ap_t, bias=c_t)          # t
+        nisa.activation(dst=s_k[0:rows, 0:cols], op=nl.copy, data=s_v[0:rows, 0:cols], bias=nc_t)     # k
+        nisa.scalar_tensor_tensor(dst=s_v[0:rows, 0:cols], data=src, op0=nl.multiply, operand0=ap_t,
+                                  op1=nl.subtract, operand1=s_k[0:rows, 0:cols])                     # w = v - k
+        nisa.activation(dst=s_k[0:rows, 0:cols], op=nl.sin, data=s_v[0:rows, 0:cols], scale=PI)
+        if impl == 5:
+            nisa.activation(dst=s_v[0:rows, 0:cols], op=nl.square, data=s_k[0:rows, 0:cols])
+        else:
+            nisa.tensor_tensor(dst=s_v[0:rows, 0:cols], data1=s_k[0:rows, 0:cols], data2=s_k[0:rows, 0:cols],
+                               op=nl.multiply)
+        nisa.scalar_tensor_tensor(dst=dst, data=s_v[0:rows, 0:cols], op0=nl.multiply, operand0=b_t,
+                                  op1=nl.add, operand1=src)
+        return
     if impl == 2 or impl == 3:
         # engine-balanced: ACT 3 (v, sin, square), DVE 3 (round, v-k, b*q+x); impl 3 puts the round on GpSimd
         nisa.activation(dst=s_v[0:rows, 0:cols], op=nl.copy, data=src, scale=ap_t)
@@ -88,26 +108,27 @@ def _snake_tile(dst, src, ap_t, b_t, rows, cols, s_v, s_k, impl=0):
                               op1=nl.add, operand1=src)
 
 
-@nki.jit
-def snake_resunit(x, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t=512, snake_impl=0):
-    """One fused residual unit. C channels are split into channel tiles of <= 128 (C = 96 / 192 / 384 / 768).
+def _shard():
+    """(n_programs, program_id) on grid axis 0 (LNC=2 runs 2 programs, one per physical core)."""
+    if nl.program_ndim() == 0:
+        return 1, 0
+    return nl.num_programs(0), nl.program_id(0)
 
-    Args:
-        x:   [B, C, T] bf16 (HBM)
-        w1t: [7, C, C] bf16, w1t[k, cin, cout] = conv1.weight[cout, cin, k]
-        c1:  [C, 1] fp32 conv1 bias
-        w2t: [C, C] bf16, w2t[cin, cout] = conv2.weight[cout, cin, 0]
-        c2:  [C, 1] fp32 conv2 bias
-        a1, b1, a2, b2: [C, 1] fp32 snake params, a passed as exp(alpha) / pi, b = 1 / (exp(beta) + 1e-9)
-        dilation: int (static)
-    Returns:
-        out: [B, C, T] bf16
-    """
+
+def _round_consts(P):
+    """[P, 2] fp32 SBUF tile: column 0 = +ROUND_C, column 1 = -ROUND_C (activation biases for snake impl 4/5)."""
+    rc = nl.ndarray((P, 2), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=rc[0:P, 0:1], value=ROUND_C)
+    nisa.memset(dst=rc[0:P, 1:2], value=-ROUND_C)
+    return rc
+
+
+def _resunit_body(x, out, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t, snake_impl, u):
+    """Body of one residual unit (see snake_resunit); u >= 0 selects unit u of stacked params."""
     B, C, T = x.shape
     K = 7
     d = dilation
     H = (K - 1) * d  # causal halo
-    out = nl.ndarray((B, C, T), dtype=x.dtype, buffer=nl.shared_hbm)
     CT = 128 if C > 128 else C
     NC = (C + CT - 1) // CT
 
@@ -115,19 +136,34 @@ def snake_resunit(x, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t=512, sna
     w1_sb = nl.ndarray((CT, NC, K, C), dtype=nl.bfloat16, buffer=nl.sbuf)
     w2_sb = nl.ndarray((CT, NC, C), dtype=nl.bfloat16, buffer=nl.sbuf)
     prm = nl.ndarray((CT, NC, 6), dtype=nl.float32, buffer=nl.sbuf)
+    rc = _round_consts(CT)
     for ci in range(NC):
         cs = min(CT, C - ci * CT)
         for k in range(K):
-            nisa.dma_copy(dst=w1_sb[0:cs, ci, k, 0:C], src=w1t[k, ci * CT:ci * CT + cs, 0:C])
-        nisa.dma_copy(dst=w2_sb[0:cs, ci, 0:C], src=w2t[ci * CT:ci * CT + cs, 0:C])
-        for i, p in enumerate((c1, c2, a1, b1, a2, b2)):
-            nisa.dma_copy(dst=prm[0:cs, ci, i:i + 1], src=p[ci * CT:ci * CT + cs, 0:1])
+            if u < 0:
+                nisa.dma_copy(dst=w1_sb[0:cs, ci, k, 0:C], src=w1t[k, ci * CT:ci * CT + cs, 0:C])
+            else:
+                nisa.dma_copy(dst=w1_sb[0:cs, ci, k, 0:C], src=w1t[u, k, ci * CT:ci * CT + cs, 0:C])
+        if u < 0:
+            nisa.dma_copy(dst=w2_sb[0:cs, ci, 0:C], src=w2t[ci * CT:ci * CT + cs, 0:C])
+        else:
+            nisa.dma_copy(dst=w2_sb[0:cs, ci, 0:C], src=w2t[u, ci * CT:ci * CT + cs, 0:C])
+        for i in range(6):
+            p = (c1, c2, a1, b1, a2, b2)[i]
+            if u < 0:
+                nisa.dma_copy(dst=prm[0:cs, ci, i:i + 1], src=p[ci * CT:ci * CT + cs, 0:1])
+            else:
+                nisa.dma_copy(dst=prm[0:cs, ci, i:i + 1], src=p[u, ci * CT:ci * CT + cs, 0:1])
 
     TT = tile_t
     n_tiles = (T + TT - 1) // TT
     W = H + TT
+    nprg, pid = _shard()
     for b in range(B):
-        for ti in range(n_tiles):
+        for tj in range((n_tiles + nprg - 1) // nprg):
+            ti = tj * nprg + pid
+            if ti >= n_tiles:
+                continue
             t0 = ti * TT
             n = min(TT, T - t0)
             lo = t0 - H
@@ -144,7 +180,7 @@ def snake_resunit(x, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t=512, sna
                     nisa.memset(dst=sn[0:cs, ci, 0:z0], value=0.0)
                 nisa.dma_copy(dst=xr[0:cs, ci, z0:H + n], src=x[b, ci * CT:ci * CT + cs, lo + z0:t0 + n])
                 _snake_tile(sn[0:cs, ci, z0:H + n], xr[0:cs, ci, z0:H + n], prm[0:cs, ci, 2:3], prm[0:cs, ci, 3:4],
-                            cs, H + n - z0, sr, ss, snake_impl)
+                            cs, H + n - z0, sr, ss, snake_impl, rc[0:cs, 0:1], rc[0:cs, 1:2])
             # dilated causal conv per output-channel tile: 7 taps x NC input tiles accumulate in PSUM
             sn2 = nl.ndarray((CT, NC, TT), dtype=nl.bfloat16, buffer=nl.sbuf)
             for co in range(NC):
@@ -158,7 +194,7 @@ def snake_resunit(x, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t=512, sna
                 z = nl.ndarray((CT, TT), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.activation(dst=z[0:os_, 0:n], op=nl.copy, data=ps[0:os_, 0:n], bias=prm[0:os_, co, 0:1])
                 _snake_tile(sn2[0:os_, co, 0:n], z[0:os_, 0:n], prm[0:os_, co, 4:5], prm[0:os_, co, 5:6], os_, n,
-                            sr, ss, snake_impl)
+                            sr, ss, snake_impl, rc[0:os_, 0:1], rc[0:os_, 1:2])
             # 1x1 conv + bias + residual per output-channel tile
             for co in range(NC):
                 os_ = min(CT, C - co * CT)
@@ -171,6 +207,39 @@ def snake_resunit(x, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t=512, sna
                 nisa.scalar_tensor_tensor(dst=o[0:os_, 0:n], data=ps2[0:os_, 0:n], op0=nl.add,
                                           operand0=prm[0:os_, co, 1:2], op1=nl.add, operand1=xr[0:os_, co, H:H + n])
                 nisa.dma_copy(dst=out[b, co * CT:co * CT + os_, t0:t0 + n], src=o[0:os_, 0:n])
+
+
+
+@nki.jit
+def snake_resunit(x, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t=512, snake_impl=0):
+    """One fused residual unit. C channels are split into channel tiles of <= 128 (C = 96 / 192 / 384 / 768).
+
+    Args:
+        x:   [B, C, T] bf16 (HBM)
+        w1t: [7, C, C] bf16, w1t[k, cin, cout] = conv1.weight[cout, cin, k]
+        c1:  [C, 1] fp32 conv1 bias
+        w2t: [C, C] bf16, w2t[cin, cout] = conv2.weight[cout, cin, 0]
+        c2:  [C, 1] fp32 conv2 bias
+        a1, b1, a2, b2: [C, 1] fp32 snake params, a passed as exp(alpha) / pi, b = 1 / (exp(beta) + 1e-9)
+        dilation: int (static)
+    Returns:
+        out: [B, C, T] bf16
+    """
+    out = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+    _resunit_body(x, out, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t, snake_impl, -1)
+    return out
+
+
+@nki.jit
+def snake_resblock(x, w1t, c1, w2t, c2, a1, b1, a2, b2, tile_t=512, snake_impl=0):
+    """The 3 residual units of a decoder block (dilations 1, 3, 9) in one kernel: params stacked on a leading axis
+    of 3 (w1t [3, 7, C, C], w2t [3, C, C], others [3, C, 1]); intermediates go through internal HBM scratch."""
+    out = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+    m0 = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+    m1 = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+    _resunit_body(x, m0, w1t, c1, w2t, c2, a1, b1, a2, b2, 1, tile_t, snake_impl, 0)
+    _resunit_body(m0, m1, w1t, c1, w2t, c2, a1, b1, a2, b2, 3, tile_t, snake_impl, 1)
+    _resunit_body(m1, out, w1t, c1, w2t, c2, a1, b1, a2, b2, 9, tile_t, snake_impl, 2)
     return out
 
 
@@ -202,6 +271,7 @@ def snake_ctconv(x, wt, bias, a, b, rate, tile_q=256, snake_impl=0, stream_w=0):
     if stream_w == 0:
         w_sb = nl.ndarray((CI, NCI, K, Cout), dtype=nl.bfloat16, buffer=nl.sbuf)
     prm = nl.ndarray((CI, NCI, 2), dtype=nl.float32, buffer=nl.sbuf)
+    rc = _round_consts(CI)
     for ci in range(NCI):
         cs = min(CI, Cin - ci * CI)
         if stream_w == 0:
@@ -216,8 +286,12 @@ def snake_ctconv(x, wt, bias, a, b, rate, tile_q=256, snake_impl=0, stream_w=0):
 
     TQ = tile_q
     n_tiles = (Tin + TQ - 1) // TQ
+    nprg, pid = _shard()
     for bb in range(B):
-        for ti in range(n_tiles):
+        for tj in range((n_tiles + nprg - 1) // nprg):
+            ti = tj * nprg + pid
+            if ti >= n_tiles:
+                continue
             q0 = ti * TQ
             n = min(TQ, Tin - q0)
             xr = nl.ndarray((CI, NCI, TQ + 1), dtype=x.dtype, buffer=nl.sbuf)
@@ -231,7 +305,7 @@ def snake_ctconv(x, wt, bias, a, b, rate, tile_q=256, snake_impl=0, stream_w=0):
                     nisa.memset(dst=sn[0:cs, ci, 0:1], value=0.0)
                 nisa.dma_copy(dst=xr[0:cs, ci, z0:n + 1], src=x[bb, ci * CI:ci * CI + cs, q0 - 1 + z0:q0 + n])
                 _snake_tile(sn[0:cs, ci, z0:n + 1], xr[0:cs, ci, z0:n + 1], prm[0:cs, ci, 0:1], prm[0:cs, ci, 1:2],
-                            cs, n + 1 - z0, sv, sk, snake_impl)
+                            cs, n + 1 - z0, sv, sk, snake_impl, rc[0:cs, 0:1], rc[0:cs, 1:2])
             for co in range(NCO):
                 os_ = min(CO, Cout - co * CO)
                 if stream_w == 1:
@@ -279,14 +353,20 @@ def snake_conv_out(x, wt, bias, a, b, tile_t=512, snake_impl=0):
     for k in range(K):
         nisa.dma_copy(dst=w_sb[0:C, k, 0:1], src=wt[k, 0:C, 0:1])
     prm = nl.ndarray((C, 2), dtype=nl.float32, buffer=nl.sbuf)
+    rc = _round_consts(C)
     nisa.dma_copy(dst=prm[0:C, 0:1], src=a[0:C, 0:1])
     nisa.dma_copy(dst=prm[0:C, 1:2], src=b[0:C, 0:1])
     bs = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=bs[0:1, 0:1], src=bias[0:1, 0:1])
     TT = tile_t
     W = H + TT
+    nprg, pid = _shard()
+    n_tiles = (T + TT - 1) // TT
     for bb in range(B):
-        for ti in range((T + TT - 1) // TT):
+        for tj in range((n_tiles + nprg - 1) // nprg):
+            ti = tj * nprg + pid
+            if ti >= n_tiles:
+                continue
             t0 = ti * TT
             n = min(TT, T - t0)
             lo = t0 - H
@@ -298,7 +378,8 @@ def snake_conv_out(x, wt, bias, a, b, tile_t=512, snake_impl=0):
             if z0 > 0:
                 nisa.memset(dst=sn[0:C, 0:z0], value=0.0)
             nisa.dma_copy(dst=xr[0:C, z0:H + n], src=x[bb, 0:C, lo + z0:t0 + n])
-            _snake_tile(sn[0:C, z0:H + n], xr[0:C, z0:H + n], prm[0:C, 0:1], prm[0:C, 1:2], C, H + n - z0, sv, sk, snake_impl)
+            _snake_tile(sn[0:C, z0:H + n], xr[0:C, z0:H + n], prm[0:C, 0:1], prm[0:C, 1:2], C, H + n - z0, sv, sk,
+                        snake_impl, rc[0:C, 0:1], rc[0:C, 1:2])
             ps = nl.ndarray((1, TT), dtype=nl.float32, buffer=nl.psum)
             for k in range(K):
                 nisa.nc_matmul(dst=ps[0:1, 0:n], stationary=w_sb[0:C, k, 0:1], moving=sn[0:C, k:k + n])
@@ -342,3 +423,10 @@ def out_params(fw, fcb, fa, fb):
     f32 = lambda t: t.detach().cpu().float().reshape(-1, 1).contiguous()
     return dict(wt=fw.detach().cpu().permute(2, 1, 0).contiguous().to(torch.bfloat16), bias=f32(fcb),
                 a=f32(fa) / math.pi, b=f32(fb))
+
+
+def resblock_params(Bk):
+    """Stacked params of a block's 3 residual units for snake_resblock."""
+    import torch
+    ps = [resunit_params(Bk, ri) for ri in range(3)]
+    return {k: torch.stack([p[k] for p in ps]).contiguous() for k in ps[0]}
