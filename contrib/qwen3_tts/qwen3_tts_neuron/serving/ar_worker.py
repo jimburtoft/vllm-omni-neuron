@@ -94,6 +94,12 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         self.prefill_fns = {None: c(self.fe.prefill)}
         if self.pctx < self.S:
             self.prefill_fns[self.pctx] = c(_M(lambda x, r, p: bt.prefill(x, r, p, ctx=self.pctx), bt))
+        # batched prefill of several new requests in one call (single-chunk prompts in the ctx-limited bucket)
+        # multi-row prefill (opt-in, e.g. "2"): 2 rows 13.0 ms vs 2 x 9.0 single at B=48, but 4+ rows fall off a cliff
+        # (115 ms) and online it measured no better (143-149x vs 147x single-row), so off by default
+        self.prefill_rows = sorted({int(r) for r in os.environ.get("QTTS_PREFILL_ROWS", "").split(",")
+                                    if r.strip() and 1 < int(r) <= self.B})
+        self.prefill_rows_fn = c(_M(lambda x, r, p: bt.prefill_rows(x, r, p, ctx=self.pctx), bt)) if self.prefill_rows else None
         self.frame_fns = {cb: c(FusedFrameRows(self.eng, self.fe.bt, vec_cp=vec, ctx=cb).to(self.device))
                           for cb in self.ctx_buckets}
         self.noise = RowNoise(self.B, self.eng.talker.cfg.vocab, self.eng.cp.cfg.vocab, self.device,
@@ -132,6 +138,9 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         pad = torch.zeros(1, 1, self.H, dtype=self.eng.dtype)
         for Tb in self.eng.prefill_buckets:
             self._prefill_slot(0, torch.zeros(1, Tb - 1, self.H, dtype=self.eng.dtype), pad)
+        for Tb in sorted(self.pctx_buckets & set(self.eng.prefill_buckets)):  # R-row prefill graphs
+            for R in self.prefill_rows:
+                self._prefill_many([(r, torch.zeros(1, Tb - 1, self.H, dtype=self.eng.dtype), pad) for r in range(R)])
         for Tb in sorted(self.pctx_buckets & set(self.eng.prefill_buckets)):  # full-S variant of ctx-limited buckets
             self._prefill_slot(0, torch.zeros(1, max(self.pctx, max(self.eng.prefill_buckets)) + Tb - 1, self.H,
                                               dtype=self.eng.dtype), pad)
@@ -170,6 +179,53 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         self.pad = self.pad.index_copy(0, bi, pad.to(dt).reshape(1, 1, -1).to(dev))
         self.pos[b] = T
         self.steps[b] = 0
+
+    def _prefill_many(self, items):
+        """Prefill several new slots. Single-chunk prompts in the ctx-limited bucket go through R-row calls
+        (R in QTTS_PREFILL_ROWS); everything else uses the per-slot path."""
+        from ..batched import prefill_plan
+        groups, rest = {}, []
+        for b, emb, pad in items:
+            plan = prefill_plan(emb.shape[1], self.eng.prefill_buckets, self.S)
+            if (self.prefill_rows_fn is not None and len(plan) == 1 and plan[0][2] in self.pctx_buckets
+                    and plan[0][0] + plan[0][1] <= self.pctx):
+                groups.setdefault(plan[0][2], []).append((b, emb, pad, plan[0]))
+            else:
+                rest.append((b, emb, pad))
+        for b, emb, pad in rest:
+            self._prefill_slot(b, emb, pad)
+        dev, dt = self.device, self.eng.dtype
+        Rmax = max(self.prefill_rows) if self.prefill_rows else 1
+        for Tb, g in groups.items():
+            i = 0
+            while i < len(g):
+                chunk = g[i:i + Rmax]
+                i += len(chunk)
+                if len(chunk) == 1:
+                    b, emb, pad, _ = chunk[0]
+                    self._prefill_slot(b, emb, pad)
+                    continue
+                R = next(r for r in self.prefill_rows if r >= len(chunk))
+                x = torch.zeros(R, Tb, self.H, dtype=dt)
+                pos = torch.zeros(R, Tb, dtype=torch.long)
+                rows = torch.zeros(R, dtype=torch.long)
+                for r in range(R):
+                    b, emb, pad, (start, n, _, p) = chunk[min(r, len(chunk) - 1)]  # pad rows repeat the last item
+                    x[r, Tb - n:] = emb[0, start:start + n].to(dt)
+                    pos[r] = p
+                    rows[r] = b
+                hl, lg = self.prefill_rows_fn(x.to(dev), rows.to(dev), pos.to(dev))
+                bi = torch.tensor([it[0] for it in chunk], device=dev)
+                k = len(chunk)
+                self.h = self.h.index_copy(0, bi, hl[:k])
+                self.lg = self.lg.index_copy(0, bi, lg[:k])
+                self.seen = self.seen.index_copy(0, bi, torch.zeros(k, self.V, dtype=torch.bool, device=dev))
+                pads = torch.stack([it[2].to(dt).reshape(-1) for it in chunk])
+                for r, it in enumerate(chunk):
+                    self.pad_host[it[0]] = pads[r].reshape(1, -1)
+                    self.pos[it[0]] = it[1].shape[1]
+                    self.steps[it[0]] = 0
+                self.pad = self.pad.index_copy(0, bi, pads.view(k, 1, -1).to(dev))
 
     def _set_row_params(self, b, sp, info):
         """Bind a request's sampling parameters to slot b."""
@@ -278,6 +334,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                                             external_req_id=getattr(nr, "external_req_id", None))
         emitted: dict[str, tuple[int, torch.Tensor | None]] = {}
         decode_rids = []
+        pending_prefill = []
         for rid, n in scheduler_output.num_scheduled_tokens.items():
             st = self.requests.get(rid)
             if st is None:
@@ -306,9 +363,8 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                     self.slot_of[rid] = b
                     _tb = time.perf_counter()
                     self._set_row_params(b, st.get("sp"), st["info"])
-                    _tc = time.perf_counter()
-                    self._prefill_slot(b, emb, pad)
-                    self._acc("params", _tc - _tb); self._acc("prefill", time.perf_counter() - _tc)
+                    self._acc("params", time.perf_counter() - _tb)
+                    pending_prefill.append((b, emb, pad))
                     if trailing.shape[0] > 1 or (trailing.shape[0] == 1 and not torch.equal(trailing[0], pad.reshape(-1))):
                         self.trailing[b] = trailing
                     else:
@@ -321,6 +377,12 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                     emitted[rid] = None  # partial prefill: no token
             else:
                 decode_rids.append(rid)
+        if pending_prefill:
+            _tc = time.perf_counter()
+            if os.environ.get("QTTS_PREFILL_TRACE") == "1":
+                logger.info("[NeuronTTS] step prefills: %d", len(pending_prefill))
+            self._prefill_many(pending_prefill)
+            self._acc("prefill", time.perf_counter() - _tc)
         active = [rid for rid in scheduler_output.num_scheduled_tokens if rid in self.slot_of]
         _t_pre = time.perf_counter()
         if active:

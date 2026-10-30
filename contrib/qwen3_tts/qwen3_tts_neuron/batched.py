@@ -52,7 +52,7 @@ class BatchedTalker(nn.Module):
             self.register_buffer(f"cv{i}", torch.zeros(B * c.kv * S, c.head_dim, dtype=talker.dtype), persistent=False)
         self.register_buffer("hoff", torch.arange(c.kv), persistent=False)
 
-    def _run(self, x, rows, pos, mask, cos, sin, ctx=None):
+    def _run(self, x, rows, pos, mask, cos, sin, ctx=None, gather=False):
         """x [R,T,H] for rows `rows` [R] at positions pos [R,T]. Attention reads only the first `ctx` KV slots
         (static; default all S) -- decode context bucketing."""
         Sc = ctx or self.S
@@ -65,7 +65,7 @@ class BatchedTalker(nn.Module):
             q, k, v = _qkv_b(l, h, cos, sin)
             ck.index_copy_(0, widx, k.reshape(-1, self.D))
             cv.index_copy_(0, widx, v.reshape(-1, self.D))
-            if R != self.B:  # prefill: gather only the selected rows' KV (cost independent of B)
+            if R != self.B or gather:  # prefill: gather only the selected rows' KV (cost independent of B)
                 K = ck.view(self.B, self.nkv * self.S, self.D).index_select(0, rows).view(R, self.nkv, self.S, self.D)[:, :, :Sc]
                 V = cv.view(self.B, self.nkv * self.S, self.D).index_select(0, rows).view(R, self.nkv, self.S, self.D)[:, :, :Sc]
             else:
@@ -87,6 +87,16 @@ class BatchedTalker(nn.Module):
         cos = self.t.cos.index_select(0, pos).unsqueeze(0)
         sin = self.t.sin.index_select(0, pos).unsqueeze(0)
         return self._run(x, row, pos.view(1, -1), mask, cos, sin, ctx=Sc)
+
+    def prefill_rows(self, x, rows, pos, ctx=None):
+        """R-row prefill: x [R,Tb,H] for slots `rows` [R], pos [R,Tb] (each row front-padded like prefill)."""
+        Sc = ctx or self.S
+        R, Tb, _ = x.shape
+        j = torch.arange(Sc, device=x.device)
+        mask = torch.where(j.view(1, 1, -1) <= pos.view(R, Tb, 1), 0.0, -1e30).to(torch.float32)  # [R,Tb,Sc]
+        cos = self.t.cos.index_select(0, pos.reshape(-1)).view(R, Tb, -1)
+        sin = self.t.sin.index_select(0, pos.reshape(-1)).view(R, Tb, -1)
+        return self._run(x, rows, pos, mask, cos, sin, ctx=Sc, gather=True)
 
     def decode(self, x, pos, ctx=None):
         # x [B,1,H], pos [B]; ctx: static number of KV slots to attend (all rows must have pos < ctx)
