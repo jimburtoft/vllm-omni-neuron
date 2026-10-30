@@ -262,7 +262,8 @@ class Code2Wav(nn.Module):
             if bi in self.nki_blocks and self._nki_head:
                 x = self._nki_k_head[self._nki_grid](x.to(torch.bfloat16).contiguous(),
                                                      *[getattr(self, f"_nkih_{bi}_{k}") for k in ("wt", "bias", "a", "b")],
-                                                     r, int(os.environ.get("QTTS_C2W_NKI_TILEQ", "256")), self._snake_impl)
+                                                     r, int(os.environ.get("QTTS_C2W_NKI_TILEQ", "256")), self._snake_impl,
+                                                     1 if bi == 0 else 0)
             else:
                 x = _snake(x, Bk["a"], Bk["b"])
                 x = self._ctconv(x, Bk["tw"], Bk["tb"], r)

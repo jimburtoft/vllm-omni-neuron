@@ -46,6 +46,22 @@ def _snake_tile(dst, src, ap_t, b_t, rows, cols, s_v, s_k, impl=0):
     sin on the scalar engine accepts [-pi, pi] only, and the ALU has no mod/floor, so range-reduce with the fp32
     rounding trick: v = a*x/pi, k = round(v), sin^2(a*x) = sin^2(pi * (v - k)) with pi*(v-k) in [-pi/2, pi/2].
     """
+    if impl == 2 or impl == 3:
+        # engine-balanced: ACT 3 (v, sin, square), DVE 3 (round, v-k, b*q+x); impl 3 puts the round on GpSimd
+        nisa.activation(dst=s_v[0:rows, 0:cols], op=nl.copy, data=src, scale=ap_t)
+        if impl == 3:
+            nisa.tensor_scalar(dst=s_k[0:rows, 0:cols], data=s_v[0:rows, 0:cols], op0=nl.add, operand0=ROUND_C,
+                               op1=nl.subtract, operand1=ROUND_C, engine=nisa.gpsimd_engine)
+        else:
+            nisa.tensor_scalar(dst=s_k[0:rows, 0:cols], data=s_v[0:rows, 0:cols], op0=nl.add, operand0=ROUND_C,
+                               op1=nl.subtract, operand1=ROUND_C)
+        nisa.tensor_tensor(dst=s_v[0:rows, 0:cols], data1=s_v[0:rows, 0:cols], data2=s_k[0:rows, 0:cols],
+                           op=nl.subtract)
+        nisa.activation(dst=s_k[0:rows, 0:cols], op=nl.sin, data=s_v[0:rows, 0:cols], scale=PI)
+        nisa.activation(dst=s_v[0:rows, 0:cols], op=nl.square, data=s_k[0:rows, 0:cols])
+        nisa.scalar_tensor_tensor(dst=dst, data=s_v[0:rows, 0:cols], op0=nl.multiply, operand0=b_t,
+                                  op1=nl.add, operand1=src)
+        return
     if impl == 1:
         # 4 instructions: v = a*x/pi (DVE) | k = round(v) in 1 two-op tensor_scalar (Pool) | sin(pi*(v-k)) via
         # scalar_tensor_tensor (DVE: v - k, then ACT sin+scale) | square + b*() + x fused in one STT
@@ -159,7 +175,7 @@ def snake_resunit(x, w1t, c1, w2t, c2, a1, b1, a2, b2, dilation, tile_t=512, sna
 
 
 @nki.jit
-def snake_ctconv(x, wt, bias, a, b, rate, tile_q=256, snake_impl=0):
+def snake_ctconv(x, wt, bias, a, b, rate, tile_q=256, snake_impl=0, stream_w=0):
     """Block head: snake, then causal transposed conv (kernel 2*rate, stride rate, right-trimmed by rate).
 
     y[:, q*r + j] = W_j^T s[:, q] + W_{j+r}^T s[:, q-1] + bias   (s = snake(x), s[:, -1] = 0)
@@ -170,6 +186,8 @@ def snake_ctconv(x, wt, bias, a, b, rate, tile_q=256, snake_impl=0):
         bias: [Cout, 1] fp32
         a, b: [Cin, 1] fp32 snake params (a passed as exp(alpha) / pi)
         rate: int r (static)
+        stream_w: 1 = load the weights per output-channel tile instead of all at once (block 0: 16 x 1536 x 768
+            weights do not fit SBUF)
     Returns:
         y: [B, Cout, Tin * r] bf16
     """
@@ -181,12 +199,14 @@ def snake_ctconv(x, wt, bias, a, b, rate, tile_q=256, snake_impl=0):
     NCI = (Cin + CI - 1) // CI
     CO = 128 if Cout > 128 else Cout
     NCO = (Cout + CO - 1) // CO
-    w_sb = nl.ndarray((CI, NCI, K, Cout), dtype=nl.bfloat16, buffer=nl.sbuf)
+    if stream_w == 0:
+        w_sb = nl.ndarray((CI, NCI, K, Cout), dtype=nl.bfloat16, buffer=nl.sbuf)
     prm = nl.ndarray((CI, NCI, 2), dtype=nl.float32, buffer=nl.sbuf)
     for ci in range(NCI):
         cs = min(CI, Cin - ci * CI)
-        for k in range(K):
-            nisa.dma_copy(dst=w_sb[0:cs, ci, k, 0:Cout], src=wt[k, ci * CI:ci * CI + cs, 0:Cout])
+        if stream_w == 0:
+            for k in range(K):
+                nisa.dma_copy(dst=w_sb[0:cs, ci, k, 0:Cout], src=wt[k, ci * CI:ci * CI + cs, 0:Cout])
         nisa.dma_copy(dst=prm[0:cs, ci, 0:1], src=a[ci * CI:ci * CI + cs, 0:1])
         nisa.dma_copy(dst=prm[0:cs, ci, 1:2], src=b[ci * CI:ci * CI + cs, 0:1])
     bs = nl.ndarray((CO, NCO, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -214,15 +234,26 @@ def snake_ctconv(x, wt, bias, a, b, rate, tile_q=256, snake_impl=0):
                             cs, n + 1 - z0, sv, sk, snake_impl)
             for co in range(NCO):
                 os_ = min(CO, Cout - co * CO)
+                if stream_w == 1:
+                    wc = nl.ndarray((CI, NCI, K, CO), dtype=nl.bfloat16, buffer=nl.sbuf)
+                    for ci in range(NCI):
+                        cs = min(CI, Cin - ci * CI)
+                        for k in range(K):
+                            nisa.dma_copy(dst=wc[0:cs, ci, k, 0:os_],
+                                          src=wt[k, ci * CI:ci * CI + cs, co * CO:co * CO + os_])
                 yo = nl.ndarray((CO, TQ, r), dtype=x.dtype, buffer=nl.sbuf)
                 for j in range(r):
                     ps = nl.ndarray((CO, TQ), dtype=nl.float32, buffer=nl.psum)
                     for ci in range(NCI):
                         cs = min(CI, Cin - ci * CI)
-                        nisa.nc_matmul(dst=ps[0:os_, 0:n], stationary=w_sb[0:cs, ci, j, co * CO:co * CO + os_],
-                                       moving=sn[0:cs, ci, 1:n + 1])
-                        nisa.nc_matmul(dst=ps[0:os_, 0:n], stationary=w_sb[0:cs, ci, j + r, co * CO:co * CO + os_],
-                                       moving=sn[0:cs, ci, 0:n])
+                        if stream_w == 1:
+                            st0 = wc[0:cs, ci, j, 0:os_]
+                            st1 = wc[0:cs, ci, j + r, 0:os_]
+                        else:
+                            st0 = w_sb[0:cs, ci, j, co * CO:co * CO + os_]
+                            st1 = w_sb[0:cs, ci, j + r, co * CO:co * CO + os_]
+                        nisa.nc_matmul(dst=ps[0:os_, 0:n], stationary=st0, moving=sn[0:cs, ci, 1:n + 1])
+                        nisa.nc_matmul(dst=ps[0:os_, 0:n], stationary=st1, moving=sn[0:cs, ci, 0:n])
                     nisa.activation(dst=yo[0:os_, 0:n, j], op=nl.copy, data=ps[0:os_, 0:n], bias=bs[0:os_, co, 0:1])
                 nisa.dma_copy(dst=y[bb, co * CO:co * CO + os_, q0 * r:(q0 + n) * r], src=yo[0:os_, 0:n, 0:r])
     return y

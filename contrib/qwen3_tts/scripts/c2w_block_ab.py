@@ -40,7 +40,9 @@ def stock(x):
 
 
 def kern(x):
-    x = head(x)
+    if WITH_CT:
+        x = m._nki_k_head[m._nki_grid](x.contiguous(), *[getattr(m, f"_nkih_{bi}_{k}") for k in ("wt", "bias", "a", "b")],
+                                       m.rates[bi], int(os.environ.get("QTTS_C2W_NKI_TILEQ", "256")), m._snake_impl)
     for ri, dil in enumerate((1, 3, 9)):
         x = m._nki_unit(x, bi, ri, dil)
     return x
