@@ -31,7 +31,7 @@ def load_wav(p):
 async def one_session(i, args, pcm, model):
     from vllm_omni.clients.duplex import AudioFormat, DuplexClient, SessionConfig
     cfg = SessionConfig(input_audio=AudioFormat("pcm_f32le", 24000), output_audio=AudioFormat("pcm16", 24000))
-    audio, text, arrivals = [], [], []
+    audio, text, arrivals, sent = [], [], [], []
     t_start = None
     async with DuplexClient(args.url, model=model, config=cfg, handshake_timeout_s=600) as cl:
         async def reader():
@@ -51,14 +51,22 @@ async def one_session(i, args, pcm, model):
                         text.append(t)
         rt = asyncio.create_task(reader())
         t_start = time.perf_counter()
-        await cl.stream_pcm(pcm.astype("<f4").tobytes(), chunk_ms=80, realtime=True)
+        # drift-free real-time pacing: frame k is sent at t_start + k * 80 ms
+        nfr = len(pcm) // 1920
+        for k in range(nfr):
+            delay = t_start + k * 0.08 - time.perf_counter()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            sent.append(time.perf_counter() - t_start)
+            await cl.append_audio(pcm[k * 1920:(k + 1) * 1920].astype("<f4").tobytes())
         await asyncio.sleep(args.tail_s)
         rt.cancel()
     wav = np.concatenate(audio) if audio else np.zeros(0, np.float32)
     dur_in = len(pcm) / 24000
-    # lag of each audio chunk vs the moment the server could have produced it at real-time pace
-    got = np.cumsum([n for _, n in arrivals]) / 24000 if arrivals else np.zeros(0)
-    lag = [t - g for (t, _), g in zip(arrivals, got)]
+    # per-frame response latency: output frame j (j-th 1920 samples) arrives after input frame j+1 was sent
+    # (Moshi answers frame t at step t+1); latency = arrival - send time of the input frame that produced it
+    got = np.cumsum([n for _, n in arrivals]) // 1920 if arrivals else np.zeros(0, int)
+    lag = [t - sent[min(int(g), len(sent) - 1)] for (t, _), g in zip(arrivals, got) if g >= 1]
     return dict(session=i, text="".join(text), out_s=len(wav) / 24000, in_s=dur_in, chunks=len(arrivals),
                 first_audio_s=arrivals[0][0] if arrivals else None,
                 lag_p50_ms=float(np.median(lag) * 1e3) if lag else None,

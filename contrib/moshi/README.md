@@ -30,10 +30,13 @@ Per-frame step with encoder, LM and decoder all on one core (budget 80 ms):
 
 Served (`/v1/realtime?duplex=1`, stage 0 on core 0, decoder on core 1), audio streamed at real-time pace:
 
-| Concurrent sessions | Frames returned | First audio | Lag vs real time p50 / p99 |
+| Concurrent sessions | Frames returned | First audio | Per-frame response latency p50 / p99 |
 |---|---|---|---|
-| 1 | all | 152 ms | 184 / 274 ms |
-| 3 | all | 190-260 ms | 250 / 381 ms |
+| 1 | all | 175 ms | 93 / 96 ms |
+| 3 | all | 250 ms | 136 / 175 ms |
+
+Per-frame response latency is the time from sending an 80 ms input frame to receiving the 80 ms of Moshi audio it
+produces (measured on a 28.8 s conversation streamed at real-time pace; it does not grow over the session).
 
 Two servers (cores 0+1, 2+3) give 6 real-time sessions per trn2.3xlarge with these first-version graphs (plain
 PyTorch, no custom kernels).
