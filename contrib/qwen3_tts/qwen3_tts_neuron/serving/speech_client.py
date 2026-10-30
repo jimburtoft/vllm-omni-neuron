@@ -62,6 +62,15 @@ async def one_stream(client, url, model, i, out):
 
 
 async def one(client, url, model, i, out):
+    for attempt in range(3):  # a reused keep-alive connection can be closed by the server between requests
+        try:
+            return await _one(client, url, model, i, out)
+        except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectError) as e:
+            err = repr(e)
+    return dict(i=i, ok=False, status=-1, err=err, lat=0.0)
+
+
+async def _one(client, url, model, i, out):
     if STREAM:
         return await one_stream(client, url, model, i, out)
     c = CASES[i % 3]
