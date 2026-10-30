@@ -65,10 +65,12 @@ class BatchedTalker(nn.Module):
             q, k, v = _qkv_b(l, h, cos, sin)
             ck.index_copy_(0, widx, k.reshape(-1, self.D))
             cv.index_copy_(0, widx, v.reshape(-1, self.D))
-            K = ck.view(self.B, self.nkv, self.S, self.D)[:, :, :Sc]
-            V = cv.view(self.B, self.nkv, self.S, self.D)[:, :, :Sc]
-            if R != self.B:
-                K, V = K.index_select(0, rows), V.index_select(0, rows)
+            if R != self.B:  # prefill: gather only the selected rows' KV (cost independent of B)
+                K = ck.view(self.B, self.nkv * self.S, self.D).index_select(0, rows).view(R, self.nkv, self.S, self.D)[:, :, :Sc]
+                V = cv.view(self.B, self.nkv * self.S, self.D).index_select(0, rows).view(R, self.nkv, self.S, self.D)[:, :, :Sc]
+            else:
+                K = ck.view(self.B, self.nkv, self.S, self.D)[:, :, :Sc]
+                V = cv.view(self.B, self.nkv, self.S, self.D)[:, :, :Sc]
             o = _attn_b(l, q, K, V, mask)
             h = h + o @ l.w_o
             h = h + l._mlp(h)

@@ -32,10 +32,11 @@ from qwen3_tts_neuron.serving.prompts import PromptBuilder
 dt = torch.float32 if cpu else model_dtype()
 dev = torch.device(a.device)
 eng = TTSEngine(a.model, device=dev, max_ctx=a.S, dtype=dt, compile=False, prefill_buckets=(64, 128, 256))
-fe = FusedEngine(eng, a.B, S=a.S, vec_cp=True, compile=False)
+VEC = os.environ.get("QTTS_CP_VEC", "0") == "1"
+fe = FusedEngine(eng, a.B, S=a.S, vec_cp=VEC, compile=False)
 c = compile_fn()
 prefill = c(fe.prefill)
-frame = c(FusedFrameRows(eng, fe.bt, vec_cp=True, ctx=a.ctx).to(dev))
+frame = c(FusedFrameRows(eng, fe.bt, vec_cp=VEC, ctx=a.ctx).to(dev))
 pb = PromptBuilder(eng, a.model)
 CASES = [("en_calm", "She said she would be here by noon, and she always keeps her word.", "English",
           "Calm, warm adult female voice, steady pace, gentle and reassuring."),
