@@ -77,7 +77,8 @@ class NeuronCode2WavModelRunner(OmniConnectorModelRunnerMixin):
         # full-context windows from different requests decoded together (B<=4 measured 12.3 vs 18.1 ms/window)
         self.c2w_batch = int(os.environ.get("QTTS_C2W_BATCH", "4"))
         self.max_inflight = int(os.environ.get("QTTS_C2W_MAX_INFLIGHT", "16"))
-        logger.info("[NeuronC2W] code2wav loaded in %.1fs device=%s", time.time() - t0, self.device)
+        logger.info("[NeuronC2W] code2wav loaded in %.1fs device=%s nki_blocks=%s", time.time() - t0, self.device,
+                    sorted(getattr(self.c2w.m, "nki_blocks", ())))
 
     @torch.inference_mode()  # same grad mode as execute_model, or dynamo recompiles every graph on first real use
     def warmup(self):

@@ -72,7 +72,6 @@ vocoder batching). Streaming TTFA p50 is 118 ms at concurrency 32. For latency, 
 
 ```bash
 QTTS_B=48 QTTS_REP0=2 QTTS_DEV0=0,2 QTTS_REP1=2 QTTS_DEV1=1,3 QTTS_B1=96 python -m qwen3_tts_neuron.serving.make_deploy /tmp/qtts.yaml
-# and start the server with QTTS_C2W_NKI_BLOCKS=1,2,3 in its environment
 ```
 Each stage process caps torch host threads at `QTTS_HOST_THREADS` (default 2). The default thread pool spins ~3
 cores per process and starved the other stages on the 12-vCPU host (3 talkers + vocoder: 35x before the cap, 61x
@@ -93,7 +92,7 @@ generate a second YAML with `QTTS_DEV0=2 QTTS_DEV1=3` and start it on another po
 | `QTTS_PREFILL_CTX` / `QTTS_PREFILL_CTX_BUCKETS` | 256 / 128 | prefill buckets that attend only the first N KV slots when the prompt fits (exact; Tb=128 prefill 65 -> 16 ms at B=32) |
 | `QTTS_HOST_THREADS` | 2 | torch host threads per stage process |
 | `QTTS_C2W_BATCH` | 4 | full-context vocoder windows decoded per call across requests (exact in fp32) |
-| `QTTS_C2W_NKI_BLOCKS` | (off) | decoder blocks run as fused NKI kernels (`1,2,3` recommended; sharded over the LNC=2 cores: vocoder window 19.2 -> 7.0 ms at B=1, 12.5 -> 4.9 ms/window at B=4; same accuracy) |
+| `QTTS_C2W_NKI_BLOCKS` | `1,2,3` on device (off in CPU mode) | decoder blocks run as fused NKI kernels (`1,2,3` recommended; sharded over the LNC=2 cores: vocoder window 19.2 -> 7.0 ms at B=1, 12.5 -> 4.9 ms/window at B=4; same accuracy) |
 | `QTTS_CP_VEC` | 0 | `1` = elementwise code-predictor attention (slower under lite: 24 vs 10 ms at B=32) |
 | `QTTS_GREEDY` | 0 | `1` writes greedy defaults into the YAML |
 

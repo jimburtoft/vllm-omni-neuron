@@ -27,8 +27,9 @@ from safetensors import safe_open
 
 SNAKE_FP32 = os.environ.get("C2W_SNAKE_FP32", "1") == "1"
 # Fused NKI residual units (snake -> dilated conv -> snake -> 1x1 conv -> +x) for decoder blocks listed here
-# (indices into the 4 upsample blocks; "" = off). Needs a Neuron device or NKI_SIMULATOR=1.
-NKI_BLOCKS = {int(b) for b in os.environ.get("QTTS_C2W_NKI_BLOCKS", "").split(",") if b.strip()}
+# (indices into the 4 upsample blocks; "" = off). Default 1,2,3 on device; off in CPU mode unless NKI_SIMULATOR=1.
+_NKI_DEFAULT = "" if os.environ.get("VLLM_NEURON_CPU_MODE") == "1" and os.environ.get("NKI_SIMULATOR") != "1" else "1,2,3"
+NKI_BLOCKS = {int(b) for b in os.environ.get("QTTS_C2W_NKI_BLOCKS", _NKI_DEFAULT).split(",") if b.strip()}
 
 
 def _snake(x, a_exp, inv_b):
