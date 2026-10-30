@@ -62,13 +62,21 @@ class MimiConfig:
     vq_dim: int = 256
 
 
-def checkpoint_paths(repo: str = DEFAULT_REPO):
-    """Return (moshi_weights, mimi_weights, tokenizer) local paths, downloading from the HF Hub if needed.
-    MOSHI_WEIGHTS / MIMI_WEIGHTS / MOSHI_TOKENIZER override individual files."""
+def checkpoint_paths(repo: str = DEFAULT_REPO, model_dir: str | None = None, need_lm: bool = True):
+    """Return (moshi_weights, mimi_weights, tokenizer) local paths.
+
+    Order: MOSHI_WEIGHTS / MIMI_WEIGHTS / MOSHI_TOKENIZER env overrides, then files in `model_dir` (a local
+    snapshot, e.g. the serving model directory), then the HF Hub repo (downloaded if needed)."""
     from huggingface_hub import hf_hub_download
 
     def get(env, name):
         p = os.environ.get(env)
-        return p if p else hf_hub_download(repo, name)
+        if p:
+            return p
+        if model_dir and os.path.isfile(os.path.join(model_dir, name)):
+            return os.path.join(model_dir, name)
+        if not need_lm and name == MOSHI_NAME:
+            return None
+        return hf_hub_download(repo, name)
 
     return get("MOSHI_WEIGHTS", MOSHI_NAME), get("MIMI_WEIGHTS", MIMI_NAME), get("MOSHI_TOKENIZER", TOKENIZER_NAME)

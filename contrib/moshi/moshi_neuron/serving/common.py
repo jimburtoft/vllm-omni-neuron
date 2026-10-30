@@ -41,3 +41,14 @@ def compile_fn():
     backend = register()
     torch._dynamo.config.cache_size_limit = 256
     return lambda m: torch.compile(m, backend=backend, dynamic=False, fullgraph=True)
+
+
+def model_dir(name_or_path: str) -> str | None:
+    """Local snapshot directory for the served model (repo id or path); None if it can't be resolved offline."""
+    if name_or_path and os.path.isdir(name_or_path):
+        return name_or_path
+    try:
+        from huggingface_hub import snapshot_download
+        return snapshot_download(name_or_path, allow_patterns=["*.safetensors", "*.model", "*.json"])
+    except Exception:
+        return None
