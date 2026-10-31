@@ -67,6 +67,11 @@ utterances; RTFx = seconds of audio per second for the whole device):
 
 The NKI vocoder (default on device) is on in all rows from B=32 down. Streaming, B=48 2+2: TTFA p50 59 ms at
 concurrency 1, 118 ms at 64; 158.9x at concurrency 160. Single stream: 0.74 s per ~4 s utterance with a B=1 talker.
+**LNC=1** (8 logical cores; `NEURON_LOGICAL_NC_CONFIG=1`, `QTTS_NC_COUNT=8`) is slower on this model, measured
+2026-10-31 (B=48 talker frame 30.6 ms on half the hardware vs 30.3 ms at LNC=2; vocoder window 13.0 vs 7.0 ms):
+4 talkers B=48 + 4 vocoders 128.6x / 134.8x / 140.9x at concurrency 160 / 300 / 400; 6 talkers B=24 + 2 vocoders
+102.4x / 129.0x at 160 / 300. 6 talkers at B=48 fail to allocate device memory. Use LNC=2.
+
 3 talkers + 1 vocoder is limited by the single stage-1 replica's per-step loop (requests wait ~1 s there after the
 talker finishes; vocoder compute ~40 % busy), not by the device. Note: clients must allow enough connections (httpx defaults to 100, which caps concurrency silently).
 
