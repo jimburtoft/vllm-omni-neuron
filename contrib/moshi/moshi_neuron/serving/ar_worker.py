@@ -194,8 +194,14 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                 off = self.offline.get(rid)
                 if off is not None and (off["t"] * FRAME >= off["pcm"].numel() + 2 * FRAME or off["t"] >= off["max"]):
                     emitted[rid] = (EOS_TEXT, raw[b, 1:].clone())
-            if te + tl > 0.08 and os.environ.get("MOSHI_STEP_TRACE", "0") == "1":
-                logger.info("[MoshiS0] step rows=%d enc %.1f ms lm %.1f ms", len(rows), te * 1e3, tl * 1e3)
+            if os.environ.get("MOSHI_STEP_STATS", "0") == "1":
+                now = time.perf_counter()
+                st = self.__dict__.setdefault("_st", dict(n=0, enc=0.0, lm=0.0, rows=0, t0=now))
+                st["n"] += 1; st["enc"] += te; st["lm"] += tl; st["rows"] += len(rows)
+                if st["n"] % 200 == 0:
+                    logger.info("[MoshiS0] 200 steps: enc %.1f ms, lm %.1f ms, %.2f rows/step, %.1f ms/step wall",
+                                1e3 * st["enc"] / 200, 1e3 * st["lm"] / 200, st["rows"] / 200, 1e3 * (now - st["t0"]) / 200)
+                    st.update(enc=0.0, lm=0.0, rows=0, t0=now)
         self._last = (list(scheduler_output.num_scheduled_tokens.keys()), emitted)
         return None
 

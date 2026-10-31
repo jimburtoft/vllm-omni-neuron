@@ -124,6 +124,7 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
                     self.row_of[rid] = self.free.pop(0)
                 frames[rid] = f
         out_wav = {rid: [] for rid in req_ids}
+        _t0 = time.perf_counter()
         # decode frame-major: step j decodes the j-th new frame of every request that has one
         maxf = max((f.shape[0] for f in frames.values()), default=0)
         for j in range(maxf):
@@ -140,6 +141,14 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
             for rid, f in frames.items():
                 if j < f.shape[0]:
                     out_wav[rid].append(pcm[self.row_of[rid]])
+        if os.environ.get("MOSHI_STEP_STATS", "0") == "1":
+            st = self.__dict__.setdefault("_st", dict(n=0, dec=0.0, frames=0, t0=time.perf_counter(), reqs=0))
+            st["n"] += 1; st["dec"] += time.perf_counter() - _t0; st["frames"] += maxf; st["reqs"] += len(frames)
+            if st["n"] % 200 == 0:
+                w = time.perf_counter() - st["t0"]
+                logger.info("[MoshiC2W] 200 steps: %.1f ms/step decode, %.2f frame-steps/step, %.1f reqs/step, "
+                            "%.1f ms/step wall", 1e3 * st["dec"] / 200, st["frames"] / 200, st["reqs"] / 200, 1e3 * w / 200)
+                st.update(dec=0.0, frames=0, reqs=0, t0=time.perf_counter())
         wavs = []
         for rid in req_ids:
             new = torch.cat(out_wav[rid]) if out_wav[rid] else torch.zeros(0)

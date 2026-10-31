@@ -82,6 +82,16 @@ class MoshiLM(nn.Module):
             # nkilib mlp TKG measured slower than the compiler's matmuls here (B=3: 93 ms with column tiling,
             # 60 ms without, vs 50 ms with torch); default to the torch MLP. MOSHI_TORCH_MLP=0 -> NF.mlp.
             self.torch_mlp = os.environ.get("MOSHI_TORCH_MLP", "1") == "1"
+            # MOSHI_FP8_KV=1: FP8 (e4m3) KV cache. Per-layer quant scales: scale = FP8_MAX / amax(K or V), amax from
+            # MOSHI_KV_SCALES (json {"k": [32], "v": [32]} of bf16 amax per layer) or a default amax.
+            self.fp8_kv = os.environ.get("MOSHI_FP8_KV", "0") == "1"
+            if self.fp8_kv:
+                import json
+                fmax = float(os.environ.get("MOSHI_FP8_MAX", "240"))
+                path = os.environ.get("MOSHI_KV_SCALES")
+                am = json.load(open(path)) if path else {"k": [float(os.environ.get("MOSHI_K_AMAX", "24"))] * L,
+                                                         "v": [float(os.environ.get("MOSHI_V_AMAX", "8"))] * L}
+                self.kv_scales = [(fmax / max(am["k"][i], 1e-3), fmax / max(am["v"][i], 1e-3)) for i in range(L)]
             self.mlp_mode = os.environ.get("MOSHI_MLP_MODE", "nf")  # nf | direct
             self.mlp_ct = os.environ.get("MOSHI_MLP_CT", "1") == "1"
             if self.mlp_mode == "direct":
@@ -104,9 +114,15 @@ class MoshiLM(nn.Module):
                     n1=P(g(p + "norm1.alpha").view(1, -1)), n2=P(g(p + "norm2.alpha").view(1, -1)),
                     wqkv=P(w.t()), wo=P(g(p + "self_attn.out_proj.weight").t()),
                     wg=P(win[:I].t()), wu=P(win[I:].t()), wd=P(wout.t()))))
-                kv = torch.zeros(B * self.NBLK, H, self.BLK, D, dtype=dtype)
-                self.register_buffer(f"k{i}", kv, persistent=False)
-                self.register_buffer(f"v{i}", kv.clone(), persistent=False)
+                kvdt = torch.float8_e4m3fn if self.fp8_kv else dtype
+                self.register_buffer(f"k{i}", torch.zeros(B * self.NBLK, H, self.BLK, D, dtype=kvdt), persistent=False)
+                self.register_buffer(f"v{i}", torch.zeros(B * self.NBLK, H, self.BLK, D, dtype=kvdt), persistent=False)
+                if self.fp8_kv:
+                    # kernel quantizes with x * scale and dequantizes by folding 1/scale into softmax scale and W_out
+                    ks, vs = self.kv_scales[i]
+                    self.register_buffer(f"ks{i}", torch.full((1, 1), ks, dtype=dtype), persistent=False)
+                    self.register_buffer(f"vs{i}", torch.full((1, 1), vs, dtype=dtype), persistent=False)
+                    self.layers[-1]["wo"] = P((self.layers[-1]["wo"].float() / vs).to(dtype))
                 continue
             self.layers.append(nn.ParameterDict(dict(
                 n1=P(g(p + "norm1.alpha").view(-1)), n2=P(g(p + "norm2.alpha").view(-1)),
@@ -171,6 +187,8 @@ class MoshiLM(nn.Module):
                 q = apply_rope_interleaved(q, cos, sin)
                 k = apply_rope_interleaved(k, cos, sin)
             kb, vb = getattr(self, f"k{i}"), getattr(self, f"v{i}")
+            if getattr(self, "_calib", None) is not None:
+                self._calib.append(torch.stack([k.float().abs().amax(), v.float().abs().amax()]))
             if not getattr(self, "_skip_write", False):  # profiling only
                 kb.index_copy_(0, widx, k.reshape(-1, D))
                 vb.index_copy_(0, widx, v.reshape(-1, D))
@@ -232,15 +250,24 @@ class MoshiLM(nn.Module):
         cos = cos.view(B, 1, D // 2).permute(2, 0, 1).contiguous().to(self.dtype)       # [D/2,B,1]
         sin = sin.view(B, 1, D // 2).permute(2, 0, 1).contiguous().to(self.dtype)
         x = x.view(B, 1, -1)
+        abl = getattr(self, "_abl", "")  # profiling ablations only
         for i, l in enumerate(self.layers):
-            a = attention_decode(
+            if "noattn" in abl:
+                a = x
+            else:
+              a = attention_decode(
                 X=x, X_hidden_dim_actual=cfg.dim, rmsnorm_X_enabled=True, rmsnorm_X_eps=cfg.eps,
                 rmsnorm_X_gamma=l["n1"], W_qkv=l["wqkv"], bias_qkv=None,
                 cos=cos, sin=sin, rope_contiguous_layout=True, K_cache_transposed=False,
                 active_blocks_table=table, K_cache=getattr(self, f"k{i}"), V_cache=getattr(self, f"v{i}"),
-                attention_mask=None, softmax_scale=D ** -0.5, sink=None, pos_ids=pos_ids,
-                swa_start_pos_ids=swa_start, update_cache=True, kv_cache_update_idx=widx,
+                attention_mask=None, softmax_scale=D ** -0.5 / (self.kv_scales[i][0] if self.fp8_kv else 1.0),
+                sink=None, pos_ids=pos_ids, swa_start_pos_ids=swa_start, update_cache=True, kv_cache_update_idx=widx,
+                k_scale=getattr(self, f"ks{i}") if self.fp8_kv else None,
+                v_scale=getattr(self, f"vs{i}") if self.fp8_kv else None,
                 W_out=l["wo"], bias_out=None, transposed_out=False, out_in_sb=False)
+            if "nomlp" in abl:
+                x = x + a.view(B, 1, -1)
+                continue
             if self.mlp_mode == "direct":
                 xr = x.view(B, -1) + a.view(B, -1)
                 m = self._wmlp[2](

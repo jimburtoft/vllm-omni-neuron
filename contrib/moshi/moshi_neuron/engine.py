@@ -61,13 +61,25 @@ class MoshiStage0:
         if seed is not None:
             for b in rows:
                 self.gens[b] = torch.Generator().manual_seed(int(seed) + b)
+            self._next = None
+
+    def _draw(self):
+        gt = torch.stack([gumbel(g, (self.cfg.text_card,), "cpu") for g in self.gens])
+        ga = torch.stack([gumbel(g, (self.cfg.dep_q, self.cfg.card), "cpu") for g in self.gens])
+        return gt, ga
 
     def _noise(self):
+        """Gumbel noise for this frame (host RNG, per-row generators). The next frame's noise is drawn while the
+        device runs the current frame (`_prefetch`), so it costs only the host->device copy on the critical path."""
         if not self.sampling:
             return self._zt, self._za
-        gt = torch.stack([gumbel(g, (self.cfg.text_card,), "cpu") for g in self.gens]).to(self.device)
-        ga = torch.stack([gumbel(g, (self.cfg.dep_q, self.cfg.card), "cpu") for g in self.gens]).to(self.device)
-        return gt, ga
+        gt, ga = self._next if getattr(self, "_next", None) is not None else self._draw()
+        self._next = None
+        return gt.to(self.device), ga.to(self.device)
+
+    def _prefetch(self):
+        if self.sampling and getattr(self, "_next", None) is None:
+            self._next = self._draw()
 
     @torch.inference_mode()
     def step(self, pcm_in, active=None):
@@ -81,7 +93,9 @@ class MoshiStage0:
         t1 = time.perf_counter()
         tokens = self.host.inputs(codes, active)
         gt, ga = self._noise()
-        raw = self.frame(tokens.to(dev), reset.to(dev), active.to(dev), gt, ga, self._ft, self._fa, self._uf).cpu()
+        raw = self.frame(tokens.to(dev), reset.to(dev), active.to(dev), gt, ga, self._ft, self._fa, self._uf)
+        self._prefetch()  # overlaps the device frame
+        raw = raw.cpu()
         t2 = time.perf_counter()
         out, ready = self.host.commit(raw, active)
         self.nseen = self.nseen + active.long()
