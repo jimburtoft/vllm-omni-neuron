@@ -22,8 +22,14 @@ cx = d["connectors"]["connector_of_shared_memory"]["extra"]
 cx.update(codec_chunk_frames=1, initial_codec_chunk_frames=1, codec_left_context_frames=0)
 s0, s1 = d["stages"]
 s0.update(worker_cls="moshi_neuron.serving.ar_worker.MoshiStage0Worker", async_scheduling=False, max_num_seqs=B,
-          max_model_len=int(os.environ.get("MOSHI_MAX_MODEL_LEN", "3000")),
+          # Each 80 ms frame appends one token to the session's resumable stage-0 request, and vLLM stops a request at
+          # max_model_len. The LM itself attends a 3000-frame ring (moshi's context), so the length here only caps the
+          # session: 45000 = 1 hour. The Neuron worker owns its KV, so this costs no memory.
+          max_model_len=int(os.environ.get("MOSHI_MAX_MODEL_LEN", "45000")),
           devices=os.environ.get("MOSHI_DEV0", "0"), enforce_eager=True)
+s1.update(max_model_len=max(int(s1.get("max_model_len", 65536)), 8 * int(os.environ.get("MOSHI_MAX_MODEL_LEN", "45000"))),
+          max_num_batched_tokens=max(int(s1.get("max_num_batched_tokens", 65536)),
+                                     8 * int(os.environ.get("MOSHI_MAX_MODEL_LEN", "45000"))))
 s1.update(worker_cls="moshi_neuron.serving.c2w_worker.MoshiCode2WavWorker", async_scheduling=False,
           max_num_seqs=int(os.environ.get("MOSHI_B1", str(B * r0))), devices=os.environ.get("MOSHI_DEV1", "1"),
           enforce_eager=True)

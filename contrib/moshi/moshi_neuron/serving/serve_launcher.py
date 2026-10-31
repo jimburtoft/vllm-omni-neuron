@@ -11,6 +11,9 @@ import sys
 
 
 def _preset():
+    # stage-0 max_model_len caps the session length (one token per 80 ms frame), above Helium's 3000-frame context;
+    # the Neuron worker attends a 3000-frame ring, so the longer length is safe.
+    os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
     from vllm_neuron.vllm.platform import NeuronPlatform
     NeuronPlatform.set_device_count(int(os.environ.get("MOSHI_NC_COUNT", "4")))
     from .backports import apply
