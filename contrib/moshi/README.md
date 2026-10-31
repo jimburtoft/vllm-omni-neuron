@@ -18,31 +18,27 @@ source changes.
 All streaming state (Mimi convolution buffers and transformer KV caches, the 3000-frame Helium KV) lives in
 device memory per session row; only 1920 PCM samples and ~10 tokens cross the host boundary per frame.
 
-## Results (trn2.3xlarge, SDK 2.33, one stage-0 core)
+## Results (trn2.3xlarge, SDK 2.33)
 
-Per-frame step with encoder, LM and decoder all on one core (budget 80 ms):
+Served (`/v1/realtime?duplex=1`), audio streamed at real-time pace, 28.8 s conversation:
 
-| Sessions | step p50 | of which LM |
-|---|---|---|
-| 1 | 54 ms | 44 ms |
-| 2 | 71 ms | 56 ms |
-| 3 | 81 ms | 66 ms |
+| Layout | Concurrent sessions | Every frame on time | First audio | Per-frame latency p50 / p99 |
+|---|---|---|---|---|
+| 1 server (cores 0+1), B=1 | 1 | yes | 175 ms | 93 / 96 ms |
+| 1 server, B=4 | 4 | yes | 220-230 ms | 112-129 / 151-167 ms |
+| 1 server, B=5 | 5 | yes | 242 ms | 135-147 / 176-186 ms |
+| **2 servers (cores 0+1, 2+3), B=5 each** | **10** | yes | 190-260 ms | 130-143 / <= 180 ms |
 
-Served (`/v1/realtime?duplex=1`, stage 0 on core 0, decoder on core 1), audio streamed at real-time pace:
+Per-frame latency is the time from sending an 80 ms input frame to receiving the 80 ms of Moshi audio it
+produces; it does not grow over the session. B=6 per server does not fit one core's HBM (7B weights + 6 x 1.6 GB KV).
 
-| Concurrent sessions | Frames returned | First audio | Per-frame response latency p50 / p99 |
-|---|---|---|---|
-| 1 | all | 175 ms | 93 / 96 ms |
-| 3 | all | 250 ms | 136 / 175 ms |
+The Helium attention runs on the fused nkilib decode kernel (`attention_block_tkg`: RMSNorm + QKV + RoPE +
+attention + KV write + output projection in one kernel) over a block-paged ring KV cache with an in-kernel
+sliding-window mask; the rest is plain PyTorch compiled by the Neuron compiler.
 
-Per-frame response latency is the time from sending an 80 ms input frame to receiving the 80 ms of Moshi audio it
-produces (measured on a 28.8 s conversation streamed at real-time pace; it does not grow over the session).
-
-Two servers (cores 0+1, 2+3) give 6 real-time sessions per trn2.3xlarge with these first-version graphs (plain
-PyTorch, no custom kernels).
-
-Output quality: the greedy Neuron output matches the kyutai reference (fp32, CPU) text exactly on our test clips and
-Whisper transcribes the generated speech identically to Moshi's inner-monologue text.
+Output quality: greedy decoding reproduces the kyutai reference's text on our test clips; teacher-forced against
+the fp32 reference, text predictions match 100% and audio-code predictions 99.5%; Whisper's transcript of the generated
+speech matches Moshi's inner-monologue text.
 
 ## Setup
 
@@ -59,7 +55,7 @@ sudo mkswap --force /swapfile && sudo swapon /swapfile`).
 ## Serve
 
 ```bash
-MOSHI_B=3 python -m moshi_neuron.serving.make_deploy /tmp/moshi.yaml   # 3 sessions; stage 0 on core 0, stage 1 on core 1
+MOSHI_B=5 python -m moshi_neuron.serving.make_deploy /tmp/moshi.yaml   # 5 sessions; stage 0 on core 0, stage 1 on core 1
 MOSHI_NC_COUNT=4 python -m moshi_neuron.serving.serve_launcher serve kyutai/moshiko-pytorch-bf16 \
     --deploy-config /tmp/moshi.yaml --port 8000 --omni --init-timeout 3600 --stage-init-timeout 3600
 ```

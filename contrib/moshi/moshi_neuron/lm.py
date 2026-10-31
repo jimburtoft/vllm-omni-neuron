@@ -72,7 +72,7 @@ class MoshiLM(nn.Module):
         qkv_perm = torch.cat([hp, H * D + hp, 2 * H * D + torch.arange(H * D)])
         # MOSHI_KERNELS=1: nkilib fused decode (attention_block_tkg + mlp TKG) with a block KV ring; weights are
         # stored in the kernels' [in, out] layout and the per-layer KV is [B*NBLK, H, BLK, D].
-        self.kernels = os.environ.get("MOSHI_KERNELS", "0") == "1"
+        self.kernels = os.environ.get("MOSHI_KERNELS", "1") == "1" and not os.environ.get("VLLM_NEURON_CPU_MODE") == "1"
         if self.kernels:
             assert self.rope_half, "the fused kernel path needs MOSHI_ROPE=half"
             self.BLK = int(os.environ.get("MOSHI_KV_BLOCK", "32"))
