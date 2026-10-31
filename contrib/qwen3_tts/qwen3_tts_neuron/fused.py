@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import time
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,7 +58,33 @@ def sample_topk(logits, gumbel, temperature, top_k):
 TOPK_MAX = 64  # static upper bound for per-row top-k (checkpoint default 50)
 
 
+def _sample_rows_threshold(logits, gumbel, temp, topk):
+    """Threshold form (top-k mask over the full vocab). Faster (frame 30.3 vs 32.3 ms at B=48), but miscompiled
+    inside the code-predictor loop at LNC=1; used at LNC=2."""
+    B = logits.shape[0]
+    shape = (B,) + (1,) * (logits.dim() - 1)
+    t = temp.view(shape)
+    greedy = t <= 0
+    l = logits / torch.where(greedy, 1.0, t)
+    kmax = min(TOPK_MAX, l.shape[-1])
+    vals = torch.topk(l, kmax, dim=-1).values  # [..., kmax] descending
+    k = topk.view(shape).clamp(min=0, max=kmax)
+    kth = torch.gather(vals, -1, (torch.where(k > 0, k, kmax) - 1).long())  # value of the k-th largest
+    l = torch.where((k > 0) & (l < kth), float("-inf"), l)
+    noisy = torch.where(greedy, l, l + gumbel)
+    return torch.argmax(noisy, dim=-1)
+
+
 def sample_rows(logits, gumbel, temp, topk):
+    """Per-row sampling; dispatches on the logical-core config (static at trace time). Both forms give identical
+    draws for the same noise."""
+    if os.environ.get("QTTS_SAMPLER", "lnc") == "threshold" or (
+            os.environ.get("QTTS_SAMPLER", "lnc") == "lnc" and os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2") != "1"):
+        return _sample_rows_threshold(logits, gumbel, temp, topk)
+    return _sample_rows_candidates(logits, gumbel, temp, topk)
+
+
+def _sample_rows_candidates(logits, gumbel, temp, topk):
     """Per-row sampling in one static graph. logits [B,...,V] f32 (middle dims of size 1); gumbel same shape;
     temp [B] f32 (<=0 -> greedy); topk [B] int (0 -> full vocab, else <= TOPK_MAX). Greedy rows reduce exactly to
     argmax(logits).
