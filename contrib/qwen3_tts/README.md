@@ -67,10 +67,38 @@ utterances; RTFx = seconds of audio per second for the whole device):
 
 The NKI vocoder (default on device) is on in all rows from B=32 down. Streaming, B=48 2+2: TTFA p50 59 ms at
 concurrency 1, 118 ms at 64; 158.9x at concurrency 160. Single stream: 0.74 s per ~4 s utterance with a B=1 talker.
-**LNC=1** (8 logical cores; `NEURON_LOGICAL_NC_CONFIG=1`, `QTTS_NC_COUNT=8`) is slower on this model, measured
-2026-10-31 (B=48 talker frame 30.6 ms on half the hardware vs 30.3 ms at LNC=2; vocoder window 13.0 vs 7.0 ms):
-4 talkers B=48 + 4 vocoders 128.6x / 134.8x / 140.9x at concurrency 160 / 300 / 400; 6 talkers B=24 + 2 vocoders
-102.4x / 129.0x at 160 / 300. 6 talkers at B=48 fail to allocate device memory. Use LNC=2.
+**Best throughput: LNC=1 with two independent servers.** At LNC=1 (`NEURON_LOGICAL_NC_CONFIG=1`, 8 logical cores of
+half size, `QTTS_NC_COUNT=8`), a B=48 talker frame takes about the same time on half the hardware (30.6 vs 30.3 ms),
+so the device yields ~2x the talker frames. One big server cannot use that (rows stay half full), but independent
+servers can:
+
+| layout (whole trn2.3xlarge) | RTFx online | p50 |
+|---|---|---|
+| LNC=2, 1 server, 2T + 2V (B=48) | 150-162 | 3.0-9.4 s |
+| LNC=1, 1 server, 4T + 4V | 129-141 | 3.7-9.8 s |
+| LNC=1, 2 servers x (2T + 2V), default host threads | 173-195 | 3.2-7.8 s |
+| **LNC=1, 2 servers x (2T + 2V), `QTTS_HOST_THREADS=1 QTTS_PREFILL_CTX_BUCKETS=64,128`** | **248 (conc 256) / 250 (conc 400)** | **3.7 / 6.0 s** |
+| LNC=1, 4 servers x (1T + 1V), same env | 244-247 | 3.8-9.4 s |
+
+Streaming, LNC=1 2 servers: 265x at concurrency 256 (TTFA p50 0.93 s); 101x at concurrency 64 per server (TTFA 133 ms).
+Single stream at LNC=1 (B=1 talker): 0.97 s per ~4 s utterance, TTFA 49 ms (LNC=2: 0.72 s / 41 ms).
+Quality (LNC=1, 2 servers, 100 prompts sampled): 1.07 % WER/CER, 0 runaways (LNC=2: 0.50 %; the gap is digit
+normalisation on de/fr/ko outputs). Recipe:
+
+```bash
+export NEURON_LOGICAL_NC_CONFIG=1 QTTS_HOST_THREADS=1 QTTS_PREFILL_CTX_BUCKETS=64,128
+QTTS_B=48 QTTS_REP0=2 QTTS_DEV0=0,2 QTTS_REP1=2 QTTS_DEV1=1,3 QTTS_B1=96 python -m qwen3_tts_neuron.serving.make_deploy /tmp/a.yaml
+QTTS_B=48 QTTS_REP0=2 QTTS_DEV0=4,6 QTTS_REP1=2 QTTS_DEV1=5,7 QTTS_B1=96 python -m qwen3_tts_neuron.serving.make_deploy /tmp/b.yaml
+QTTS_NC_COUNT=8 python -m qwen3_tts_neuron.serving.serve_launcher serve <model> --deploy-config /tmp/a.yaml --port 8101 ... &
+QTTS_NC_COUNT=8 python -m qwen3_tts_neuron.serving.serve_launcher serve <model> --deploy-config /tmp/b.yaml --port 8102 ... &
+# put a load balancer in front of 8101/8102
+```
+Why the two env settings matter at LNC=1:
+- 8 stage processes plus 2 API servers share 12 vCPUs, so 1 torch thread per stage is enough.
+- At LNC=1 the full-cache 64-token prefill is 14 ms vs 11 ms ctx-limited.
+- Together they took the 2-server layout from 195x to 250x. At LNC=2 they are worth ~3 % (157 -> 162x).
+- The sampler's top-k compare is miscompiled at LNC=1, so `fused.sample_rows` switches to an equivalent form there
+  (identical draws for the same noise).
 
 3 talkers + 1 vocoder is limited by the single stage-1 replica's per-step loop (requests wait ~1 s there after the
 talker finishes; vocoder compute ~40 % busy), not by the device. Note: clients must allow enough connections (httpx defaults to 100, which caps concurrency silently).
