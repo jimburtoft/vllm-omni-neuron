@@ -27,7 +27,8 @@ Served (`/v1/realtime?duplex=1`), audio streamed at real-time pace, 28.8 s conve
 | 1 server (cores 0+1), B=1 | 1 | yes | 175 ms | 93 / 96 ms |
 | 1 server, B=4 | 4 | yes | 220-230 ms | 112-129 / 151-167 ms |
 | 1 server, B=5 | 5 | yes | 242 ms | 135-147 / 176-186 ms |
-| **2 servers (cores 0+1, 2+3), B=5 each** | **10** | yes | 190-260 ms | 130-143 / <= 180 ms |
+| 2 servers (cores 0+1, 2+3), B=5 each | 10 | yes | 190-260 ms | 130-143 / <= 180 ms |
+| **1 server, 3 stage-0 replicas (cores 0,2,3) B=5 + 1 decoder (core 1)** | **15** | yes | 225-349 ms | 167-189 / <= 248 ms |
 
 Per-frame latency is the time from sending an 80 ms input frame to receiving the 80 ms of Moshi audio it
 produces; it does not grow over the session. B=6 per server does not fit one core's HBM (7B weights + 6 x 1.6 GB KV).
@@ -61,6 +62,18 @@ MOSHI_NC_COUNT=4 python -m moshi_neuron.serving.serve_launcher serve kyutai/mosh
 ```
 
 The first start compiles the graphs (about 8 minutes); later starts load them from the compile cache.
+
+### 15 sessions per instance
+
+The Mimi decoder is light, so one decoder core can serve three language-model cores:
+
+```bash
+MOSHI_B=5 MOSHI_REP0=3 MOSHI_DEV0=0,2,3 MOSHI_DEV1=1 python -m moshi_neuron.serving.make_deploy /tmp/moshi15.yaml
+MOSHI_NC_COUNT=4 python -m moshi_neuron.serving.serve_launcher serve kyutai/moshiko-pytorch-bf16 \
+    --deploy-config /tmp/moshi15.yaml --port 8000 --omni --init-timeout 3600 --stage-init-timeout 3600
+```
+
+The first start compiles the three stage-0 replicas one after another (about 20 minutes); later starts use the cache.
 
 ## Talk to it
 
