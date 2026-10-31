@@ -85,6 +85,7 @@ class MoshiLM(nn.Module):
             # MOSHI_FP8_KV=1: FP8 (e4m3) KV cache. Per-layer quant scales: scale = FP8_MAX / amax(K or V), amax from
             # MOSHI_KV_SCALES (json {"k": [32], "v": [32]} of bf16 amax per layer) or a default amax.
             self.fp8_kv = os.environ.get("MOSHI_FP8_KV", "0") == "1"
+            self.attn_chunk = int(os.environ.get("MOSHI_ATTN_CHUNK", "4"))
             if self.fp8_kv:
                 import json
                 fmax = float(os.environ.get("MOSHI_FP8_MAX", "240"))
@@ -255,16 +256,26 @@ class MoshiLM(nn.Module):
             if "noattn" in abl:
                 a = x
             else:
-              a = attention_decode(
-                X=x, X_hidden_dim_actual=cfg.dim, rmsnorm_X_enabled=True, rmsnorm_X_eps=cfg.eps,
-                rmsnorm_X_gamma=l["n1"], W_qkv=l["wqkv"], bias_qkv=None,
-                cos=cos, sin=sin, rope_contiguous_layout=True, K_cache_transposed=False,
-                active_blocks_table=table, K_cache=getattr(self, f"k{i}"), V_cache=getattr(self, f"v{i}"),
-                attention_mask=None, softmax_scale=D ** -0.5 / (self.kv_scales[i][0] if self.fp8_kv else 1.0),
-                sink=None, pos_ids=pos_ids, swa_start_pos_ids=swa_start, update_cache=True, kv_cache_update_idx=widx,
-                k_scale=getattr(self, f"ks{i}") if self.fp8_kv else None,
-                v_scale=getattr(self, f"vs{i}") if self.fp8_kv else None,
-                W_out=l["wo"], bias_out=None, transposed_out=False, out_in_sb=False)
+              # The kernel folds the 32 KV heads into its batch; its FP8-KV path is only correct while
+              # B*32 <= 128 partitions (measured: B<=4 correct, B>=5 garbage). Chunk rows for FP8 KV; the KV pool
+              # and the global block tables are shared, so per-chunk calls are exact.
+              ch = self.attn_chunk if self.fp8_kv else B
+              parts = []
+              for r0 in range(0, B, ch):
+                  r1 = min(B, r0 + ch)
+                  parts.append(attention_decode(
+                      X=x[r0:r1], X_hidden_dim_actual=cfg.dim, rmsnorm_X_enabled=True, rmsnorm_X_eps=cfg.eps,
+                      rmsnorm_X_gamma=l["n1"], W_qkv=l["wqkv"], bias_qkv=None,
+                      cos=cos[:, r0:r1].contiguous(), sin=sin[:, r0:r1].contiguous(), rope_contiguous_layout=True,
+                      K_cache_transposed=False, active_blocks_table=table[r0:r1].contiguous(),
+                      K_cache=getattr(self, f"k{i}"), V_cache=getattr(self, f"v{i}"), attention_mask=None,
+                      softmax_scale=D ** -0.5 / (self.kv_scales[i][0] if self.fp8_kv else 1.0), sink=None,
+                      pos_ids=pos_ids[r0:r1].contiguous(), swa_start_pos_ids=swa_start[r0:r1].contiguous(),
+                      update_cache=True, kv_cache_update_idx=widx[r0:r1].contiguous(),
+                      k_scale=getattr(self, f"ks{i}") if self.fp8_kv else None,
+                      v_scale=getattr(self, f"vs{i}") if self.fp8_kv else None,
+                      W_out=l["wo"], bias_out=None, transposed_out=False, out_in_sb=False))
+              a = parts[0] if len(parts) == 1 else torch.cat([p.view(-1, cfg.dim) for p in parts], 0)
             if "nomlp" in abl:
                 x = x + a.view(B, 1, -1)
                 continue

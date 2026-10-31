@@ -25,6 +25,7 @@ def main():
     ap.add_argument("--clip", default="utt1")
     ap.add_argument("--frames", type=int, default=40)
     ap.add_argument("--golden-dtype", default="float32")
+    ap.add_argument("--B", type=int, default=1)
     args = ap.parse_args()
     neuron_runtime_env()
     dev = torch_device()
@@ -34,7 +35,7 @@ def main():
         test_mimi(args.goldens, mimi_path, getattr(torch, args.mimi_dtype), device=dev, compile_fn=cf)
     if "lm" in args.what:
         test_lm(args.goldens, lm_path, getattr(torch, args.dtype), args.clip, args.frames, device=dev,
-                compile_fn=cf, golden_dtype=args.golden_dtype)
+                compile_fn=cf, golden_dtype=args.golden_dtype, B=args.B)
 
 
 if __name__ == "__main__":

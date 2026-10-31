@@ -58,12 +58,16 @@ def test_mimi(gdir, mimi_path, dtype, device="cpu", compile_fn=None):
     return res
 
 
-def test_lm(gdir, lm_path, dtype, clip, frames, device="cpu", compile_fn=None, golden_dtype="float32"):
+def test_lm(gdir, lm_path, dtype, clip, frames, device="cpu", compile_fn=None, golden_dtype="float32", B=1):
+    """B > 1: every row replays the same golden, row b starting b*stagger frames late (different ring offsets);
+    each row is compared against the golden at its own frame index."""
     g = torch.load(os.path.join(gdir, f"duplex_{clip}_{golden_dtype}_greedy.pt"))
     T = min(frames, g["user_codes"].shape[0])
-    lm = MoshiLM(lm_path, 1, dtype=dtype).to(device).eval()
+    lm = MoshiLM(lm_path, B, dtype=dtype).to(device).eval()
     frame = MoshiFrame(lm, ctx=lm.C, temp_text=0.0, temp=0.0, debug=True).to(device)
     fn = (compile_fn or (lambda x: x))(frame)
+    if B > 1:
+        return _test_lm_rows(g, T, B, fn, device)
     host = LMGenHost(1)
     forced_text = g["text_logits"].argmax(-1)       # [T]
     forced_audio = g["dep_logits"].argmax(-1)       # [T,8]
@@ -94,6 +98,32 @@ def test_lm(gdir, lm_path, dtype, clip, frames, device="cpu", compile_fn=None, g
     summ["ms_median"] = float(np.median(stats["ms"][2:])) if T > 3 else summ["ms"]
     print("lm", clip, dtype, summ, flush=True)
     return summ
+
+
+def _test_lm_rows(g, T, B, fn, device, stagger=7):
+    host = LMGenHost(B)
+    ft_all, fa_all = g["text_logits"].argmax(-1), g["dep_logits"].argmax(-1)
+    z = lambda *s: torch.zeros(*s, device=device)
+    tops, deps, rels = [[] for _ in range(B)], [[] for _ in range(B)], [[] for _ in range(B)]
+    for step in range(T + stagger * (B - 1)):
+        t_row = torch.tensor([step - b * stagger for b in range(B)])
+        active = (t_row >= 0) & (t_row < T)
+        tt = t_row.clamp(0, T - 1)
+        inp = host.inputs(g["user_codes"][tt], active)
+        out, tl, al, _ = fn(inp.to(device), (t_row == 0).to(device), active.to(device), z(B, 32000), z(B, 8, 2048),
+                            ft_all[tt].to(device), fa_all[tt].to(device), torch.ones(B, dtype=torch.bool, device=device))
+        tl, al = tl.cpu(), al.cpu()
+        host.commit(out.cpu(), active)
+        for b in range(B):
+            if bool(active[b]):
+                t = int(tt[b])
+                tops[b].append(int(tl[b].argmax() == ft_all[t]))
+                deps[b].append(float((al[b].argmax(-1) == fa_all[t]).float().mean()))
+                rels[b].append(rel(tl[b], g["text_logits"][t]))
+    res = {f"row{b}": dict(text_top1=float(np.mean(tops[b])), dep_top1=float(np.mean(deps[b])),
+                           text_rel_max=float(np.max(rels[b]))) for b in range(B)}
+    print("lm rows", res, flush=True)
+    return res
 
 
 def main():
