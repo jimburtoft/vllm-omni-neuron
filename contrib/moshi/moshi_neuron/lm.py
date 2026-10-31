@@ -63,12 +63,55 @@ class MoshiLM(nn.Module):
         self.register_buffer("emb_off", torch.tensor(offs).view(1, -1), persistent=False)
 
         self.layers = nn.ModuleList()
+        # Interleaved RoPE == rotate-half RoPE after permuting each head's Q/K output rows from [r0,i0,r1,i1,...] to
+        # [r0,r1,...,i0,i1,...]. q.k is invariant under the same permutation of q and k, so this is exact; V and
+        # out_proj are untouched. MOSHI_ROPE=interleaved keeps the reference layout.
+        self.rope_half = os.environ.get("MOSHI_ROPE", "half") == "half"
+        perm = torch.cat([torch.arange(0, D, 2), torch.arange(1, D, 2)])
+        hp = (torch.arange(H).view(H, 1) * D + perm.view(1, D)).reshape(-1)
+        qkv_perm = torch.cat([hp, H * D + hp, 2 * H * D + torch.arange(H * D)])
+        # MOSHI_KERNELS=1: nkilib fused decode (attention_block_tkg + mlp TKG) with a block KV ring; weights are
+        # stored in the kernels' [in, out] layout and the per-layer KV is [B*NBLK, H, BLK, D].
+        self.kernels = os.environ.get("MOSHI_KERNELS", "0") == "1"
+        if self.kernels:
+            assert self.rope_half, "the fused kernel path needs MOSHI_ROPE=half"
+            self.BLK = int(os.environ.get("MOSHI_KV_BLOCK", "32"))
+            self.SCTX = int(os.environ.get("MOSHI_KV_SLOTS", "3072"))  # >= context + BLK, multiple of 128
+            assert self.SCTX % self.BLK == 0 and self.SCTX % 128 == 0 and self.SCTX >= cfg.context + self.BLK
+            self.NBLK = self.SCTX // self.BLK
+            # nkilib mlp TKG measured slower than the compiler's matmuls here (B=3: 93 ms with column tiling,
+            # 60 ms without, vs 50 ms with torch); default to the torch MLP. MOSHI_TORCH_MLP=0 -> NF.mlp.
+            self.torch_mlp = os.environ.get("MOSHI_TORCH_MLP", "1") == "1"
+            self.mlp_mode = os.environ.get("MOSHI_MLP_MODE", "nf")  # nf | direct
+            self.mlp_ct = os.environ.get("MOSHI_MLP_CT", "1") == "1"
+            if self.mlp_mode == "direct":
+                from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+                from nkilib.core.mlp.mlp import mlp as nk_mlp
+                from nkilib.core.utils.common_types import ActFnType
+                from nkilib.core.utils.common_types import ComputationMode
+                self._wmlp = wrap_nki(nk_mlp)
+                self._act = ActFnType.SiLU
+                self._mode = getattr(ComputationMode, os.environ.get("MOSHI_MLP_CMODE", "DECODE"))
         for i in range(L):
             p = f"transformer.layers.{i}."
+            w = g(p + "self_attn.in_proj_weight")
+            if self.rope_half:
+                w = w[qkv_perm]
+            win, wout = g(p + "gating.linear_in.weight"), g(p + "gating.linear_out.weight")
+            if self.kernels:
+                I = win.shape[0] // 2
+                self.layers.append(nn.ParameterDict(dict(
+                    n1=P(g(p + "norm1.alpha").view(1, -1)), n2=P(g(p + "norm2.alpha").view(1, -1)),
+                    wqkv=P(w.t()), wo=P(g(p + "self_attn.out_proj.weight").t()),
+                    wg=P(win[:I].t()), wu=P(win[I:].t()), wd=P(wout.t()))))
+                kv = torch.zeros(B * self.NBLK, H, self.BLK, D, dtype=dtype)
+                self.register_buffer(f"k{i}", kv, persistent=False)
+                self.register_buffer(f"v{i}", kv.clone(), persistent=False)
+                continue
             self.layers.append(nn.ParameterDict(dict(
                 n1=P(g(p + "norm1.alpha").view(-1)), n2=P(g(p + "norm2.alpha").view(-1)),
-                wqkv=P(g(p + "self_attn.in_proj_weight")), wo=P(g(p + "self_attn.out_proj.weight")),
-                win=P(g(p + "gating.linear_in.weight")), wout=P(g(p + "gating.linear_out.weight")))))
+                wqkv=P(w), wo=P(g(p + "self_attn.out_proj.weight")),
+                win=P(win), wout=P(wout))))
             self.register_buffer(f"k{i}", torch.zeros(B * H * self.C, D, dtype=dtype), persistent=False)
             self.register_buffer(f"v{i}", torch.zeros(B * H * self.C, D, dtype=dtype), persistent=False)
         self.out_norm = P(g("out_norm.alpha").view(-1))
@@ -95,29 +138,52 @@ class MoshiLM(nn.Module):
 
     # ---------------------------------------------------------------- temporal transformer
     def temporal(self, tokens, reset, active, ctx: int):
+        if self.kernels:
+            return self.temporal_kernels(tokens, reset, active)
         cfg, B, H, D, C = self.cfg, self.B, self.cfg.num_heads, self.cfg.head_dim, self.C
         valid = (tokens >= 0).to(self.dtype).unsqueeze(-1)
         x = (F.embedding(tokens.clamp(min=0) + self.emb_off, self.emb) * valid).sum(1, keepdim=True)  # [B,1,dim]
         off = torch.where(reset, torch.zeros_like(self.offset), self.offset)
-        cos, sin = rope_tables(off.view(B, 1), D, cfg.max_period)
+        cos, sin = rope_tables(off.view(B, 1), D, cfg.max_period)          # [B,1,1,D/2] fp32
+        if self.rope_half:
+            cos2 = torch.cat([cos, cos], -1)                                 # [B,1,1,D] fp32
+            sin2 = torch.cat([-sin, sin], -1)
         pos_k = ring_positions(off, 1, C)[:, :ctx]
         delta = off.view(B, 1) - pos_k
         ok = (pos_k >= 0) & (delta >= 0) & (delta < cfg.context)
         mask = torch.where(ok, 0.0, NEG).to(torch.float32).view(B, 1, 1, ctx)
+        abl = getattr(self, "_abl", "")  # profiling ablations only
+        if "simplemask" in abl:
+            mask = torch.where(torch.arange(ctx, device=x.device).view(1, ctx) <= off.view(B, 1), 0.0, NEG).float().view(B, 1, 1, ctx)
         widx = ((torch.arange(B, device=x.device).view(B, 1) * H + self.hoff.view(1, H)) * C
                 + (off % C).view(B, 1)).reshape(-1)
         for i, l in enumerate(self.layers):
             h = rms_f32(x, l["n1"], cfg.eps)
             q, k, v = F.linear(h, l["wqkv"]).view(B, 1, 3, H, D).permute(2, 0, 3, 1, 4)  # [B,H,1,D]
-            q = apply_rope_interleaved(q, cos, sin)
-            k = apply_rope_interleaved(k, cos, sin)
+            if "norope" in abl:
+                pass
+            elif self.rope_half:
+                # x*cos + rotate_half(x)*sin, rotate_half(x) = [x2, x1] with the sign folded into sin2
+                qf, kf = q.float(), k.float()
+                q = (qf * cos2 + torch.cat([qf[..., D // 2:], qf[..., :D // 2]], -1) * sin2).to(q.dtype)
+                k = (kf * cos2 + torch.cat([kf[..., D // 2:], kf[..., :D // 2]], -1) * sin2).to(k.dtype)
+            else:
+                q = apply_rope_interleaved(q, cos, sin)
+                k = apply_rope_interleaved(k, cos, sin)
             kb, vb = getattr(self, f"k{i}"), getattr(self, f"v{i}")
-            kb.index_copy_(0, widx, k.reshape(-1, D))
-            vb.index_copy_(0, widx, v.reshape(-1, D))
+            if not getattr(self, "_skip_write", False):  # profiling only
+                kb.index_copy_(0, widx, k.reshape(-1, D))
+                vb.index_copy_(0, widx, v.reshape(-1, D))
             K = kb.view(B, H, C, D)[:, :, :ctx]
             V = vb.view(B, H, C, D)[:, :, :ctx]
-            sc = (q @ K.transpose(-1, -2)).float() * (D ** -0.5) + mask
-            o = (torch.softmax(sc, -1).to(V.dtype) @ V).transpose(1, 2).reshape(B, 1, H * D)
+            if "noattn" in abl:
+                o = q.transpose(1, 2).reshape(B, 1, H * D)
+            else:
+                sc = (q @ K.transpose(-1, -2)).float() * (D ** -0.5) + mask
+                o = (torch.softmax(sc, -1).to(V.dtype) @ V).transpose(1, 2).reshape(B, 1, H * D)
+            if "nomlp" in abl:
+                x = x + o
+                continue
             x = x + F.linear(o, l["wo"])
             h = rms_f32(x, l["n2"], cfg.eps)
             gu = F.linear(h, l["win"]).view(B, 1, 2, -1)
@@ -125,6 +191,77 @@ class MoshiLM(nn.Module):
         self.offset.copy_(torch.where(active, off + 1, self.offset))
         tout = rms_f32(x, self.out_norm, cfg.eps)              # [B,1,dim]
         return tout, F.linear(tout, self.text_linear).float()[:, 0]  # [B,32000]
+
+    def temporal_kernels(self, tokens, reset, active):
+        """Helium step on nkilib fused decode kernels.
+
+        Ring KV in blocks: frame f lives in slot f mod SCTX (block (f mod SCTX) // BLK, offset f % BLK) of the row's
+        NBLK blocks. Each step the row's block table is rotated so that the attended window (the last context-1
+        frames) is contiguous in table order, starting at offset `ofs` < BLK; the kernel's in-kernel banded mask
+        (pos_ids = end, swa_start_pos_ids = start) then selects exactly moshi's RingKVCache window. The kernel places
+        the current token at the table's last slot (never part of the window since SCTX >= context + BLK) and writes
+        its K/V to the physical slot of frame t. Inactive rows write to uint32_max (skipped)."""
+        from nkilib.core.utils.common_types import NormType
+        from vllm_neuron.functional.attention.attention_decode import attention_decode
+        from vllm_neuron.functional.mlp import mlp as nf_mlp
+
+        cfg, B, H, D = self.cfg, self.B, self.cfg.num_heads, self.cfg.head_dim
+        BLK, NBLK, SCTX, W = self.BLK, self.NBLK, self.SCTX, cfg.context - 1
+        dev = tokens.device
+        valid = (tokens >= 0).to(self.dtype).unsqueeze(-1)
+        x = (F.embedding(tokens.clamp(min=0) + self.emb_off, self.emb) * valid).sum(1)  # [B,dim]
+        t = torch.where(reset, torch.zeros_like(self.offset), self.offset)               # frames before this one
+        s0 = torch.clamp(t - W, min=0)                                                  # oldest attended frame
+        start_blk = (s0 % SCTX) // BLK
+        ofs = s0 % BLK
+        end = ofs + (t - s0)
+        j = torch.arange(NBLK, device=dev).view(1, NBLK)
+        rows = torch.arange(B, device=dev).view(B, 1)
+        blocks = rows * NBLK + (start_blk.view(B, 1) + j) % NBLK                        # [B,NBLK] pool block ids
+        hh = torch.arange(H, device=dev).view(1, H, 1)
+        table = (blocks.view(B, 1, NBLK) * H + hh).to(torch.int32)                      # [B,H,NBLK] head-inner
+        wslot = t % SCTX
+        wblk = rows.view(B) * NBLK + wslot // BLK
+        widx = ((wblk.view(B, 1) * H + hh.view(1, H)) * BLK + (wslot % BLK).view(B, 1))  # [B,H]
+        # inactive rows: -1 in int32 == 0xFFFFFFFF as uint32 -> the kernel skips the write
+        widx = torch.where(active.view(B, 1), widx.to(torch.int32), torch.full_like(widx, -1, dtype=torch.int32))
+        widx = widx.view(B, H, 1).to(torch.uint32)
+        pos_ids = end.view(B, 1).to(torch.float32)
+        swa_start = ofs.view(B, 1).to(torch.float32)
+        cos, sin = rope_tables(t.view(B, 1), D, cfg.max_period)                         # [B,1,1,D/2]
+        cos = cos.view(B, 1, D // 2).permute(2, 0, 1).contiguous().to(self.dtype)       # [D/2,B,1]
+        sin = sin.view(B, 1, D // 2).permute(2, 0, 1).contiguous().to(self.dtype)
+        x = x.view(B, 1, -1)
+        for i, l in enumerate(self.layers):
+            a = attention_decode(
+                X=x, X_hidden_dim_actual=cfg.dim, rmsnorm_X_enabled=True, rmsnorm_X_eps=cfg.eps,
+                rmsnorm_X_gamma=l["n1"], W_qkv=l["wqkv"], bias_qkv=None,
+                cos=cos, sin=sin, rope_contiguous_layout=True, K_cache_transposed=False,
+                active_blocks_table=table, K_cache=getattr(self, f"k{i}"), V_cache=getattr(self, f"v{i}"),
+                attention_mask=None, softmax_scale=D ** -0.5, sink=None, pos_ids=pos_ids,
+                swa_start_pos_ids=swa_start, update_cache=True, kv_cache_update_idx=widx,
+                W_out=l["wo"], bias_out=None, transposed_out=False, out_in_sb=False)
+            if self.mlp_mode == "direct":
+                xr = x.view(B, -1) + a.view(B, -1)
+                m = self._wmlp[2](
+                    hidden_tensor=xr.view(1, B, -1), gate_proj_weights_tensor=l["wg"], up_proj_weights_tensor=l["wu"],
+                    down_proj_weights_tensor=l["wd"], normalization_weights_tensor=l["n2"],
+                    normalization_type=NormType.RMS_NORM, eps=cfg.eps, activation_fn=self._act,
+                    use_tkg_gate_up_proj_column_tiling=self.mlp_ct, use_tkg_down_proj_column_tiling=self.mlp_ct,
+                    mode=self._mode)
+                m = m[0] if isinstance(m, (tuple, list)) else m
+                x = (xr + m.view(B, -1)).view(B, 1, -1)
+            elif self.torch_mlp:
+                x = x + a.view(B, 1, -1)
+                h = rms_f32(x, l["n2"].view(-1), cfg.eps)
+                x = x + F.linear(F.silu(F.linear(h, l["wg"].t())) * F.linear(h, l["wu"].t()), l["wd"].t())
+            else:
+                m, x = nf_mlp(a.view(B, -1), l["wg"], l["wu"], l["wd"], eps=cfg.eps, ln_w=l["n2"],
+                              norm_type=NormType.RMS_NORM, fused_add_tensor=x.view(B, -1), store_fused_add_result=True)
+                x = (x + m).view(B, 1, -1)
+        self.offset.copy_(torch.where(active, t + 1, self.offset))
+        tout = rms_f32(x, self.out_norm, cfg.eps)
+        return tout, F.linear(tout, self.text_linear).float()[:, 0]
 
     # ---------------------------------------------------------------- depformer
     def _lookup(self, table, idx):
