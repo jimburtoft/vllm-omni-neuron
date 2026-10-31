@@ -57,20 +57,35 @@ TOPK_MAX = 64  # static upper bound for per-row top-k (checkpoint default 50)
 
 
 def sample_rows(logits, gumbel, temp, topk):
-    """Per-row sampling in one static graph. logits [B,...,V] f32; gumbel same shape; temp [B] f32 (<=0 -> greedy);
-    topk [B] int (0 -> full vocab, else <= TOPK_MAX). Greedy rows reduce exactly to argmax(logits)."""
-    B = logits.shape[0]
-    shape = (B,) + (1,) * (logits.dim() - 1)
-    t = temp.view(shape)
+    """Per-row sampling in one static graph. logits [B,...,V] f32 (middle dims of size 1); gumbel same shape;
+    temp [B] f32 (<=0 -> greedy); topk [B] int (0 -> full vocab, else <= TOPK_MAX). Greedy rows reduce exactly to
+    argmax(logits).
+
+    Top-k rows sample inside the TOPK_MAX candidate set returned by torch.topk (positions >= k masked by an integer
+    compare), with the Gumbel noise gathered at the candidates' vocab ids, so the result equals Gumbel-max over the
+    top-k set of the full vocab. The earlier form compared all V logits against a data-dependent k-th threshold; inside
+    the 15-step code-predictor loop that compare was miscompiled at LNC=1 (libtorch-neuronx-lite, SDK 2.33: ~60 % of
+    residual codes came out as 0)."""
+    out_shape = logits.shape[:-1]
+    B, V = logits.shape[0], logits.shape[-1]
+    l0 = logits.reshape(B, V)
+    g = gumbel.reshape(B, V)
+    t = temp.view(B, 1)
     greedy = t <= 0
-    l = logits / torch.where(greedy, 1.0, t)
-    kmax = min(TOPK_MAX, l.shape[-1])
-    vals = torch.topk(l, kmax, dim=-1).values  # [..., kmax] descending
-    k = topk.view(shape).clamp(min=0, max=kmax)
-    kth = torch.gather(vals, -1, (torch.where(k > 0, k, kmax) - 1).long())  # value of the k-th largest
-    l = torch.where((k > 0) & (l < kth), float("-inf"), l)
-    noisy = torch.where(greedy, l, l + gumbel)
-    return torch.argmax(noisy, dim=-1)
+    inv_t = 1.0 / torch.where(greedy, 1.0, t)
+    noise_on = torch.where(greedy, 0.0, 1.0)
+    # full-vocab path (topk == 0)
+    full = torch.argmax(l0 * inv_t + noise_on * g, dim=-1)
+    # top-k path
+    kmax = min(TOPK_MAX, V)
+    vals, idx = torch.topk(l0, kmax, dim=-1)  # [B, kmax]
+    k = topk.view(B, 1).clamp(min=0, max=kmax)
+    pos = torch.arange(kmax, device=logits.device).view(1, kmax)
+    score = vals * inv_t + noise_on * torch.gather(g, -1, idx)
+    score = torch.where(pos < k, score, float("-inf"))
+    j = torch.argmax(score, dim=-1, keepdim=True)
+    topk_pick = torch.gather(idx, -1, j).view(B)
+    return torch.where(k.view(B) > 0, topk_pick, full).view(out_shape)
 
 
 def cp_frame_vec(cp, talker_hidden, cb0_embed, vec=True, gumbel=None, temperature=0.0, top_k=0, rows=None):
