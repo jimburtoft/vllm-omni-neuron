@@ -28,10 +28,10 @@ Served (`/v1/realtime?duplex=1`), audio streamed at real-time pace, 28.8 s conve
 | 1 server, B=4 | 4 | yes | 220-230 ms | 112-129 / 151-167 ms |
 | 1 server, B=5 | 5 | yes | 242 ms | 135-147 / 176-186 ms |
 | 2 servers (cores 0+1, 2+3), B=5 each | 10 | yes | 190-260 ms | 130-143 / <= 180 ms |
-| **1 server, 3 stage-0 replicas (cores 0,2,3) B=5 + 1 decoder (core 1)** | **15** | yes | 225-349 ms | 167-189 / <= 248 ms |
+| **1 server, 3 stage-0 replicas (cores 0,2,3) B=5 + 1 decoder (core 1)** | **15** | yes | <= 280 ms | 124-140 / <= 187 ms |
 
 Per-frame latency is the time from sending an 80 ms input frame to receiving the 80 ms of Moshi audio it
-produces; it does not grow over the session. B=6 per server does not fit one core's HBM (7B weights + 6 x 1.6 GB KV).
+produces; it does not grow over the session (also measured over 5-minute sessions). B=6 per server does not fit one core's HBM (7B weights + 6 x 1.6 GB KV).
 
 The Helium attention runs on the fused nkilib decode kernel (`attention_block_tkg`: RMSNorm + QKV + RoPE +
 attention + KV write + output projection in one kernel) over a block-paged ring KV cache with an in-kernel
@@ -40,6 +40,10 @@ sliding-window mask; the rest is plain PyTorch compiled by the Neuron compiler.
 Output quality: greedy decoding reproduces the kyutai reference's text on our test clips; teacher-forced against
 the fp32 reference, text predictions match 100% and audio-code predictions 99.5%; Whisper's transcript of the generated
 speech matches Moshi's inner-monologue text.
+
+Sessions can run past Moshi's 3000-frame (4 min) attention window: the KV caches are rings, and the server allows
+sessions up to 1 hour (`MOSHI_MAX_MODEL_LEN`, frames). Note that Moshi itself tends to repeat or go quiet in very
+long one-sided monologues; the kyutai reference does the same.
 
 ## Setup
 
