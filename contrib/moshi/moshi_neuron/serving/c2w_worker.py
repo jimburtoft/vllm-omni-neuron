@@ -41,6 +41,9 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
         # duplex data plane slices the *cumulative* audio of a request by the samples already sent
         self.cumulative = os.environ.get("MOSHI_C2W_CUMULATIVE", "0") == "1"
         self.acc: dict[str, list] = {}
+        self.text: dict[str, str] = {}
+        self.text_rows = os.environ.get("MOSHI_TEXT_CHANNEL", "1") == "1"
+        self._tok = None
         if needs_omni_connector(self.model_config):
             self.init_omni_connectors(model_config=self.model_config)
 
@@ -50,6 +53,16 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
         self.dec = MoshiDecoderRows(B=self.B, device=self.device, compile_fn=compile_fn(),
                                     model_dir=model_dir(self.model_config.model))
         logger.info("[MoshiC2W] loaded in %.1fs (B=%d)", time.time() - t0, self.B)
+
+    def _add_text(self, rid, toks):
+        if self._tok is None:
+            import sentencepiece
+            from ..config import checkpoint_paths
+            _, _, tp = checkpoint_paths(model_dir=model_dir(self.model_config.model), need_lm=False)
+            self._tok = sentencepiece.SentencePieceProcessor(tp)
+        pieces = [self._tok.id_to_piece(int(t)).replace("\u2581", " ") for t in toks.tolist()
+                  if int(t) not in (0, 3) and 0 <= int(t) < 32000]
+        self.text[rid] = self.text.get(rid, "") + "".join(pieces)
 
     @torch.inference_mode()
     def warmup(self):
@@ -78,6 +91,7 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
             self.requests.pop(rid, None)
             self.seen.pop(rid, None)
             self.acc.pop(rid, None)
+            self.text.pop(rid, None)
             b = self.row_of.pop(rid, None)
             if b is not None:
                 self.free.append(b)
@@ -111,7 +125,14 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
                 continue
             req_ids.append(rid)
             flat = self._codes(st, ncomp.get(rid, 0), n)
-            if flat.numel() == 0 or flat.numel() % K:
+            if flat.numel() == 0:
+                continue
+            # with the text backport the processor sends [8*F audio | F text]; MOSHI_TEXT_CHANNEL=0 for 8*F only
+            if self.text_rows and flat.numel() % 9 == 0:
+                nf = flat.numel() // 9
+                self._add_text(rid, flat[8 * nf:])
+                flat = flat[:8 * nf]
+            if flat.numel() % K:
                 continue
             f = flat.view(K, -1).t()  # [F,8]
             if f.shape[0] == 0 or bool((f >= 2048).any()) or bool((f < 0).any()):
@@ -159,14 +180,20 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
                 wavs.append(torch.cat(a) if a else torch.zeros(0))
             else:
                 wavs.append(new)
-        self._last = (req_ids, wavs)
+        self._last = (req_ids, wavs, [self.text.get(r, "") for r in req_ids])
         return None
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output=None):
         from vllm_omni.utils.mm_outputs import partition_payload_list
-        req_ids, wavs = self._last
-        payloads = [{"model_outputs": w.float(), "sr": torch.tensor(24000)} for w in wavs]
+        req_ids, wavs, texts = self._last
+        payloads = []
+        for w, t in zip(wavs, texts):
+            p = {"model_outputs": w.float(), "sr": torch.tensor(24000)}
+            if t:
+                # cumulative inner-monologue text; the PersonaPlex data plane emits deltas against what it sent
+                p["meta.llm_output_text_utf8"] = torch.tensor(list(t.encode("utf-8")), dtype=torch.uint8)
+            payloads.append(p)
         if self._async_chunk:
             inter, mm = partition_payload_list(payloads) if payloads else (None, None)
         else:

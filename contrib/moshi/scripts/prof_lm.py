@@ -36,12 +36,12 @@ class Temporal(nn.Module):
 
 
 class Depformer(nn.Module):
-    def __init__(self, lm):
+    def __init__(self, lm, temp=0.8, top_k=250):
         super().__init__()
-        self.lm = lm
+        self.lm, self.temp, self.top_k = lm, temp, top_k
 
     def forward(self, tout, text, ga):
-        codes, _ = self.lm.depformer(tout, text, ga, 0.8, 250)
+        codes, _ = self.lm.depformer(tout, text, ga, self.temp, self.top_k)
         return codes
 
 
@@ -92,10 +92,11 @@ def main():
                     fn = cf(Temporal(lm, c, write=(w == "temporal")).to(dev))
                     res[(w, c)] = bench(fn, (tok, r, a), args.n, f"B={B} {w} ctx={c} abl={args.abl}")
                     lm._skip_write = False
-                elif w == "depformer":
-                    fn = cf(Depformer(lm).to(dev))
+                elif w in ("depformer", "depformer_greedy", "depformer_notopk"):
+                    tk = {"depformer": (0.8, 250), "depformer_greedy": (0.0, 0), "depformer_notopk": (0.8, 0)}[w]
+                    fn = cf(Depformer(lm, *tk).to(dev))
                     tout = torch.zeros(B, 1, 4096, dtype=torch.bfloat16).to(dev)
-                    res[(w, c)] = bench(fn, (tout, ft, ga), args.n, f"B={B} depformer")
+                    res[(w, c)] = bench(fn, (tout, ft, ga), args.n, f"B={B} {w}")
     print(res)
 
 

@@ -85,7 +85,8 @@ The first start compiles the three stage-0 replicas one after another (about 20 
 python -m moshi_neuron.serving.duplex_client --wav my_question.wav --sessions 1 --out out/
 ```
 
-The client streams the file in real time over `ws://127.0.0.1:8000/v1/realtime?duplex=1` (24 kHz float32 in,
+The client also records Moshi's inner-monologue text (`out/session0.txt`), streamed as `text` deltas on
+`response.output_audio.delta` events. The client streams the file in real time over `ws://127.0.0.1:8000/v1/realtime?duplex=1` (24 kHz float32 in,
 16-bit PCM out) and writes Moshi's reply to `out/session0.wav`. Any client of the vLLM-Omni realtime duplex API
 works (`vllm_omni.clients.duplex.DuplexClient`); Moshi takes no `voice` or `instructions`.
 

@@ -34,14 +34,32 @@ def rms_f32(x, alpha, eps):
 
 def sample(logits, gumbel, temp: float, top_k: int):
     """logits [..., V] fp32. Gumbel-max sampling from softmax(logits/temp) restricted to the top-k (same
-    distribution as moshi `sample_top_k`). temp <= 0 means greedy argmax."""
+    distribution as moshi `sample_top_k`). temp <= 0 means greedy argmax.
+
+    MOSHI_TOPK_BISECT=N (default 0 = exact torch.topk): find the k-th largest value by N steps of bisection on the
+    value range instead of a sort (count(l >= mid) is one compare + reduce per step); the kept set is the top-k up to
+    ties within (max-min)/2^N."""
     if temp <= 0:
         return torch.argmax(logits, dim=-1)
     l = logits / temp
     if 0 < top_k < l.shape[-1]:
-        kth = torch.topk(l, top_k, dim=-1).values[..., -1:]
+        if _TOPK_BISECT > 0:
+            hi = l.amax(-1, keepdim=True)
+            lo = l.amin(-1, keepdim=True)
+            for _ in range(_TOPK_BISECT):
+                mid = 0.5 * (lo + hi)
+                ge = (l >= mid).sum(-1, keepdim=True)
+                big = ge >= top_k
+                lo = torch.where(big, mid, lo)
+                hi = torch.where(big, hi, mid)
+            kth = lo
+        else:
+            kth = torch.topk(l, top_k, dim=-1).values[..., -1:]
         l = torch.where(l >= kth, l, torch.full_like(l, NEG))
     return torch.argmax(l + gumbel, dim=-1)
+
+
+_TOPK_BISECT = int(os.environ.get("MOSHI_TOPK_BISECT", "0"))
 
 
 class MoshiLM(nn.Module):

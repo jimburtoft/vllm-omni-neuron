@@ -217,7 +217,10 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                 continue
             tok, codes = e
             sampled.append([tok])
-            inter.append(None if codes is None else {"codes.audio": codes.view(1, -1).to(torch.long)})
+            # row layout [8 audio codes, text token]: the backported processor de-delays the 8 audio codes and carries
+            # the text token (delay 0) to stage 1, which detokenizes it for the client text stream
+            inter.append(None if codes is None else
+                         {"codes.audio": torch.cat([codes.view(-1), torch.tensor([tok])]).view(1, -1).to(torch.long)})
         out = OmniModelRunnerOutput(req_ids=req_ids, req_id_to_index={r: i for i, r in enumerate(req_ids)},
                                     sampled_token_ids=sampled, logprobs=None, prompt_logprobs_dict={},
                                     pooler_output=None, multimodal_outputs=None,
