@@ -33,6 +33,31 @@ def _fp8_rowwise(w, fmax):
     return q, sc
 
 
+def _fp8_group(w, fmax, g):
+    """w [out, in] -> (fp8 [out, in], scale [out, in/g] fp32): per-(row, input-group) scales."""
+    o, i = w.shape
+    wg = w.float().view(o, i // g, g)
+    sc = wg.abs().amax(-1).clamp(min=1e-8) / fmax
+    q = (wg / sc[..., None]).clamp(-fmax, fmax).to(torch.float8_e4m3fn).view(o, i)
+    return q, sc
+
+
+def lin8g(x, wq, sc, dtype, g):
+    """y = x @ W^T with W = wq * sc per (row, group): dequantize on chip (cast + group scale), then matmul."""
+    o, i = wq.shape
+    w = (wq.to(dtype).view(o, i // g, g) * sc.to(dtype)[..., None]).view(o, i)
+    return F.linear(x, w)
+
+
+def _i8_group(w, g):
+    """w [out, in] -> (int8 [out, in], scale [out, in/g] fp32), symmetric per (row, group)."""
+    o, i = w.shape
+    wg = w.float().view(o, i // g, g)
+    sc = wg.abs().amax(-1).clamp(min=1e-8) / 127.0
+    q = torch.round(wg / sc[..., None]).clamp(-127, 127).to(torch.int8).view(o, i)
+    return q, sc
+
+
 def lin8(x, wq, sc, dtype):
     """y = x @ (wq * sc)^T with the per-row scale applied to the output (weight-only FP8, dequant on chip).
     The bf16 view of the weight is a graph temporary; for B<=8 decode the compiler streams it tile by tile, but at
@@ -113,8 +138,15 @@ class MoshiLM(nn.Module):
             self.NBLK = self.SCTX // self.BLK
             # MOSHI_FP8_MLP=1: Helium MLP weights stored FP8 e4m3 with per-output-row scales (weight-only; activations
             # bf16; dequant scale applied to the matmul output). Halves 8.9 of the 15.4 GB of weights.
-            self.fp8_mlp = os.environ.get("MOSHI_FP8_MLP", "0") == "1"
+            self.fp8_mlp = os.environ.get("MOSHI_FP8_MLP", "0") == "1" or os.environ.get("MOSHI_W8", "") == "int8"
             self.fp8_max = float(os.environ.get("MOSHI_FP8_WMAX", "240"))
+            self.fp8_group = int(os.environ.get("MOSHI_FP8_GROUP", "0"))   # 0 = per-row scales
+            self.fp8_down = os.environ.get("MOSHI_FP8_DOWN", "1") == "1"
+            # MOSHI_W8=int8: int8 weight-only MLP with per-(row, 128-group) scales (4x lower error than fp8 e4m3)
+            self.w8_int = os.environ.get("MOSHI_W8", "fp8") == "int8"
+            if self.w8_int:
+                self.fp8_mlp = True
+                self.fp8_group = self.fp8_group or 128
             # nkilib mlp TKG measured slower than the compiler's matmuls here (B=3: 93 ms with column tiling,
             # 60 ms without, vs 50 ms with torch); default to the torch MLP. MOSHI_TORCH_MLP=0 -> NF.mlp.
             self.torch_mlp = os.environ.get("MOSHI_TORCH_MLP", "1") == "1"
@@ -147,13 +179,18 @@ class MoshiLM(nn.Module):
             win, wout = g(p + "gating.linear_in.weight"), g(p + "gating.linear_out.weight")
             if self.kernels and self.fp8_mlp:
                 I = win.shape[0] // 2
-                gq, gs = _fp8_rowwise(win[:I], self.fp8_max)
-                uq, us = _fp8_rowwise(win[I:], self.fp8_max)
-                dq, ds = _fp8_rowwise(wout, self.fp8_max)
+                G = self.fp8_group
+                if self.w8_int:
+                    quant = lambda t: _i8_group(t, G or 128)
+                else:
+                    quant = (lambda t: _fp8_group(t, self.fp8_max, G)) if G else (lambda t: _fp8_rowwise(t, self.fp8_max))
+                gq, gs = quant(win[:I])
+                uq, us = quant(win[I:])
+                extra = dict(dq=P(quant(wout)[0]), ds=P(quant(wout)[1])) if self.fp8_down else dict(wd=P(wout))
                 self.layers.append(nn.ParameterDict(dict(
                     n1=P(g(p + "norm1.alpha").view(1, -1)), n2=P(g(p + "norm2.alpha").view(1, -1)),
                     wqkv=P(w.t()), wo=P(g(p + "self_attn.out_proj.weight").t()),
-                    gq=P(gq), gs=P(gs), uq=P(uq), us=P(us), dq=P(dq), ds=P(ds))))
+                    gq=P(gq), gs=P(gs), uq=P(uq), us=P(us), **extra)))
                 kv = torch.zeros(B * self.NBLK, H, self.BLK, D, dtype=dtype)
                 self.register_buffer(f"k{i}", kv, persistent=False)
                 self.register_buffer(f"v{i}", kv.clone(), persistent=False)
@@ -342,9 +379,12 @@ class MoshiLM(nn.Module):
             elif self.fp8_mlp:
                 x = x + a.view(B, 1, -1)
                 h = rms_f32(x, l["n2"].view(-1), cfg.eps)
-                gt = lin8(h, l["gq"], l["gs"], self.dtype)
-                ut = lin8(h, l["uq"], l["us"], self.dtype)
-                x = x + lin8(F.silu(gt) * ut, l["dq"], l["ds"], self.dtype)
+                G = self.fp8_group
+                L8 = (lambda z, q, sc: lin8g(z, q, sc, self.dtype, G)) if G else (lambda z, q, sc: lin8(z, q, sc, self.dtype))
+                gt = L8(h, l["gq"], l["gs"])
+                ut = L8(h, l["uq"], l["us"])
+                mid = F.silu(gt) * ut
+                x = x + (L8(mid, l["dq"], l["ds"]) if self.fp8_down else F.linear(mid, l["wd"]))
             elif self.torch_mlp:
                 x = x + a.view(B, 1, -1)
                 h = rms_f32(x, l["n2"].view(-1), cfg.eps)
