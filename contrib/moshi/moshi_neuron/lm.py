@@ -26,6 +26,20 @@ from .config import LMConfig
 from .mimi import NEG, apply_rope_interleaved, ring_positions, rope_tables
 
 
+def _fp8_rowwise(w, fmax):
+    """w [out, in] -> (fp8 [out, in], scale [out] fp32) with per-output-row scale = amax / fmax."""
+    sc = (w.float().abs().amax(1).clamp(min=1e-8) / fmax)
+    q = (w.float() / sc[:, None]).clamp(-fmax, fmax).to(torch.float8_e4m3fn)
+    return q, sc
+
+
+def lin8(x, wq, sc, dtype):
+    """y = x @ (wq * sc)^T with the per-row scale applied to the output (weight-only FP8, dequant on chip).
+    The bf16 view of the weight is a graph temporary; for B<=8 decode the compiler streams it tile by tile, but at
+    load time the runtime reserves scratchpad for the largest such temporary."""
+    return F.linear(x, wq.to(dtype)) * sc.to(dtype)
+
+
 def rms_f32(x, alpha, eps):
     xf = x.float()
     var = eps + torch.mean(xf * xf, dim=-1, keepdim=True)
@@ -97,6 +111,10 @@ class MoshiLM(nn.Module):
             self.SCTX = int(os.environ.get("MOSHI_KV_SLOTS", "3072"))  # >= context + BLK, multiple of 128
             assert self.SCTX % self.BLK == 0 and self.SCTX % 128 == 0 and self.SCTX >= cfg.context + self.BLK
             self.NBLK = self.SCTX // self.BLK
+            # MOSHI_FP8_MLP=1: Helium MLP weights stored FP8 e4m3 with per-output-row scales (weight-only; activations
+            # bf16; dequant scale applied to the matmul output). Halves 8.9 of the 15.4 GB of weights.
+            self.fp8_mlp = os.environ.get("MOSHI_FP8_MLP", "0") == "1"
+            self.fp8_max = float(os.environ.get("MOSHI_FP8_WMAX", "240"))
             # nkilib mlp TKG measured slower than the compiler's matmuls here (B=3: 93 ms with column tiling,
             # 60 ms without, vs 50 ms with torch); default to the torch MLP. MOSHI_TORCH_MLP=0 -> NF.mlp.
             self.torch_mlp = os.environ.get("MOSHI_TORCH_MLP", "1") == "1"
@@ -127,6 +145,19 @@ class MoshiLM(nn.Module):
             if self.rope_half:
                 w = w[qkv_perm]
             win, wout = g(p + "gating.linear_in.weight"), g(p + "gating.linear_out.weight")
+            if self.kernels and self.fp8_mlp:
+                I = win.shape[0] // 2
+                gq, gs = _fp8_rowwise(win[:I], self.fp8_max)
+                uq, us = _fp8_rowwise(win[I:], self.fp8_max)
+                dq, ds = _fp8_rowwise(wout, self.fp8_max)
+                self.layers.append(nn.ParameterDict(dict(
+                    n1=P(g(p + "norm1.alpha").view(1, -1)), n2=P(g(p + "norm2.alpha").view(1, -1)),
+                    wqkv=P(w.t()), wo=P(g(p + "self_attn.out_proj.weight").t()),
+                    gq=P(gq), gs=P(gs), uq=P(uq), us=P(us), dq=P(dq), ds=P(ds))))
+                kv = torch.zeros(B * self.NBLK, H, self.BLK, D, dtype=dtype)
+                self.register_buffer(f"k{i}", kv, persistent=False)
+                self.register_buffer(f"v{i}", kv.clone(), persistent=False)
+                continue
             if self.kernels:
                 I = win.shape[0] // 2
                 self.layers.append(nn.ParameterDict(dict(
@@ -308,6 +339,12 @@ class MoshiLM(nn.Module):
                     mode=self._mode)
                 m = m[0] if isinstance(m, (tuple, list)) else m
                 x = (xr + m.view(B, -1)).view(B, 1, -1)
+            elif self.fp8_mlp:
+                x = x + a.view(B, 1, -1)
+                h = rms_f32(x, l["n2"].view(-1), cfg.eps)
+                gt = lin8(h, l["gq"], l["gs"], self.dtype)
+                ut = lin8(h, l["uq"], l["us"], self.dtype)
+                x = x + lin8(F.silu(gt) * ut, l["dq"], l["ds"], self.dtype)
             elif self.torch_mlp:
                 x = x + a.view(B, 1, -1)
                 h = rms_f32(x, l["n2"].view(-1), cfg.eps)
