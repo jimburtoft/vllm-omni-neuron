@@ -15,6 +15,7 @@ row overwrites first on its next active step, so they are never read.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -73,12 +74,21 @@ class _StreamingTransformer(nn.Module):
         g = lambda k: f.get_tensor(prefix + k).to(dtype)
         P = lambda t: nn.Parameter(t.contiguous(), requires_grad=False)
         self.layers = nn.ModuleList()
+        # rotate-half RoPE on permuted Q/K rows == interleaved RoPE (exact; see lm.py). MIMI_ROPE=interleaved keeps
+        # the reference layout.
+        self.rope_half = os.environ.get("MIMI_ROPE", "half") == "half"
+        Hh, Dh = cfg.tr_heads, cfg.dimension // cfg.tr_heads
+        perm = torch.cat([torch.arange(0, Dh, 2), torch.arange(1, Dh, 2)])
+        hp = (torch.arange(Hh).view(Hh, 1) * Dh + perm.view(1, Dh)).reshape(-1)
+        self._qkv_perm = torch.cat([hp, Hh * Dh + hp, 2 * Hh * Dh + torch.arange(Hh * Dh)])
         for i in range(self.L):
             p = f"transformer.layers.{i}."
             self.layers.append(nn.ParameterDict(dict(
                 n1w=P(g(p + "norm1.weight")), n1b=P(g(p + "norm1.bias")),
                 n2w=P(g(p + "norm2.weight")), n2b=P(g(p + "norm2.bias")),
-                wqkv=P(g(p + "self_attn.in_proj_weight")), wo=P(g(p + "self_attn.out_proj.weight")),
+                wqkv=P(g(p + "self_attn.in_proj_weight")[self._qkv_perm] if self.rope_half
+                       else g(p + "self_attn.in_proj_weight")),
+                wo=P(g(p + "self_attn.out_proj.weight")),
                 # LayerScale folded into the output projections (exact up to fp rounding).
                 ls1=P(g(p + "layer_scale_1.scale")), ls2=P(g(p + "layer_scale_2.scale")),
                 w1=P(g(p + "linear1.weight")), w2=P(g(p + "linear2.weight")))))
@@ -96,6 +106,8 @@ class _StreamingTransformer(nn.Module):
         t = torch.arange(T, device=x.device)
         pos_q = off.view(B, 1) + t.view(1, T)  # [B,T]
         cos, sin = rope_tables(pos_q, D, self.max_period)
+        if self.rope_half:
+            cos2, sin2 = torch.cat([cos, cos], -1), torch.cat([-sin, sin], -1)  # [B,1,T,D] fp32
         pos_k = ring_positions(off, T, C)  # [B,C]
         delta = pos_q.view(B, T, 1) - pos_k.view(B, 1, C)
         ok = (pos_k.view(B, 1, C) >= 0) & (delta >= 0) & (delta < C)
@@ -105,8 +117,13 @@ class _StreamingTransformer(nn.Module):
         for i, l in enumerate(self.layers):
             h = F.layer_norm(x, (x.shape[-1],), l["n1w"], l["n1b"], 1e-5)
             q, k, v = F.linear(h, l["wqkv"]).view(B, T, 3, H, D).permute(2, 0, 3, 1, 4)  # [B,H,T,D] each
-            q = apply_rope_interleaved(q, cos, sin)
-            k = apply_rope_interleaved(k, cos, sin)
+            if self.rope_half:
+                qf, kf = q.float(), k.float()
+                q = (qf * cos2 + torch.cat([qf[..., D // 2:], qf[..., :D // 2]], -1) * sin2).to(q.dtype)
+                k = (kf * cos2 + torch.cat([kf[..., D // 2:], kf[..., :D // 2]], -1) * sin2).to(k.dtype)
+            else:
+                q = apply_rope_interleaved(q, cos, sin)
+                k = apply_rope_interleaved(k, cos, sin)
             kb, vb = getattr(self, f"k{i}"), getattr(self, f"v{i}")
             kb.index_copy_(0, widx, k.reshape(-1, D))
             vb.index_copy_(0, widx, v.reshape(-1, D))

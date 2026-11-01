@@ -152,6 +152,7 @@ class MoshiLM(nn.Module):
                 win=P(torch.stack([g(p + f"gating.{k}.linear_in.weight") for k in range(Q)])),
                 wout=P(torch.stack([g(p + f"gating.{k}.linear_out.weight") for k in range(Q)])))))
         self.onehot_emb = os.environ.get("MOSHI_ONEHOT_EMB", "0") == "1"
+        self.dep_in_fused = os.environ.get("MOSHI_DEP_IN_FUSED", "1") == "1"
 
     # ---------------------------------------------------------------- temporal transformer
     def temporal(self, tokens, reset, active, ctx: int):
@@ -315,8 +316,11 @@ class MoshiLM(nn.Module):
         ks, vs = [[] for _ in self.dep_layers], [[] for _ in self.dep_layers]
         prev = self._lookup(self.dep_text_emb, text)           # [B,1024]
         codes, logits_all = [], []
+        if self.dep_in_fused:
+            # all 8 per-step input projections read the same transformer output: one [8*1024, 4096] matmul
+            din = F.linear(tout, self.dep_in.view(-1, self.dep_in.shape[-1])).view(B, cfg.dep_q, -1)
         for s in range(cfg.dep_q):
-            x = (F.linear(tout, self.dep_in[s]) + prev).view(B, 1, -1)
+            x = ((din[:, s] if self.dep_in_fused else F.linear(tout, self.dep_in[s])) + prev).view(B, 1, -1)
             for i, l in enumerate(self.dep_layers):
                 h = rms_f32(x, l["n1"], cfg.eps)
                 q, k, v = F.linear(h, l["wqkv"][s]).view(B, 1, 3, Hd, Dd).permute(2, 0, 3, 1, 4)
