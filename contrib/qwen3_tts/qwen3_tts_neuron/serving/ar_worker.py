@@ -89,7 +89,9 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         self.pctx = min(int(os.environ.get("QTTS_PREFILL_CTX", "256")), self.S)
         # buckets that use the ctx-limited graph (measured B=32 lite: Tb=128 16 ms vs 65 ms full-S; Tb=64 is faster
         # full-S, 10 vs 15 ms; Tb=256 no gain)
-        self.pctx_buckets = {int(x) for x in os.environ.get("QTTS_PREFILL_CTX_BUCKETS", "128").split(",") if x.strip()}
+        # at LNC=1 the full-cache 64-token prefill is also slower than the ctx-limited one (14 vs 11 ms)
+        _pcb_default = "64,128" if os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2") == "1" else "128"
+        self.pctx_buckets = {int(x) for x in os.environ.get("QTTS_PREFILL_CTX_BUCKETS", _pcb_default).split(",") if x.strip()}
         bt = self.fe.bt
         self.prefill_fns = {None: c(self.fe.prefill)}
         if self.pctx < self.S:

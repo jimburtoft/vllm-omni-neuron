@@ -29,7 +29,9 @@ def neuron_runtime_env():
     # Host-side torch work per step is small (noise, index ops, prompt build); the default intra-op pool spins ~3
     # cores per stage process and starves the other stages on a 12-vCPU trn2.3xlarge. 2 threads measured best.
     if not cpu_mode():
-        torch.set_num_threads(int(os.environ.get("QTTS_HOST_THREADS", "2")))
+        # LNC=1 runs twice as many stage processes on the same 12 vCPUs: 1 thread measured best there (195 -> 237x)
+        lnc1 = os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2") == "1"
+        torch.set_num_threads(int(os.environ.get("QTTS_HOST_THREADS", "1" if lnc1 else "2")))
 
 
 def cpu_mode() -> bool:

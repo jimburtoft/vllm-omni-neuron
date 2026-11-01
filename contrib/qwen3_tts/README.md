@@ -86,7 +86,7 @@ Quality: no measurable difference between LNC=1 and LNC=2 (3 x 100 prompts each,
 1.15 % excluding one sampled run-on, paired z = 0.86). Recipe:
 
 ```bash
-export NEURON_LOGICAL_NC_CONFIG=1 QTTS_HOST_THREADS=1 QTTS_PREFILL_CTX_BUCKETS=64,128
+export NEURON_LOGICAL_NC_CONFIG=1   # implies QTTS_HOST_THREADS=1 and QTTS_PREFILL_CTX_BUCKETS=64,128 by default
 QTTS_B=48 QTTS_REP0=2 QTTS_DEV0=0,2 QTTS_REP1=2 QTTS_DEV1=1,3 QTTS_B1=96 python -m qwen3_tts_neuron.serving.make_deploy /tmp/a.yaml
 QTTS_B=48 QTTS_REP0=2 QTTS_DEV0=4,6 QTTS_REP1=2 QTTS_DEV1=5,7 QTTS_B1=96 python -m qwen3_tts_neuron.serving.make_deploy /tmp/b.yaml
 QTTS_NC_COUNT=8 python -m qwen3_tts_neuron.serving.serve_launcher serve <model> --deploy-config /tmp/a.yaml --port 8101 ... &
