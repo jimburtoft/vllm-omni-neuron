@@ -56,17 +56,24 @@ if var == "rows_ws":
     fu.sample_rows = sample_rows_ws
 if var == "rows_unroll_off":
     pass
+if var == "greedy_fp32":
+    st = torch.zeros(B); sk = torch.zeros(B, dtype=torch.long)
 def run(eng, h, e0, gs, st, sk):
     if var == "static":
         return cp_frame_vec(eng.cp, h, e0, False, gs, 0.9, 50)[0]
     return cp_frame_vec(eng.cp, h, e0, False, gs, rows=(st, sk))[0]
 # reference: CPU bf16 with the same function (isolates compile issues from bf16-vs-fp32 drift)
-engc = TTSEngine(sys.argv[1], device="cpu", max_ctx=256, dtype=torch.bfloat16, compile=False)
-ref = run(engc, h.to(torch.bfloat16), e0.to(torch.bfloat16), gs, st, sk)
+REFDT = torch.float32 if var.endswith("fp32") else torch.bfloat16
+engc = TTSEngine(sys.argv[1], device="cpu", max_ctx=256, dtype=REFDT, compile=False)
+ref = run(engc, h.to(REFDT), e0.to(REFDT), gs, st, sk)
+if var.endswith("fp32"):
+    engd = TTSEngine(sys.argv[1], device=dev, max_ctx=256, dtype=torch.float32, compile=False)
 fn = compile_fn()(_M(lambda a, b, c, d, e: run(engd, a, b, c, d, e), engd.cp))
 with torch.inference_mode():
-    out = fn(*(t.to(dev) for t in (h.to(torch.bfloat16), e0.to(torch.bfloat16), gs, st, sk))).cpu()
-print(f"[cp] lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG')} var={var} zeros dev {int((out == 0).sum())}/{out.numel()} ref {int((ref == 0).sum())}/{ref.numel()}; first group equal {bool((out[:, 0] == ref[:, 0]).all())}")
+    DT = torch.float32 if var.endswith("fp32") else torch.bfloat16
+    fn = compile_fn()(_M(lambda a, b, c, d, e: run(engd, a, b, c, d, e), engd.cp))
+    out = fn(*(t.to(dev) for t in (h.to(DT), e0.to(DT), gs, st, sk))).cpu()
+print(f"[cp] lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG')} var={var} agree {int((out == ref).sum())}/{out.numel()} zeros dev {int((out == 0).sum())}/{out.numel()} ref {int((ref == 0).sum())}/{ref.numel()}; first group equal {bool((out[:, 0] == ref[:, 0]).all())}")
 print("[cp] dev row0", out[0].tolist()); print("[cp] ref row0", ref[0].tolist())
 # single-sampler graph on the first group's logits for comparison (outside the CP loop)
 with torch.inference_mode():

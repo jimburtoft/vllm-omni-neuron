@@ -82,8 +82,8 @@ servers can:
 
 Streaming, LNC=1 2 servers: 265x at concurrency 256 (TTFA p50 0.93 s); 101x at concurrency 64 per server (TTFA 133 ms).
 Single stream at LNC=1 (B=1 talker): 0.97 s per ~4 s utterance, TTFA 49 ms (LNC=2: 0.72 s / 41 ms).
-Quality (LNC=1, 2 servers, 100 prompts sampled): 1.07 % WER/CER, 0 runaways (LNC=2: 0.50 %; the gap is digit
-normalisation on de/fr/ko outputs). Recipe:
+Quality: no measurable difference between LNC=1 and LNC=2 (3 x 100 prompts each, sampled; mean WER/CER 1.03 % vs
+1.15 % excluding one sampled run-on, paired z = 0.86). Recipe:
 
 ```bash
 export NEURON_LOGICAL_NC_CONFIG=1 QTTS_HOST_THREADS=1 QTTS_PREFILL_CTX_BUCKETS=64,128
