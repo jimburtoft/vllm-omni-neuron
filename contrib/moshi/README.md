@@ -79,6 +79,21 @@ MOSHI_NC_COUNT=4 python -m moshi_neuron.serving.serve_launcher serve kyutai/mosh
 
 The first start compiles the three stage-0 replicas one after another (about 20 minutes); later starts use the cache.
 
+### Tensor parallel layout (experimental): 20 sessions per instance
+
+Helium sharded over all 4 cores (TP4, in-graph all-reduce), Mimi encoder/decoder row-sharded across the same ranks,
+stage 1 a CPU pass-through:
+
+```bash
+MOSHI_B=20 MOSHI_TP0=4 MOSHI_DEV0=0,1,2,3 MOSHI_DEV1=0 MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 \
+    python -m moshi_neuron.serving.make_deploy /tmp/moshi_tp4.yaml
+MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 MOSHI_NC_COUNT=4 python -m moshi_neuron.serving.serve_launcher serve \
+    kyutai/moshiko-pytorch-bf16 --deploy-config /tmp/moshi_tp4.yaml --port 8000 --omni --init-timeout 3600 --stage-init-timeout 3600
+```
+
+Measured: 20 concurrent sessions, every frame, latency p50 159-212 / p99 <= 334 ms (stage-0 step 63 ms); teacher-forced
+parity on 20 rows identical to TP1. 24 sessions keep every frame but latency rises to ~0.5 s (host overhead per step).
+
 ## Talk to it
 
 ```bash
