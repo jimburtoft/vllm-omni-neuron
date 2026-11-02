@@ -110,6 +110,17 @@ class MoshiLM(nn.Module):
         g = lambda k: f.get_tensor(k).to(dtype)
         P = lambda t: nn.Parameter(t.contiguous(), requires_grad=False)
         H, D, L = cfg.num_heads, cfg.head_dim, cfg.num_layers
+        # Tensor parallelism (MOSHI_TP>1, one process per logical core, torch.distributed initialized by the caller):
+        # Q/K/V heads, out_proj input rows and the MLP hidden dim are sharded; partial sums are all-reduced after
+        # out_proj and after the MLP down projection (2 all-reduces per layer). Embeddings, norms, text head and the
+        # depformer stay replicated (they are small or latency-bound).
+        self.tp = int(os.environ.get("MOSHI_TP", "1"))
+        self.tp_rank = 0
+        if self.tp > 1:
+            import torch.distributed as dist
+            self.tp_rank = dist.get_rank() % self.tp
+            assert H % self.tp == 0
+        self.Hl = H // self.tp
 
         # ---- input embeddings: one flat table [text (32001) | audio_0 (2049) | ... | audio_15 (2049)]
         tabs = [g("text_emb.weight")] + [g(f"emb.{k}.weight") for k in range(cfg.n_q)]
@@ -150,6 +161,7 @@ class MoshiLM(nn.Module):
             # nkilib mlp TKG measured slower than the compiler's matmuls here (B=3: 93 ms with column tiling,
             # 60 ms without, vs 50 ms with torch); default to the torch MLP. MOSHI_TORCH_MLP=0 -> NF.mlp.
             self.torch_mlp = os.environ.get("MOSHI_TORCH_MLP", "1") == "1"
+            self.mlp_xw = os.environ.get("MOSHI_MLP_XW", "0") == "1"   # x @ W form (A/B vs F.linear on W^T)
             # MOSHI_FP8_KV=1: FP8 (e4m3) KV cache. Per-layer quant scales: scale = FP8_MAX / amax(K or V), amax from
             # MOSHI_KV_SCALES (json {"k": [32], "v": [32]} of bf16 amax per layer) or a default amax.
             self.fp8_kv = os.environ.get("MOSHI_FP8_KV", "0") == "1"
@@ -197,13 +209,24 @@ class MoshiLM(nn.Module):
                 continue
             if self.kernels:
                 I = win.shape[0] // 2
+                wo_ = g(p + "self_attn.out_proj.weight")                     # [dim, H*D]
+                wg_, wu_ = win[:I], win[I:]
+                if self.tp > 1:
+                    r, tp, Hl = self.tp_rank, self.tp, self.Hl
+                    hs = slice(r * Hl * D, (r + 1) * Hl * D)
+                    w = torch.cat([w[:H * D][hs], w[H * D:2 * H * D][hs], w[2 * H * D:][hs]])
+                    wo_ = wo_[:, hs]
+                    Il = I // tp
+                    wg_, wu_ = wg_[r * Il:(r + 1) * Il], wu_[r * Il:(r + 1) * Il]
+                    wout = wout[:, r * Il:(r + 1) * Il]
                 self.layers.append(nn.ParameterDict(dict(
                     n1=P(g(p + "norm1.alpha").view(1, -1)), n2=P(g(p + "norm2.alpha").view(1, -1)),
-                    wqkv=P(w.t()), wo=P(g(p + "self_attn.out_proj.weight").t()),
-                    wg=P(win[:I].t()), wu=P(win[I:].t()), wd=P(wout.t()))))
+                    wqkv=P(w.t()), wo=P(wo_.t()),
+                    wg=P(wg_.t()), wu=P(wu_.t()), wd=P(wout.t()))))
                 kvdt = torch.float8_e4m3fn if self.fp8_kv else dtype
-                self.register_buffer(f"k{i}", torch.zeros(B * self.NBLK, H, self.BLK, D, dtype=kvdt), persistent=False)
-                self.register_buffer(f"v{i}", torch.zeros(B * self.NBLK, H, self.BLK, D, dtype=kvdt), persistent=False)
+                Hk = self.Hl
+                self.register_buffer(f"k{i}", torch.zeros(B * self.NBLK, Hk, self.BLK, D, dtype=kvdt), persistent=False)
+                self.register_buffer(f"v{i}", torch.zeros(B * self.NBLK, Hk, self.BLK, D, dtype=kvdt), persistent=False)
                 if self.fp8_kv:
                     # kernel quantizes with x * scale and dequantizes by folding 1/scale into softmax scale and W_out
                     ks, vs = self.kv_scales[i]
@@ -311,8 +334,14 @@ class MoshiLM(nn.Module):
         from vllm_neuron.functional.attention.attention_decode import attention_decode
         from vllm_neuron.functional.mlp import mlp as nf_mlp
 
-        cfg, B, H, D = self.cfg, self.B, self.cfg.num_heads, self.cfg.head_dim
+        cfg, B, H, D = self.cfg, self.B, self.Hl, self.cfg.head_dim   # H = heads on this rank
         BLK, NBLK, SCTX, W = self.BLK, self.NBLK, self.SCTX, cfg.context - 1
+        if self.tp > 1:
+            import torch.distributed as dist
+            from torch.distributed._functional_collectives import all_reduce as _ar
+            allr = lambda t: _ar(t, reduceOp="sum", group=dist.group.WORLD)
+        else:
+            allr = lambda t: t
         dev = tokens.device
         valid = (tokens >= 0).to(self.dtype).unsqueeze(-1)
         x = (F.embedding(tokens.clamp(min=0) + self.emb_off, self.emb) * valid).sum(1)  # [B,dim]
@@ -363,6 +392,7 @@ class MoshiLM(nn.Module):
                       v_scale=getattr(self, f"vs{i}") if self.fp8_kv else None,
                       W_out=l["wo"], bias_out=None, transposed_out=False, out_in_sb=False))
               a = parts[0] if len(parts) == 1 else torch.cat([p.view(-1, cfg.dim) for p in parts], 0)
+              a = allr(a)
             if "nomlp" in abl:
                 x = x + a.view(B, 1, -1)
                 continue
@@ -388,7 +418,11 @@ class MoshiLM(nn.Module):
             elif self.torch_mlp:
                 x = x + a.view(B, 1, -1)
                 h = rms_f32(x, l["n2"].view(-1), cfg.eps)
-                x = x + F.linear(F.silu(F.linear(h, l["wg"].t())) * F.linear(h, l["wu"].t()), l["wd"].t())
+                if self.mlp_xw:
+                    m = (F.silu(h @ l["wg"]) * (h @ l["wu"])) @ l["wd"]
+                else:
+                    m = F.linear(F.silu(F.linear(h, l["wg"].t())) * F.linear(h, l["wu"].t()), l["wd"].t())
+                x = x + allr(m)
             else:
                 m, x = nf_mlp(a.view(B, -1), l["wg"], l["wu"], l["wd"], eps=cfg.eps, ln_w=l["n2"],
                               norm_type=NormType.RMS_NORM, fused_add_tensor=x.view(B, -1), store_fused_add_result=True)

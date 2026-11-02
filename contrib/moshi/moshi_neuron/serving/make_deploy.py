@@ -33,12 +33,20 @@ s1.update(max_model_len=max(int(s1.get("max_model_len", 65536)), 8 * int(os.envi
 s1.update(worker_cls="moshi_neuron.serving.c2w_worker.MoshiCode2WavWorker", async_scheduling=False,
           max_num_seqs=int(os.environ.get("MOSHI_B1", str(B * r0))), devices=os.environ.get("MOSHI_DEV1", "1"),
           enforce_eager=True)
+tp0 = int(os.environ.get("MOSHI_TP0", "1"))
+if os.environ.get("MOSHI_S0_DECODE", "0") == "1":
+    # stage 0 decodes Mimi on its own TP ranks; stage 1 is a CPU pass-through -> no core of its own
+    s1["devices"] = s0["devices"].split(",")[0]
+if tp0 > 1:
+    # stage 0 tensor parallel over the listed cores (one rank per core): vllm-neuron NeuronWorker for the
+    # distributed setup, Moshi runner on top
+    s0.update(worker_cls="moshi_neuron.serving.ar_worker.MoshiStage0TPWorker", tensor_parallel_size=tp0)
 for s in (s0, s1):
     s.pop("gpu_memory_utilization", None)
 if r0 > 1:
     devs = [x for x in s0["devices"].split(",") if x.strip()]
-    if len(devs) != r0:
-        raise SystemExit(f"MOSHI_DEV0 must list {r0} cores for {r0} replicas")
+    if len(devs) != r0 * tp0:
+        raise SystemExit(f"MOSHI_DEV0 must list {r0 * tp0} cores for {r0} replicas x TP{tp0}")
     s0["num_replicas"] = r0
 out = sys.argv[1] if len(sys.argv) > 1 else "/tmp/moshi_neuron.yaml"
 yaml.safe_dump(d, open(out, "w"), sort_keys=False)

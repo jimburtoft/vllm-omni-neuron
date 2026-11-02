@@ -60,6 +60,10 @@ def _pcm_from_payload(payload) -> torch.Tensor:
 
 class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
     def __init__(self, vllm_config, device):
+        # the connector's chunk adapter resolves the stage input processor by import; apply the processor / data
+        # plane backports in this process first (TP workers are separate processes from the stage engine)
+        from .backports import apply as _bp
+        logger.info("[MoshiS0] runner backports: %s (pid %d)", _bp(), os.getpid())
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.device = device
@@ -189,19 +193,27 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
             rows[rid] = b
         if rows:
             raw, out, ready, (te, tl) = self.s0.step(pcm, active)
+            dec_pcm = getattr(self.s0, "last_pcm", None) if self.s0.decode_here else None
             for rid, b in rows.items():
+                if dec_pcm is not None:
+                    # stage 0 decoded the frame: emit (text of the de-delayed frame, its PCM) when ready
+                    emitted[rid] = (int(raw[b, 0]), ("pcm", dec_pcm[b].clone() if bool(ready[b]) else None,
+                                                     int(out[b, 0]) if bool(ready[b]) else -1))
+                    continue
                 emitted[rid] = (int(raw[b, 0]), raw[b, 1:].clone())
                 off = self.offline.get(rid)
                 if off is not None and (off["t"] * FRAME >= off["pcm"].numel() + 2 * FRAME or off["t"] >= off["max"]):
                     emitted[rid] = (EOS_TEXT, raw[b, 1:].clone())
             if os.environ.get("MOSHI_STEP_STATS", "0") == "1":
                 now = time.perf_counter()
-                st = self.__dict__.setdefault("_st", dict(n=0, enc=0.0, lm=0.0, rows=0, t0=now))
+                st = self.__dict__.setdefault("_st", dict(n=0, enc=0.0, lm=0.0, dec=0.0, rows=0, t0=now))
                 st["n"] += 1; st["enc"] += te; st["lm"] += tl; st["rows"] += len(rows)
+                st["dec"] += getattr(self.s0, "t_dec", 0.0)
                 if st["n"] % 200 == 0:
-                    logger.info("[MoshiS0] 200 steps: enc %.1f ms, lm %.1f ms, %.2f rows/step, %.1f ms/step wall",
-                                1e3 * st["enc"] / 200, 1e3 * st["lm"] / 200, st["rows"] / 200, 1e3 * (now - st["t0"]) / 200)
-                    st.update(enc=0.0, lm=0.0, rows=0, t0=now)
+                    logger.info("[MoshiS0] 200 steps: enc %.1f ms, lm %.1f ms, dec %.1f ms, %.2f rows/step, "
+                                "%.1f ms/step wall", 1e3 * st["enc"] / 200, 1e3 * st["lm"] / 200,
+                                1e3 * st["dec"] / 200, st["rows"] / 200, 1e3 * (now - st["t0"]) / 200)
+                    st.update(enc=0.0, lm=0.0, dec=0.0, rows=0, t0=now)
         self._last = (list(scheduler_output.num_scheduled_tokens.keys()), emitted)
         return None
 
@@ -217,10 +229,19 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                 continue
             tok, codes = e
             sampled.append([tok])
+            if isinstance(codes, tuple) and codes and codes[0] == "pcm":
+                _, wav, txt = codes
+                inter.append({"codes.ref": (wav if wav is not None else torch.zeros(0)).float(),
+                              "codes.audio": torch.tensor([[txt]], dtype=torch.long)})
+                continue
             # row layout [8 audio codes, text token]: the backported processor de-delays the 8 audio codes and carries
             # the text token (delay 0) to stage 1, which detokenizes it for the client text stream
             inter.append(None if codes is None else
                          {"codes.audio": torch.cat([codes.view(-1), torch.tensor([tok])]).view(1, -1).to(torch.long)})
+        if os.environ.get("MOSHI_DEBUG_INTER", "0") == "1" and inter:
+            x = next((i for i in inter if i), None)
+            logger.warning("[MoshiS0 dbg] inter keys=%s", {k: (tuple(v.shape) if hasattr(v, "shape") else v)
+                                                          for k, v in (x or {}).items()})
         out = OmniModelRunnerOutput(req_ids=req_ids, req_id_to_index={r: i for i, r in enumerate(req_ids)},
                                     sampled_token_ids=sampled, logprobs=None, prompt_logprobs_dict={},
                                     pooler_output=None, multimodal_outputs=None,
@@ -238,7 +259,11 @@ class _ThinWorker(OmniWorkerMixin, WorkerBase):
         applied = _backports()
         if applied:
             logger.info("[Moshi] applied vllm-omni backports: %s", applied)
-        self.device = torch_device()
+        # stage-1 pass-through (MOSHI_S0_DECODE=1) never touches the device: stay on CPU so it holds no NeuronCore
+        if os.environ.get("MOSHI_S0_DECODE", "0") == "1" and self.model_runner_cls.__name__ == "MoshiCode2WavRunner":
+            self.device = torch.device("cpu")
+        else:
+            self.device = torch_device()
         self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
     def load_model(self, *a, **k):
@@ -299,3 +324,85 @@ class _ThinWorker(OmniWorkerMixin, WorkerBase):
 
 class MoshiStage0Worker(_ThinWorker):
     model_runner_cls = MoshiStage0Runner
+
+
+def _make_tp_worker():
+    """Stage-0 worker for tensor_parallel_size > 1: vllm-neuron's NeuronWorker does device pinning (one core per
+    rank from `devices:`), the gloo world, the CCOM rendezvous and runtime init; we then replace its model runner with
+    MoshiStage0Runner (every rank runs the same frame graph with its shard and the 2 all-reduces per layer; every
+    rank runs the replicated Mimi encoder / depformer / sampling so all ranks hold identical tokens). Only TP rank 0's
+    output is returned to the scheduler (vLLM's executor uses rank 0's output)."""
+    from vllm_neuron.vllm.worker.neuron_worker import NeuronWorker
+
+    class MoshiStage0TPWorker(OmniWorkerMixin, NeuronWorker):
+        model_runner_cls = MoshiStage0Runner
+
+        def init_device(self):
+            from .backports import apply as _backports
+            _backports()
+            tp = int(self.vllm_config.parallel_config.tensor_parallel_size)
+            os.environ["MOSHI_TP"] = str(tp)
+            os.environ["OMP_NUM_THREADS"] = "1"
+            torch.set_num_threads(int(os.environ.get("MOSHI_HOST_THREADS", "2")))
+            from vllm_neuron.vllm.patches.replica_mesh_patch import apply_replica_mesh_patches
+            apply_replica_mesh_patches()
+            # NeuronWorker's distributed init only (core pinning, gloo world, CCOM rendezvous, runtime init); its
+            # NeuronModelRunner needs a HF text config, so we build our own runner instead.
+            self._init_neuron_distributed_environment_and_runtime(
+                self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
+            import libtorch_neuronx_lite  # noqa: F401
+            # vllm-neuron convention: with NEURON_VISIBLE_DEVICES set, the device index is the local rank
+            self.device = torch.device(f"neuron:{self.local_rank}")
+            self.model_runner = MoshiStage0Runner(self.vllm_config, self.device)
+
+        def load_model(self, *a, **k):
+            self.model_runner.load_model()
+
+        def get_kv_cache_spec(self):
+            return {}
+
+        def determine_available_memory(self) -> int:
+            return 0
+
+        def initialize_from_config(self, kv_cache_configs) -> None:
+            return None
+
+        def initialize_cache(self, num_gpu_blocks, num_cpu_blocks) -> None:
+            return None
+
+        def compile_or_warm_up_model(self):
+            return CompilationTimes(language_model=self.model_runner.warmup(), encoder=0.0)
+
+        def execute_model(self, scheduler_output, *a, **k):
+            return self.model_runner.execute_model(scheduler_output)
+
+        def sample_tokens(self, grammar_output=None, *a, **k):
+            return self.model_runner.sample_tokens(grammar_output)
+
+        def take_draft_token_ids(self):
+            return None
+
+        def get_supported_tasks(self):
+            return ("generate",)
+
+        def profile(self, *a, **k):
+            return None
+
+        def check_health(self):
+            return None
+
+    return MoshiStage0TPWorker
+
+
+# The stage engine process imports this module to resolve worker_cls (connector validation) and runs the stage
+# input processors; with a multiproc executor (TP>1) the workers are separate processes, so apply the backports here.
+try:
+    from .backports import apply as _apply_backports
+    _apply_backports()
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    MoshiStage0TPWorker = _make_tp_worker()
+except Exception:  # vllm_neuron not importable (CPU tests)
+    MoshiStage0TPWorker = None

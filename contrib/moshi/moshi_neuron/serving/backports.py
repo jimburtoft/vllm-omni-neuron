@@ -123,8 +123,39 @@ def _patch_data_plane_text():
     return True
 
 
+def _patch_pipeline_processor():
+    """Point the PersonaPlex pipeline's stage-0 async-chunk processor at `moshi_neuron.serving.processors` so the
+    stage-0 engine-core process imports our module (and its backports) itself -- needed when stage-0 workers are
+    separate TP processes. Must run in the process that builds the stage configs (API server / launcher)."""
+    import dataclasses
+    from vllm_omni.model_executor.models.personaplex import pipeline as pl
+    p = pl.PERSONAPLEX_PIPELINE
+    s0 = p.stages[0]
+    target = "moshi_neuron.serving.processors.moshi_async_chunk"
+    if s0.async_chunk_process_next_stage_input_func == target:
+        return False
+    new0 = dataclasses.replace(s0, async_chunk_process_next_stage_input_func=target)
+    pl.PERSONAPLEX_PIPELINE = dataclasses.replace(p, stages=(new0,) + tuple(p.stages[1:]))
+    try:  # the registry may already hold the old object
+        from vllm_omni.config import pipeline_registry as reg
+        for name in dir(reg):
+            obj = getattr(reg, name)
+            if isinstance(obj, dict):
+                for k, v in list(obj.items()):
+                    if v is p:
+                        obj[k] = pl.PERSONAPLEX_PIPELINE
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
 def apply():
     applied = []
+    try:
+        if _patch_pipeline_processor():
+            applied.append("personaplex.pipeline:moshi-processor")
+    except Exception as e:  # noqa: BLE001
+        applied.append(f"pipeline processor backport failed: {e!r}")
     try:
         if _patch_data_plane_text():
             applied.append("personaplex.data_plane:text-from-meta")

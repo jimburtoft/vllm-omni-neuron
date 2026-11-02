@@ -122,7 +122,8 @@ def _test_lm_rows(g, T, B, fn, device, stagger=7):
                 rels[b].append(rel(tl[b], g["text_logits"][t]))
     res = {f"row{b}": dict(text_top1=float(np.mean(tops[b])), dep_top1=float(np.mean(deps[b])),
                            text_rel_max=float(np.max(rels[b]))) for b in range(B)}
-    print("lm rows", res, flush=True)
+    if int(os.environ.get("RANK", "0")) == 0 and B <= 8:
+        print("lm rows", res, flush=True)
     return res
 
 

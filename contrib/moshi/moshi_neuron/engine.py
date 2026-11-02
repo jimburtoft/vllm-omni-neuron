@@ -13,6 +13,7 @@ Per 80 ms tick, for every active row b:
 """
 from __future__ import annotations
 
+import os
 import time
 
 import torch
@@ -36,7 +37,19 @@ class MoshiStage0:
         lm_path, mimi_path, tok_path = checkpoint_paths(model_dir=model_dir)
         cf = compile_fn or (lambda m: m)
         self.B, self.device, self.cfg = B, device, LMConfig()
-        self.mimi = MimiStreaming(mimi_path, B, device, dtype=mimi_dtype, compile_fn=cf, decoder=False)
+        # TP>1: the Mimi encoder and (MOSHI_S0_DECODE=1) decoder are row-sharded across the TP ranks: rank r codes
+        # rows [r*B/tp, (r+1)*B/tp); user codes are all-gathered (gloo, host) before the LM frame, PCM is gathered to
+        # rank 0. Removes the need for a separate decoder core.
+        self.tp = int(os.environ.get("MOSHI_TP", "1"))
+        self.rank = 0
+        if self.tp > 1:
+            import torch.distributed as dist
+            self.rank = dist.get_rank() % self.tp
+            assert B % self.tp == 0, f"B={B} must be divisible by TP={self.tp}"
+        self.Bl = B // self.tp
+        self.r0, self.r1 = self.rank * self.Bl, (self.rank + 1) * self.Bl
+        self.decode_here = os.environ.get("MOSHI_S0_DECODE", "0") == "1"
+        self.mimi = MimiStreaming(mimi_path, self.Bl, device, dtype=mimi_dtype, compile_fn=cf, decoder=self.decode_here)
         self.lm = MoshiLM(lm_path, B, dtype=lm_dtype).to(device).eval()
         tt, ta = (0.0, 0.0) if greedy else (temp_text, temp)
         self.sampling = not greedy
@@ -89,7 +102,13 @@ class MoshiStage0:
         t0 = time.perf_counter()
         mreset = (self.nseen <= 1) & active
         reset = (self.nseen == 0) & active
-        codes = self.mimi.encode(pcm_in, reset=mreset, active=active).cpu()
+        r0, r1 = self.r0, self.r1
+        codes = self.mimi.encode(pcm_in[r0:r1], reset=mreset[r0:r1], active=active[r0:r1]).cpu()
+        if self.tp > 1:
+            import torch.distributed as dist
+            parts = [torch.empty_like(codes) for _ in range(self.tp)]
+            dist.all_gather(parts, codes)
+            codes = torch.cat(parts, 0)
         t1 = time.perf_counter()
         tokens = self.host.inputs(codes, active)
         gt, ga = self._noise()
@@ -99,7 +118,27 @@ class MoshiStage0:
         t2 = time.perf_counter()
         out, ready = self.host.commit(raw, active)
         self.nseen = self.nseen + active.long()
+        if self.decode_here:
+            t3 = time.perf_counter()
+            self.last_pcm = self._decode_rows(out, ready)
+            self.t_dec = time.perf_counter() - t3
         return raw, out, ready, (t1 - t0, t2 - t1)
+
+    @torch.inference_mode()
+    def _decode_rows(self, out, ready):
+        """Mimi-decode this rank's rows of the de-delayed frame; gather [B,1920] PCM on every rank (gloo)."""
+        r0, r1 = self.r0, self.r1
+        dreset = ready & (self.host.offsets == self.host.max_delay + 1)
+        if bool(ready[r0:r1].any()):
+            pcm = self.mimi.decode(out[r0:r1, 1:].clamp(min=0), reset=dreset[r0:r1], active=ready[r0:r1]).cpu()
+        else:
+            pcm = torch.zeros(self.Bl, FRAME)
+        if self.tp > 1:
+            import torch.distributed as dist
+            parts = [torch.empty_like(pcm) for _ in range(self.tp)]
+            dist.all_gather(parts, pcm)
+            pcm = torch.cat(parts, 0)
+        return pcm
 
 
 class MoshiDecoderRows:

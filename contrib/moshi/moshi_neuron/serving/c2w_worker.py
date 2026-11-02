@@ -44,12 +44,18 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
         self.text: dict[str, str] = {}
         self.text_rows = os.environ.get("MOSHI_TEXT_CHANNEL", "1") == "1"
         self._tok = None
+        # MOSHI_S0_DECODE=1: stage 0 decodes Mimi on its TP ranks and sends PCM (codes.ref) + the text token
+        self.passthrough = os.environ.get("MOSHI_S0_DECODE", "0") == "1"
         if needs_omni_connector(self.model_config):
             self.init_omni_connectors(model_config=self.model_config)
 
     def load_model(self):
         from ..engine import MoshiDecoderRows
         t0 = time.time()
+        if self.passthrough:
+            self.dec = None
+            logger.info("[MoshiC2W] PCM pass-through mode (stage 0 decodes); no device used")
+            return
         self.dec = MoshiDecoderRows(B=self.B, device=self.device, compile_fn=compile_fn(),
                                     model_dir=model_dir(self.model_config.model))
         logger.info("[MoshiC2W] loaded in %.1fs (B=%d)", time.time() - t0, self.B)
@@ -67,6 +73,8 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
     @torch.inference_mode()
     def warmup(self):
         t0 = time.time()
+        if self.passthrough:
+            return 0.0
         a = torch.ones(self.B, dtype=torch.bool)
         for i in range(3):
             self.dec.decode(torch.zeros(self.B, K, dtype=torch.long), a, a if i == 0 else ~a)
@@ -117,6 +125,30 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
                     st["info"] = deserialize_additional_information(ainfo[rid]) or st["info"]
                 except Exception:
                     st["info"] = ainfo[rid] if isinstance(ainfo[rid], dict) else st["info"]
+        if self.passthrough:
+            req_ids, wavs, texts = [], [], []
+            for rid, n in scheduler_output.num_scheduled_tokens.items():
+                st = self.requests.get(rid)
+                if st is None:
+                    continue
+                req_ids.append(rid)
+                info = st.get("info") or {}
+                c = info.get("codes") if isinstance(info, dict) else None
+                ref = c.get("ref") if isinstance(c, dict) else None
+                wav = ref.reshape(-1).float() if isinstance(ref, torch.Tensor) and ref.numel() else torch.zeros(0)
+                # the 1-D codes.audio [text token] arrives as this chunk's prompt token (the chunk adapter moves 1-D
+                # codes into prompt_token_ids)
+                toks = st.get("tokens") or []
+                if toks and wav.numel():
+                    self._add_text(rid, torch.tensor(toks[-1:], dtype=torch.long))
+                # each chunk carries exactly one new frame; a step without a fresh chunk must not replay the last one
+                if st.get("_last_ref") is ref:
+                    wav = torch.zeros(0)
+                st["_last_ref"] = ref
+                wavs.append(wav)
+                texts.append(self.text.get(rid, ""))
+            self._last = (req_ids, wavs, texts)
+            return None
         # gather new frames per request
         req_ids, frames = [], {}
         for rid, n in scheduler_output.num_scheduled_tokens.items():
