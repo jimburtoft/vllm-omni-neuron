@@ -1,5 +1,7 @@
 # Qwen3-TTS (12Hz) on AWS Neuron — contrib
 
+Step-by-step guide with results: [NeuronStuff/qwen3-tts-vllm-omni-neuron](https://github.com/jimburtoft/NeuronStuff/tree/main/qwen3-tts-vllm-omni-neuron).
+
 Status: **experimental contrib**. Runs the Qwen3-TTS 12Hz 1.7B checkpoints (`-VoiceDesign`, `-CustomVoice`, `-Base`)
 on Trainium2 and serves them through
 **vLLM-Omni** (`vllm-omni serve --omni`, OpenAI `/v1/audio/speech`, streaming) on the public SDK 2.33 DLAMI.
