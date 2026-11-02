@@ -80,6 +80,14 @@ def sample(logits, gumbel, temp: float, top_k: int):
     ties within (max-min)/2^N."""
     if temp <= 0:
         return torch.argmax(logits, dim=-1)
+    if gumbel.shape[-1] == 1 and logits.shape[-1] > 1 and 0 < top_k < logits.shape[-1]:
+        # multinomial over the top-k (exactly moshi's sample_top_k) by inverse CDF with ONE uniform u per row:
+        # needs 1 random number per sampler instead of a full-vocab Gumbel field
+        vals, idx = torch.topk(logits / temp, top_k, dim=-1)
+        p = torch.softmax(vals.float(), dim=-1)
+        c = torch.cumsum(p, dim=-1)
+        j = (c < gumbel).sum(-1, keepdim=True).clamp(max=top_k - 1)
+        return idx.gather(-1, j).squeeze(-1)
     l = logits / temp
     if 0 < top_k < l.shape[-1]:
         if _TOPK_BISECT > 0:

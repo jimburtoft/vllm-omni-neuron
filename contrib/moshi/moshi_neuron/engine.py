@@ -49,7 +49,17 @@ class MoshiStage0:
         self.Bl = B // self.tp
         self.r0, self.r1 = self.rank * self.Bl, (self.rank + 1) * self.Bl
         self.decode_here = os.environ.get("MOSHI_S0_DECODE", "0") == "1"
-        self.mimi = MimiStreaming(mimi_path, self.Bl, device, dtype=mimi_dtype, compile_fn=cf, decoder=self.decode_here)
+        # MOSHI_ENC_ALL=1: every TP rank encodes all B rows (identical results, no host all-gather of codes, which
+        # costs 10-17 ms per step through gloo while the encoder graph itself is ~2 ms)
+        self.enc_all = self.tp > 1 and os.environ.get("MOSHI_ENC_ALL", "1") == "1"
+        if self.enc_all:
+            self.mimi = MimiStreaming(mimi_path, B, device, dtype=mimi_dtype, compile_fn=cf, decoder=False)
+            self.mimi_dec = (MimiStreaming(mimi_path, self.Bl, device, dtype=mimi_dtype, compile_fn=cf, encoder=False)
+                             if self.decode_here else None)
+        else:
+            self.mimi = MimiStreaming(mimi_path, self.Bl, device, dtype=mimi_dtype, compile_fn=cf,
+                                      decoder=self.decode_here)
+            self.mimi_dec = self.mimi
         self.lm = MoshiLM(lm_path, B, dtype=lm_dtype).to(device).eval()
         tt, ta = (0.0, 0.0) if greedy else (temp_text, temp)
         self.sampling = not greedy
@@ -57,6 +67,11 @@ class MoshiStage0:
                                    top_k=top_k).to(device))
         self.host = LMGenHost(B, self.cfg)
         self.gens = [torch.Generator().manual_seed(seed + b) for b in range(B)]
+        # MOSHI_SAMPLER=multinomial (default): inverse-CDF multinomial over top-k, 1 uniform per sampler;
+        # MOSHI_SAMPLER=gumbel: full-vocab Gumbel-max (B x 48k host random numbers per frame)
+        self.uniform_sampler = os.environ.get("MOSHI_SAMPLER", "multinomial") == "multinomial"
+        self._prof = os.environ.get("MOSHI_PARTS", "0") == "1"
+        self._pt, self._pn, self._plast = {}, 0, 0.0
         self.nseen = torch.zeros(B, dtype=torch.long)
         z = lambda *s, **k: torch.zeros(*s, device=device, **k)
         self._zt, self._za = z(B, self.cfg.text_card), z(B, self.cfg.dep_q, self.cfg.card)
@@ -77,6 +92,11 @@ class MoshiStage0:
             self._next = None
 
     def _draw(self):
+        if self.uniform_sampler:
+            # one uniform per sampler and row (inverse-CDF top-k sampling on device)
+            gt = torch.stack([torch.rand(1, generator=g) for g in self.gens])
+            ga = torch.stack([torch.rand(self.cfg.dep_q, 1, generator=g) for g in self.gens])
+            return gt, ga
         gt = torch.stack([gumbel(g, (self.cfg.text_card,), "cpu") for g in self.gens])
         ga = torch.stack([gumbel(g, (self.cfg.dep_q, self.cfg.card), "cpu") for g in self.gens])
         return gt, ga
@@ -94,34 +114,60 @@ class MoshiStage0:
         if self.sampling and getattr(self, "_next", None) is None:
             self._next = self._draw()
 
+    def _tick(self, name):
+        if self._prof:
+            now = time.perf_counter()
+            self._pt[name] = self._pt.get(name, 0.0) + now - self._plast
+            self._plast = now
+
     @torch.inference_mode()
     def step(self, pcm_in, active=None):
         """pcm_in [B,1920] fp32 host. -> (raw [B,9], out [B,9], ready [B], (t_enc, t_lm))."""
+        if self._prof:
+            self._plast = time.perf_counter()
+            self._pn += 1
+            if self._pn % 200 == 0 and self.rank == 0:
+                import logging
+                logging.getLogger("moshi").warning("[MoshiS0 parts/200] %s", {k: round(v / 200 * 1e3, 2) for k, v in self._pt.items()})
+                self._pt = {}
         B, dev = self.B, self.device
         active = torch.ones(B, dtype=torch.bool) if active is None else active.bool()
         t0 = time.perf_counter()
         mreset = (self.nseen <= 1) & active
         reset = (self.nseen == 0) & active
         r0, r1 = self.r0, self.r1
-        codes = self.mimi.encode(pcm_in[r0:r1], reset=mreset[r0:r1], active=active[r0:r1]).cpu()
-        if self.tp > 1:
+        if self.enc_all:
+            codes = self.mimi.encode(pcm_in, reset=mreset, active=active)
+            self._tick("enc_call")
+            codes = codes.cpu()
+            self._tick("enc_d2h")
+        else:
+            codes = self.mimi.encode(pcm_in[r0:r1], reset=mreset[r0:r1], active=active[r0:r1]).cpu()
+        if self.tp > 1 and not self.enc_all:
             import torch.distributed as dist
             parts = [torch.empty_like(codes) for _ in range(self.tp)]
             dist.all_gather(parts, codes)
             codes = torch.cat(parts, 0)
         t1 = time.perf_counter()
         tokens = self.host.inputs(codes, active)
+        self._tick("host_inputs")
         gt, ga = self._noise()
+        self._tick("noise_h2d")
         raw = self.frame(tokens.to(dev), reset.to(dev), active.to(dev), gt, ga, self._ft, self._fa, self._uf)
+        self._tick("lm_call")
         self._prefetch()  # overlaps the device frame
+        self._tick("prefetch")
         raw = raw.cpu()
+        self._tick("lm_d2h")
         t2 = time.perf_counter()
         out, ready = self.host.commit(raw, active)
         self.nseen = self.nseen + active.long()
+        self._tick("host_commit")
         if self.decode_here:
             t3 = time.perf_counter()
             self.last_pcm = self._decode_rows(out, ready)
             self.t_dec = time.perf_counter() - t3
+            self._tick("decode+gather")
         return raw, out, ready, (t1 - t0, t2 - t1)
 
     @torch.inference_mode()
@@ -130,14 +176,19 @@ class MoshiStage0:
         r0, r1 = self.r0, self.r1
         dreset = ready & (self.host.offsets == self.host.max_delay + 1)
         if bool(ready[r0:r1].any()):
-            pcm = self.mimi.decode(out[r0:r1, 1:].clamp(min=0), reset=dreset[r0:r1], active=ready[r0:r1]).cpu()
+            pcm = self.mimi_dec.decode(out[r0:r1, 1:].clamp(min=0), reset=dreset[r0:r1], active=ready[r0:r1]).cpu()
         else:
             pcm = torch.zeros(self.Bl, FRAME)
         if self.tp > 1:
+            # only rank 0's output reaches the scheduler: gather PCM to rank 0 (gloo gather, not all_gather)
             import torch.distributed as dist
-            parts = [torch.empty_like(pcm) for _ in range(self.tp)]
-            dist.all_gather(parts, pcm)
-            pcm = torch.cat(parts, 0)
+            if self.rank == 0:
+                parts = [torch.empty_like(pcm) for _ in range(self.tp)]
+                dist.gather(pcm, parts, dst=0)
+                pcm = torch.cat(parts, 0)
+            else:
+                dist.gather(pcm, None, dst=0)
+                pcm = torch.zeros(self.B, FRAME)
         return pcm
 
 

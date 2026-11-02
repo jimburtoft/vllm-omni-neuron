@@ -136,6 +136,12 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
     # ------------------------------------------------------------------ engine-core API
     @torch.inference_mode()
     def execute_model(self, scheduler_output, intermediate_tensors=None):
+        _tx0 = time.perf_counter()
+        if os.environ.get("MOSHI_STEP_STATS", "0") == "1":
+            st_ = self.__dict__.setdefault("_gap", dict(last=None, gap=0.0, n=0, pre=0.0, post=0.0))
+            if st_["last"] is not None:
+                st_["gap"] += _tx0 - st_["last"]
+            st_["n"] += 1
         if hasattr(self, "_omni_connector"):
             for request in getattr(scheduler_output, "pending_input_registrations", []):
                 self.register_chunk_recv(request)
@@ -191,6 +197,9 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                 off["t"] += 1
             active[b] = True
             rows[rid] = b
+        _tx1 = time.perf_counter()
+        if os.environ.get("MOSHI_STEP_STATS", "0") == "1":
+            self._gap["pre"] += _tx1 - _tx0
         if rows:
             raw, out, ready, (te, tl) = self.s0.step(pcm, active)
             dec_pcm = getattr(self.s0, "last_pcm", None) if self.s0.decode_here else None
@@ -215,6 +224,13 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                                 1e3 * st["dec"] / 200, st["rows"] / 200, 1e3 * (now - st["t0"]) / 200)
                     st.update(enc=0.0, lm=0.0, dec=0.0, rows=0, t0=now)
         self._last = (list(scheduler_output.num_scheduled_tokens.keys()), emitted)
+        if os.environ.get("MOSHI_STEP_STATS", "0") == "1":
+            g = self._gap
+            g["last"] = time.perf_counter()
+            if g["n"] % 200 == 0 and g["n"]:
+                logger.info("[MoshiS0 overhead/200] outside execute_model %.1f ms, execute pre-step %.1f ms",
+                            1e3 * g["gap"] / 200, 1e3 * g["pre"] / 200)
+                g.update(gap=0.0, pre=0.0)
         return None
 
     @torch.inference_mode()
@@ -351,6 +367,16 @@ def _make_tp_worker():
             self._init_neuron_distributed_environment_and_runtime(
                 self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
             import libtorch_neuronx_lite  # noqa: F401
+            # host CPUs are shared by all TP ranks (8 at LNC=1 on 12 vCPUs): pin each rank to its own CPU slice so the
+            # Mimi/sampling host work of the ranks does not contend
+            ncpu = os.cpu_count() or 1
+            per = max(1, ncpu // max(1, tp))
+            cpus = set(range((self.local_rank * per) % ncpu, (self.local_rank * per) % ncpu + per))
+            try:
+                os.sched_setaffinity(0, cpus)
+            except Exception:  # noqa: BLE001
+                pass
+            torch.set_num_threads(len(cpus))
             # vllm-neuron convention: with NEURON_VISIBLE_DEVICES set, the device index is the local rank
             self.device = torch.device(f"neuron:{self.local_rank}")
             self.model_runner = MoshiStage0Runner(self.vllm_config, self.device)
