@@ -28,7 +28,8 @@ Served (`/v1/realtime?duplex=1`), audio streamed at real-time pace, 28.8 s conve
 | 1 server, B=4 | 4 | yes | 220-230 ms | 112-129 / 151-167 ms |
 | 1 server, B=5 | 5 | yes | 242 ms | 135-147 / 176-186 ms |
 | 2 servers (cores 0+1, 2+3), B=5 each | 10 | yes | 190-260 ms | 130-143 / <= 180 ms |
-| **1 server, 3 stage-0 replicas (cores 0,2,3) B=5 + 1 decoder (core 1)** | **15** | yes | <= 280 ms | 124-140 / <= 187 ms |
+| **1 server, 3 stage-0 replicas (cores 0,2,3) B=5 + 1 decoder (core 1) -- latency layout** | **15** | yes | <= 280 ms | 124-140 / <= 187 ms |
+| **TP4 over all cores, codec on the TP ranks -- throughput layout** | **24** | yes | <= 654 ms | 216-242 / 579 ms |
 
 Per-frame latency is the time from sending an 80 ms input frame to receiving the 80 ms of Moshi audio it
 produces; it does not grow over the session (also measured over 5-minute sessions). B=6 per server does not fit one core's HBM (7B weights + 6 x 1.6 GB KV).
@@ -79,20 +80,22 @@ MOSHI_NC_COUNT=4 python -m moshi_neuron.serving.serve_launcher serve kyutai/mosh
 
 The first start compiles the three stage-0 replicas one after another (about 20 minutes); later starts use the cache.
 
-### Tensor parallel layout (experimental): 20 sessions per instance
+### Throughput layout: 24 sessions per instance (tensor parallel over all 4 cores)
 
-Helium sharded over all 4 cores (TP4, in-graph all-reduce), Mimi encoder/decoder row-sharded across the same ranks,
-stage 1 a CPU pass-through:
+Helium sharded over the 4 NeuronCores (TP4, in-graph all-reduce); every rank runs the Mimi encoder for all sessions
+and the Mimi decoder for its quarter of the sessions; stage 1 is a CPU pass-through:
 
 ```bash
-MOSHI_B=20 MOSHI_TP0=4 MOSHI_DEV0=0,1,2,3 MOSHI_DEV1=0 MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 \
+MOSHI_B=24 MOSHI_TP0=4 MOSHI_DEV0=0,1,2,3 MOSHI_DEV1=0 MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 \
     python -m moshi_neuron.serving.make_deploy /tmp/moshi_tp4.yaml
 MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 MOSHI_NC_COUNT=4 python -m moshi_neuron.serving.serve_launcher serve \
     kyutai/moshiko-pytorch-bf16 --deploy-config /tmp/moshi_tp4.yaml --port 8000 --omni --init-timeout 3600 --stage-init-timeout 3600
 ```
 
-Measured: 20 concurrent sessions, every frame, latency p50 159-212 / p99 <= 334 ms (stage-0 step 63 ms); teacher-forced
-parity on 20 rows identical to TP1. 24 sessions keep every frame but latency rises to ~0.5 s (host overhead per step).
+Measured: 24 concurrent sessions, every frame, latency p50 216-242 / p99 579 ms (stage-0 step 75 ms); 20 sessions:
+p50 149-196 / p99 327 ms. Teacher-forced parity on 20 rows identical to one core. `MOSHI_B` must be a multiple of 4.
+(LNC=1 / TP8 was measured too: faster on device, but host overhead of 8 workers on 12 vCPUs makes it serve fewer
+sessions -- not recommended.)
 
 ## Talk to it
 
