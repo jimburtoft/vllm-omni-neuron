@@ -28,8 +28,10 @@ Served (`/v1/realtime?duplex=1`), audio streamed at real-time pace, 28.8 s conve
 | 1 server, B=4 | 4 | yes | 220-230 ms | 112-129 / 151-167 ms |
 | 1 server, B=5 | 5 | yes | 242 ms | 135-147 / 176-186 ms |
 | 2 servers (cores 0+1, 2+3), B=5 each | 10 | yes | 190-260 ms | 130-143 / <= 180 ms |
-| **1 server, 3 stage-0 replicas (cores 0,2,3) B=5 + 1 decoder (core 1) -- latency layout** | **15** | yes | <= 280 ms | 124-140 / <= 187 ms |
-| **TP4 over all cores, codec on the TP ranks -- throughput layout** | **24** | yes | <= 654 ms | 216-242 / 579 ms |
+| **1 server, 3 stage-0 replicas (cores 0,2,3) B=5 + 1 decoder (core 1) -- latency layout** | **15** | yes | <= 215 ms | 117-132 / <= 178 ms |
+| same, 1 session | 1 | yes | 428 ms | **61 / 86 ms** |
+| **TP4 over all cores, codec on the TP ranks -- throughput layout** | **24** | yes | <= 364 ms | 245-329 / 485 ms |
+| same, 1 / 8 / 16 sessions | 1 / 8 / 16 | yes | | **41** / 80-112 / 124-149 ms p50 |
 
 Per-frame latency is the time from sending an 80 ms input frame to receiving the 80 ms of Moshi audio it
 produces; it does not grow over the session (also measured over 5-minute sessions). B=6 per server does not fit one core's HBM (7B weights + 6 x 1.6 GB KV).
@@ -74,7 +76,7 @@ The Mimi decoder is light, so one decoder core can serve three language-model co
 
 ```bash
 MOSHI_B=5 MOSHI_REP0=3 MOSHI_DEV0=0,2,3 MOSHI_DEV1=1 python -m moshi_neuron.serving.make_deploy /tmp/moshi15.yaml
-MOSHI_NC_COUNT=4 python -m moshi_neuron.serving.serve_launcher serve kyutai/moshiko-pytorch-bf16 \
+MOSHI_MLP_XW=1 MOSHI_BUCKETS=1,2,3,4,5 MOSHI_DEC_BUCKETS=1,2,4,8,15 MOSHI_NC_COUNT=4 python -m moshi_neuron.serving.serve_launcher serve kyutai/moshiko-pytorch-bf16 \
     --deploy-config /tmp/moshi15.yaml --port 8000 --omni --init-timeout 3600 --stage-init-timeout 3600
 ```
 
@@ -88,7 +90,7 @@ and the Mimi decoder for its quarter of the sessions; stage 1 is a CPU pass-thro
 ```bash
 MOSHI_B=24 MOSHI_TP0=4 MOSHI_DEV0=0,1,2,3 MOSHI_DEV1=0 MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 \
     python -m moshi_neuron.serving.make_deploy /tmp/moshi_tp4.yaml
-MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 MOSHI_NC_COUNT=4 python -m moshi_neuron.serving.serve_launcher serve \
+MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 MOSHI_BUCKETS=1,2,4,8,12,16,24 MOSHI_NC_COUNT=4 python -m moshi_neuron.serving.serve_launcher serve \
     kyutai/moshiko-pytorch-bf16 --deploy-config /tmp/moshi_tp4.yaml --port 8000 --omni --init-timeout 3600 --stage-init-timeout 3600
 ```
 
@@ -96,6 +98,10 @@ Measured: 24 concurrent sessions, every frame, latency p50 216-242 / p99 579 ms 
 p50 149-196 / p99 327 ms. Teacher-forced parity on 20 rows identical to one core. `MOSHI_B` must be a multiple of 4.
 (LNC=1 / TP8 was measured too: faster on device, but host overhead of 8 workers on 12 vCPUs makes it serve fewer
 sessions -- not recommended.)
+
+**Batch buckets** (`MOSHI_BUCKETS`, `MOSHI_DEC_BUCKETS`): every graph is compiled for each listed batch size and a
+step runs the smallest one that covers the active sessions, so the step time (and latency) scales with load instead
+of always paying for the maximum batch. Each bucket adds a compile on first start (cached afterwards).
 
 ## Talk to it
 

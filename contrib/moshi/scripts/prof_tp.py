@@ -29,6 +29,7 @@ def main():
     ap.add_argument("--n", type=int, default=30)
     ap.add_argument("--parity", type=int, default=0)
     ap.add_argument("--rows", type=int, default=0, help="staggered B-row teacher-forced parity (frames)")
+    ap.add_argument("--maxB", type=int, default=0, help="state sized for maxB rows; run the B-row (bucket) graph")
     a = ap.parse_args()
     dist.init_process_group("gloo", rank=rank, world_size=world)
     if world > 1:
@@ -46,7 +47,7 @@ def main():
     if a.rows:
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tests"))
         from test_cpu_equivalence import _test_lm_rows
-        lm = MoshiLM(lm_path, B).to(dev).eval()
+        lm = MoshiLM(lm_path, a.maxB or B).to(dev).eval()
         fn = cf(MoshiFrame(lm, ctx=lm.C, temp_text=0.0, temp=0.0, debug=True).to(dev))
         g = torch.load(os.path.expanduser("~/goldens/duplex_utt2_float32_greedy.pt"))
         with torch.inference_mode():
