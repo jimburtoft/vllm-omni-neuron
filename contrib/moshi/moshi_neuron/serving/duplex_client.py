@@ -67,11 +67,13 @@ async def one_session(i, args, pcm, model):
     # (Moshi answers frame t at step t+1); latency = arrival - send time of the input frame that produced it
     got = np.cumsum([n for _, n in arrivals]) // 1920 if arrivals else np.zeros(0, int)
     lag = [t - sent[min(int(g), len(sent) - 1)] for (t, _), g in zip(arrivals, got) if g >= 1]
+    late = [s - k * 0.08 for k, s in enumerate(sent)]  # client pacing check: how late each send was
     return dict(session=i, text="".join(text), out_s=len(wav) / 24000, in_s=dur_in, chunks=len(arrivals),
                 first_audio_s=arrivals[0][0] if arrivals else None,
                 lag_p50_ms=float(np.median(lag) * 1e3) if lag else None,
                 lag_p99_ms=float(np.quantile(lag, 0.99) * 1e3) if lag else None,
-                lag_max_ms=float(np.max(lag) * 1e3) if lag else None), wav
+                lag_max_ms=float(np.max(lag) * 1e3) if lag else None,
+                send_late_p99_ms=float(np.quantile(late, 0.99) * 1e3) if late else None), wav
 
 
 async def main_async(args):

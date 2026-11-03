@@ -46,6 +46,8 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
         self._tok = None
         # MOSHI_S0_DECODE=1: stage 0 decodes Mimi on its TP ranks and sends PCM (codes.ref) + the text token
         self.passthrough = os.environ.get("MOSHI_S0_DECODE", "0") == "1"
+        bl = os.environ.get("MOSHI_DEC_BUCKETS", "")
+        self.buckets = sorted({int(x) for x in bl.split(",") if x.strip() and int(x) <= self.B} | {self.B})
         if needs_omni_connector(self.model_config):
             self.init_omni_connectors(model_config=self.model_config)
 
@@ -70,14 +72,21 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
                   if int(t) not in (0, 3) and 0 <= int(t) < 32000]
         self.text[rid] = self.text.get(rid, "") + "".join(pieces)
 
+    def _bucket(self, need):
+        for b in self.buckets:
+            if b >= need:
+                return b
+        return self.B
+
     @torch.inference_mode()
     def warmup(self):
         t0 = time.time()
         if self.passthrough:
             return 0.0
-        a = torch.ones(self.B, dtype=torch.bool)
-        for i in range(3):
-            self.dec.decode(torch.zeros(self.B, K, dtype=torch.long), a, a if i == 0 else ~a)
+        for nb in self.buckets:
+            a = torch.ones(nb, dtype=torch.bool)
+            for i in range(2):
+                self.dec.decode(torch.zeros(nb, K, dtype=torch.long), a, a if i == 0 else ~a)
         return time.time() - t0
 
     def _codes(self, st, nc, n):
@@ -103,6 +112,7 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
             b = self.row_of.pop(rid, None)
             if b is not None:
                 self.free.append(b)
+                self.free.sort()
         ncomp = {}
         for nr in scheduler_output.scheduled_new_reqs:
             info = getattr(nr, "additional_information", None)
@@ -190,7 +200,9 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
                     codes[b], active[b] = f[j], True
                     reset[b] = self.seen.get(rid, 0) == 0
                     self.seen[rid] = self.seen.get(rid, 0) + 1
-            pcm = self.dec.decode(codes, active, reset)
+            nb = self._bucket(int(torch.nonzero(active).max()) + 1 if bool(active.any()) else 1)
+            pcm = torch.zeros(self.B, 1920)
+            pcm[:nb] = self.dec.decode(codes[:nb], active[:nb], reset[:nb])
             for rid, f in frames.items():
                 if j < f.shape[0]:
                     out_wav[rid].append(pcm[self.row_of[rid]])

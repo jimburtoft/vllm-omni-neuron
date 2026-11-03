@@ -342,8 +342,11 @@ class MoshiLM(nn.Module):
         from vllm_neuron.functional.attention.attention_decode import attention_decode
         from vllm_neuron.functional.mlp import mlp as nf_mlp
 
-        cfg, B, H, D = self.cfg, self.B, self.Hl, self.cfg.head_dim   # H = heads on this rank
+        # B = rows in THIS call (batch bucket <= self.B): rows 0..B-1 of the shared KV pool / offsets
+        cfg, B, H, D = self.cfg, tokens.shape[0], self.Hl, self.cfg.head_dim   # H = heads on this rank
         BLK, NBLK, SCTX, W = self.BLK, self.NBLK, self.SCTX, cfg.context - 1
+        off_all = self.offset
+        off_b = off_all[:B] if B < self.B else off_all
         if self.tp > 1:
             import torch.distributed as dist
             from torch.distributed._functional_collectives import all_reduce as _ar
@@ -353,7 +356,7 @@ class MoshiLM(nn.Module):
         dev = tokens.device
         valid = (tokens >= 0).to(self.dtype).unsqueeze(-1)
         x = (F.embedding(tokens.clamp(min=0) + self.emb_off, self.emb) * valid).sum(1)  # [B,dim]
-        t = torch.where(reset, torch.zeros_like(self.offset), self.offset)               # frames before this one
+        t = torch.where(reset, torch.zeros_like(off_b), off_b)                          # frames before this one
         s0 = torch.clamp(t - W, min=0)                                                  # oldest attended frame
         start_blk = (s0 % SCTX) // BLK
         ofs = s0 % BLK
@@ -435,7 +438,10 @@ class MoshiLM(nn.Module):
                 m, x = nf_mlp(a.view(B, -1), l["wg"], l["wu"], l["wd"], eps=cfg.eps, ln_w=l["n2"],
                               norm_type=NormType.RMS_NORM, fused_add_tensor=x.view(B, -1), store_fused_add_result=True)
                 x = (x + m).view(B, 1, -1)
-        self.offset.copy_(torch.where(active, t + 1, self.offset))
+        new_off = torch.where(active, t + 1, off_b)
+        if B < self.B:
+            new_off = torch.cat([new_off, off_all[B:]])
+        self.offset.copy_(new_off)
         tout = rms_f32(x, self.out_norm, cfg.eps)
         return tout, F.linear(tout, self.text_linear).float()[:, 0]
 
@@ -447,7 +453,7 @@ class MoshiLM(nn.Module):
         return F.embedding(idx, table)
 
     def depformer(self, tout, text, gumbel_audio, temp: float, top_k: int, force_audio=None, use_force=None):
-        cfg, B = self.cfg, self.B
+        cfg, B = self.cfg, tout.shape[0]
         Hd, Dd = cfg.dep_heads, cfg.dep_dim // cfg.dep_heads
         tout = tout[:, 0]                                      # [B,4096]
         ks, vs = [[] for _ in self.dep_layers], [[] for _ in self.dep_layers]

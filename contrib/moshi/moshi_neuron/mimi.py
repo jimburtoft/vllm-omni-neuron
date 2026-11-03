@@ -27,6 +27,17 @@ from .config import FRAME, MimiConfig
 NEG = -1e30
 
 
+def _rows(buf, B):
+    """first B rows of a per-row state buffer (batch-bucket graphs use rows 0..B-1 of the max-B state)"""
+    return buf if buf.shape[0] == B else buf[:B]
+
+
+def _store(buf, new):
+    """write rows 0..B-1 of a per-row state buffer, keep the rest"""
+    B = new.shape[0]
+    buf.copy_(new if buf.shape[0] == B else torch.cat([new, buf[B:]], 0))
+
+
 def elu(x):
     return torch.where(x > 0, x, torch.exp(torch.clamp(x, max=0.0)) - 1.0)
 
@@ -99,10 +110,11 @@ class _StreamingTransformer(nn.Module):
 
     def forward(self, x, reset, active):
         """x [B,C,T] (conv layout) -> [B,C,T]."""
-        B, H, C, D = self.B, self.H, self.C, self.D
+        B, H, C, D = x.shape[0], self.H, self.C, self.D
         x = x.transpose(1, 2)  # [B,T,512]
         T = x.shape[1]
-        off = torch.where(reset, torch.zeros_like(self.offset), self.offset)
+        off0 = _rows(self.offset, B)
+        off = torch.where(reset, torch.zeros_like(off0), off0)
         t = torch.arange(T, device=x.device)
         pos_q = off.view(B, 1) + t.view(1, T)  # [B,T]
         cos, sin = rope_tables(pos_q, D, self.max_period)
@@ -127,13 +139,14 @@ class _StreamingTransformer(nn.Module):
             kb, vb = getattr(self, f"k{i}"), getattr(self, f"v{i}")
             kb.index_copy_(0, widx, k.reshape(-1, D))
             vb.index_copy_(0, widx, v.reshape(-1, D))
-            K, V = kb.view(B, H, C, D), vb.view(B, H, C, D)
+            # rows are row-major in the flat KV (row b = [b*H*C, (b+1)*H*C)), so rows 0..B-1 are a prefix
+            K, V = kb[:B * H * C].view(B, H, C, D), vb[:B * H * C].view(B, H, C, D)
             sc = (q @ K.transpose(-1, -2)).float() * (D ** -0.5) + mask
             o = (torch.softmax(sc, -1).to(V.dtype) @ V).transpose(1, 2).reshape(B, T, H * D)
             x = x + l["ls1"] * F.linear(o, l["wo"])
             h = F.layer_norm(x, (x.shape[-1],), l["n2w"], l["n2b"], 1e-5)
             x = x + l["ls2"] * F.linear(gelu_erf(F.linear(h, l["w1"])), l["w2"])
-        self.offset.copy_(torch.where(active, off + T, self.offset))
+        _store(self.offset, torch.where(active, off + T, off0))
         return x.transpose(1, 2)
 
 
@@ -156,14 +169,17 @@ class _Conv(nn.Module):
         if not self.tp:
             return F.conv1d(x, self.w, self.b, stride=self.stride, dilation=self.dilation)
         r3, a3 = reset.view(-1, 1, 1), active.view(-1, 1, 1)
-        prev = torch.where(r3, torch.zeros_like(self.prev), self.prev)
+        B = x.shape[0]
+        prev0 = _rows(self.prev, B)
+        prev = torch.where(r3, torch.zeros_like(prev0), prev0)
         if self.replicate:
-            first = torch.where(reset, torch.ones_like(self.first), self.first)
+            first0 = _rows(self.first, B)
+            first = torch.where(reset, torch.ones_like(first0), first0)
             prev = torch.where(first.view(-1, 1, 1) & a3, x[..., :1].expand_as(prev), prev)
-            self.first.copy_(torch.where(active, torch.zeros_like(first), first))
+            _store(self.first, torch.where(active, torch.zeros_like(first), first))
         xc = torch.cat([prev, x], dim=-1)
         y = F.conv1d(xc, self.w, self.b, stride=self.stride, dilation=self.dilation)
-        self.prev.copy_(torch.where(a3, xc[..., -self.tp:], prev))
+        _store(self.prev, torch.where(a3, xc[..., -self.tp:], prev))
         return y
 
 
@@ -189,13 +205,14 @@ class _ConvTr(nn.Module):
                 y = y + self.b.view(1, -1, 1)
         else:
             y = F.conv_transpose1d(x, self.w, self.b, stride=self.stride, groups=self.groups)
-        partial = torch.where(r3, torch.zeros_like(self.partial), self.partial)
+        part0 = _rows(self.partial, x.shape[0])
+        partial = torch.where(r3, torch.zeros_like(part0), part0)
         pt = self.pt
         y = torch.cat([y[..., :pt] + partial, y[..., pt:]], dim=-1)
         tail = y[..., -pt:]
         if self.b is not None:
             tail = tail - self.b.view(1, -1, 1)
-        self.partial.copy_(torch.where(a3, tail, partial))
+        _store(self.partial, torch.where(a3, tail, partial))
         return y[..., :-pt]
 
 
@@ -328,8 +345,8 @@ class MimiStreaming:
         self._dec = compile_fn(self.dec) if decoder else None
         self.frame = FRAME
 
-    def _flags(self, reset, active):
-        B, d = self.B, self.device
+    def _flags(self, reset, active, B=None):
+        B, d = B or self.B, self.device
         r = torch.zeros(B, dtype=torch.bool) if reset is None else torch.as_tensor(reset, dtype=torch.bool)
         a = torch.ones(B, dtype=torch.bool) if active is None else torch.as_tensor(active, dtype=torch.bool)
         return r.to(d), a.to(d)
@@ -337,11 +354,11 @@ class MimiStreaming:
     @torch.no_grad()
     def encode(self, pcm, reset=None, active=None):
         """pcm [B,1920] fp32 (host or device) -> codes [B,8] (device)."""
-        r, a = self._flags(reset, active)
-        return self._enc(pcm.to(self.device).view(self.B, 1, -1), r, a)
+        r, a = self._flags(reset, active, pcm.shape[0])
+        return self._enc(pcm.to(self.device).view(pcm.shape[0], 1, -1), r, a)
 
     @torch.no_grad()
     def decode(self, codes, reset=None, active=None):
         """codes [B,8] long -> pcm [B,1920] (device)."""
-        r, a = self._flags(reset, active)
-        return self._dec(codes.to(self.device).long(), r, a).view(self.B, -1)
+        r, a = self._flags(reset, active, codes.shape[0])
+        return self._dec(codes.to(self.device).long(), r, a).view(codes.shape[0], -1)

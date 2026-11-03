@@ -93,9 +93,13 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
     def warmup(self):
         t0 = time.time()
         z = torch.zeros(self.B, FRAME)
-        for _ in range(3):
-            self.s0.step(z, torch.ones(self.B, dtype=torch.bool))
-        self.s0.reset(range(self.B))
+        for bb in self.s0.buckets:  # compile / load every batch-bucket graph
+            act = torch.zeros(self.B, dtype=torch.bool)
+            act[:bb] = True
+            for _ in range(2):
+                self.s0.step(z, act)
+            self.s0.reset(range(self.B))
+            logger.info("[MoshiS0] warmed bucket %d (%.1fs)", bb, time.time() - t0)
         logger.info("[MoshiS0] warmup %.1fs", time.time() - t0)
         return time.time() - t0
 
@@ -132,6 +136,7 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
             self.row_of_session.pop(key, None)
         if b is not None and b not in self.free:
             self.free.append(b)
+            self.free.sort()  # always hand out the lowest free row -> smallest batch bucket
 
     # ------------------------------------------------------------------ engine-core API
     @torch.inference_mode()
@@ -220,8 +225,9 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                 st["dec"] += getattr(self.s0, "t_dec", 0.0)
                 if st["n"] % 200 == 0:
                     logger.info("[MoshiS0] 200 steps: enc %.1f ms, lm %.1f ms, dec %.1f ms, %.2f rows/step, "
-                                "%.1f ms/step wall", 1e3 * st["enc"] / 200, 1e3 * st["lm"] / 200,
-                                1e3 * st["dec"] / 200, st["rows"] / 200, 1e3 * (now - st["t0"]) / 200)
+                                "%.1f ms/step wall, bucket %s", 1e3 * st["enc"] / 200, 1e3 * st["lm"] / 200,
+                                1e3 * st["dec"] / 200, st["rows"] / 200, 1e3 * (now - st["t0"]) / 200,
+                                getattr(self.s0, "last_bucket", "-"))
                     st.update(enc=0.0, lm=0.0, dec=0.0, rows=0, t0=now)
         self._last = (list(scheduler_output.num_scheduled_tokens.keys()), emitted)
         if os.environ.get("MOSHI_STEP_STATS", "0") == "1":

@@ -48,6 +48,14 @@ class MoshiStage0:
             assert B % self.tp == 0, f"B={B} must be divisible by TP={self.tp}"
         self.Bl = B // self.tp
         self.r0, self.r1 = self.rank * self.Bl, (self.rank + 1) * self.Bl
+        # Batch buckets (MOSHI_BUCKETS="4,8,16,24"): each step runs graphs compiled for the smallest bucket that
+        # covers the highest active row, so step time scales with load. Rows 0..Bb-1 of the shared state are used;
+        # the serving row allocator hands out the lowest free row. Buckets are multiples of TP (decoder rows are
+        # interleaved across ranks: rank r owns global rows r, r+tp, r+2tp, ...).
+        bl = os.environ.get("MOSHI_BUCKETS", "")
+        bk = sorted({int(x) for x in bl.split(",") if x.strip()} | {B}) if bl else [B]
+        # buckets < tp are allowed: rank 0 then decodes all rows (no gather)
+        self.buckets = [b for b in bk if b <= B and (b % self.tp == 0 or b < self.tp)] or [B]
         self.decode_here = os.environ.get("MOSHI_S0_DECODE", "0") == "1"
         # MOSHI_ENC_ALL=1: every TP rank encodes all B rows (identical results, no host all-gather of codes, which
         # costs 10-17 ms per step through gloo while the encoder graph itself is ~2 ms)
@@ -56,10 +64,12 @@ class MoshiStage0:
             self.mimi = MimiStreaming(mimi_path, B, device, dtype=mimi_dtype, compile_fn=cf, decoder=False)
             self.mimi_dec = (MimiStreaming(mimi_path, self.Bl, device, dtype=mimi_dtype, compile_fn=cf, encoder=False)
                              if self.decode_here else None)
+            self.interleave = True
         else:
             self.mimi = MimiStreaming(mimi_path, self.Bl, device, dtype=mimi_dtype, compile_fn=cf,
                                       decoder=self.decode_here)
             self.mimi_dec = self.mimi
+            self.interleave = False
         self.lm = MoshiLM(lm_path, B, dtype=lm_dtype).to(device).eval()
         tt, ta = (0.0, 0.0) if greedy else (temp_text, temp)
         self.sampling = not greedy
@@ -120,9 +130,19 @@ class MoshiStage0:
             self._pt[name] = self._pt.get(name, 0.0) + now - self._plast
             self._plast = now
 
+    def bucket_for(self, active):
+        """smallest bucket covering the highest active row"""
+        idx = torch.nonzero(active).view(-1)
+        need = int(idx.max()) + 1 if idx.numel() else 1
+        for b in self.buckets:
+            if b >= need:
+                return b
+        return self.B
+
     @torch.inference_mode()
     def step(self, pcm_in, active=None):
-        """pcm_in [B,1920] fp32 host. -> (raw [B,9], out [B,9], ready [B], (t_enc, t_lm))."""
+        """pcm_in [B,1920] fp32 host. -> (raw [B,9], out [B,9], ready [B], (t_enc, t_lm)). Rows >= the chosen bucket
+        must be inactive; their outputs are zeros and their state is untouched."""
         if self._prof:
             self._plast = time.perf_counter()
             self._pn += 1
@@ -132,32 +152,38 @@ class MoshiStage0:
                 self._pt = {}
         B, dev = self.B, self.device
         active = torch.ones(B, dtype=torch.bool) if active is None else active.bool()
+        Bb = self.bucket_for(active)
+        self.last_bucket = Bb
         t0 = time.perf_counter()
         mreset = (self.nseen <= 1) & active
         reset = (self.nseen == 0) & active
-        r0, r1 = self.r0, self.r1
         if self.enc_all:
-            codes = self.mimi.encode(pcm_in, reset=mreset, active=active)
+            codes = self.mimi.encode(pcm_in[:Bb], reset=mreset[:Bb], active=active[:Bb])
             self._tick("enc_call")
             codes = codes.cpu()
             self._tick("enc_d2h")
         else:
+            r0, r1 = self.r0, self.r1
             codes = self.mimi.encode(pcm_in[r0:r1], reset=mreset[r0:r1], active=active[r0:r1]).cpu()
-        if self.tp > 1 and not self.enc_all:
-            import torch.distributed as dist
-            parts = [torch.empty_like(codes) for _ in range(self.tp)]
-            dist.all_gather(parts, codes)
-            codes = torch.cat(parts, 0)
+            if self.tp > 1:
+                import torch.distributed as dist
+                parts = [torch.empty_like(codes) for _ in range(self.tp)]
+                dist.all_gather(parts, codes)
+                codes = torch.cat(parts, 0)
+        if codes.shape[0] < B:
+            codes = torch.cat([codes, torch.zeros(B - codes.shape[0], codes.shape[1], dtype=codes.dtype)])
         t1 = time.perf_counter()
         tokens = self.host.inputs(codes, active)
         self._tick("host_inputs")
         gt, ga = self._noise()
         self._tick("noise_h2d")
-        raw = self.frame(tokens.to(dev), reset.to(dev), active.to(dev), gt, ga, self._ft, self._fa, self._uf)
+        raw_b = self.frame(tokens[:Bb].to(dev), reset[:Bb].to(dev), active[:Bb].to(dev), gt[:Bb], ga[:Bb],
+                           self._ft[:Bb], self._fa[:Bb], self._uf[:Bb])
         self._tick("lm_call")
         self._prefetch()  # overlaps the device frame
         self._tick("prefetch")
-        raw = raw.cpu()
+        raw_b = raw_b.cpu()
+        raw = raw_b if Bb == B else torch.cat([raw_b, torch.zeros(B - Bb, raw_b.shape[1], dtype=raw_b.dtype)])
         self._tick("lm_d2h")
         t2 = time.perf_counter()
         out, ready = self.host.commit(raw, active)
@@ -165,30 +191,51 @@ class MoshiStage0:
         self._tick("host_commit")
         if self.decode_here:
             t3 = time.perf_counter()
-            self.last_pcm = self._decode_rows(out, ready)
+            self.last_pcm = self._decode_rows(out, ready, Bb)
             self.t_dec = time.perf_counter() - t3
             self._tick("decode+gather")
         return raw, out, ready, (t1 - t0, t2 - t1)
 
     @torch.inference_mode()
-    def _decode_rows(self, out, ready):
-        """Mimi-decode this rank's rows of the de-delayed frame; gather [B,1920] PCM on every rank (gloo)."""
-        r0, r1 = self.r0, self.r1
+    def _decode_rows(self, out, ready, Bb=None):
+        """Mimi-decode this rank's rows of the de-delayed frame; gather [B,1920] PCM to rank 0 (gloo).
+        Rows are interleaved across ranks (rank r: rows r, r+tp, ...) so every rank has Bb/tp rows in any bucket."""
+        Bb = Bb or self.B
+        tp, r = self.tp, self.rank
         dreset = ready & (self.host.offsets == self.host.max_delay + 1)
-        if bool(ready[r0:r1].any()):
-            pcm = self.mimi_dec.decode(out[r0:r1, 1:].clamp(min=0), reset=dreset[r0:r1], active=ready[r0:r1]).cpu()
+        small = tp > 1 and Bb < tp
+        if small:
+            sel = torch.arange(Bb) if r == 0 else torch.arange(0)
+        elif self.interleave:
+            sel = torch.arange(r, Bb, tp)
         else:
-            pcm = torch.zeros(self.Bl, FRAME)
-        if self.tp > 1:
-            # only rank 0's output reaches the scheduler: gather PCM to rank 0 (gloo gather, not all_gather)
+            sel = torch.arange(self.r0, self.r1)
+        if small:
+            full = torch.zeros(self.B, FRAME)
+            if r == 0 and bool(ready[sel].any()):
+                full[sel] = self.mimi_dec.decode(out[sel, 1:].clamp(min=0), reset=dreset[sel], active=ready[sel]).cpu()
+            return full
+        if bool(ready[sel].any()):
+            pcm = self.mimi_dec.decode(out[sel, 1:].clamp(min=0), reset=dreset[sel], active=ready[sel]).cpu()
+        else:
+            pcm = torch.zeros(sel.numel(), FRAME)
+        if tp > 1:
             import torch.distributed as dist
-            if self.rank == 0:
-                parts = [torch.empty_like(pcm) for _ in range(self.tp)]
+            if r == 0:
+                parts = [torch.empty_like(pcm) for _ in range(tp)]
                 dist.gather(pcm, parts, dst=0)
-                pcm = torch.cat(parts, 0)
+                full = torch.zeros(self.B, FRAME)
+                for q in range(tp):
+                    rows = torch.arange(q, Bb, tp) if self.interleave else torch.arange(q * self.Bl, (q + 1) * self.Bl)
+                    full[rows] = parts[q]
+                pcm = full
             else:
                 dist.gather(pcm, None, dst=0)
                 pcm = torch.zeros(self.B, FRAME)
+        elif Bb < self.B:
+            full = torch.zeros(self.B, FRAME)
+            full[sel] = pcm
+            pcm = full
         return pcm
 
 
