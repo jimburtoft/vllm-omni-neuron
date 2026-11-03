@@ -99,7 +99,10 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         # batched prefill of several new requests in one call (single-chunk prompts in the ctx-limited bucket)
         # multi-row prefill (opt-in, e.g. "2"): 2 rows 13.0 ms vs 2 x 9.0 single at B=48, but 4+ rows fall off a cliff
         # (115 ms) and online it measured no better (143-149x vs 147x single-row), so off by default
-        self.prefill_rows = sorted({int(r) for r in os.environ.get("QTTS_PREFILL_ROWS", "").split(",")
+        # default: 2-row prefill at LNC=1 with >= 64 talker slots (B=80: 306 -> 327x online; at B=48 / LNC=2 it
+        # measured no gain, and 4+ rows are much slower: 2,4 -> 190x)
+        _pr_default = "2" if (os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2") == "1" and self.B >= 64) else ""
+        self.prefill_rows = sorted({int(r) for r in os.environ.get("QTTS_PREFILL_ROWS", _pr_default).split(",")
                                     if r.strip() and 1 < int(r) <= self.B})
         self.prefill_rows_fn = c(_M(lambda x, r, p: bt.prefill_rows(x, r, p, ctx=self.pctx), bt)) if self.prefill_rows else None
         self.frame_fns = {cb: c(FusedFrameRows(self.eng, self.fe.bt, vec_cp=vec, ctx=cb).to(self.device))
