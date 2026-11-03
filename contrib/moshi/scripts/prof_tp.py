@@ -29,6 +29,7 @@ def main():
     ap.add_argument("--n", type=int, default=30)
     ap.add_argument("--parity", type=int, default=0)
     ap.add_argument("--rows", type=int, default=0, help="staggered B-row teacher-forced parity (frames)")
+    ap.add_argument("--ctx", type=int, default=0, help="context bucket (attended slots) for the frame graph")
     ap.add_argument("--maxB", type=int, default=0, help="state sized for maxB rows; run the B-row (bucket) graph")
     a = ap.parse_args()
     dist.init_process_group("gloo", rank=rank, world_size=world)
@@ -48,7 +49,7 @@ def main():
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tests"))
         from test_cpu_equivalence import _test_lm_rows
         lm = MoshiLM(lm_path, a.maxB or B).to(dev).eval()
-        fn = cf(MoshiFrame(lm, ctx=lm.C, temp_text=0.0, temp=0.0, debug=True).to(dev))
+        fn = cf(MoshiFrame(lm, ctx=a.ctx or lm.SCTX, temp_text=0.0, temp=0.0, debug=True).to(dev))
         g = torch.load(os.path.expanduser("~/goldens/duplex_utt2_float32_greedy.pt"))
         with torch.inference_mode():
             res = _test_lm_rows(g, a.rows, B, fn, dev, stagger=7)
@@ -59,7 +60,7 @@ def main():
                   f"mean {np.mean(dd):.4f}", flush=True)
         return
     lm = MoshiLM(lm_path, B).to(dev).eval()
-    frame = MoshiFrame(lm, ctx=lm.C, temp_text=0.0, temp=0.0, debug=bool(a.parity)).to(dev)
+    frame = MoshiFrame(lm, ctx=a.ctx or getattr(lm, "SCTX", lm.C), temp_text=0.0, temp=0.0, debug=bool(a.parity)).to(dev)
     fn = cf(frame)
     z = lambda *s, **k: torch.zeros(*s, device=dev, **k)
     with torch.inference_mode():

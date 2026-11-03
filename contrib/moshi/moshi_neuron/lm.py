@@ -129,6 +129,7 @@ class MoshiLM(nn.Module):
             self.tp_rank = dist.get_rank() % self.tp
             assert H % self.tp == 0
         self.Hl = H // self.tp
+        self.dep_shard = os.environ.get("MOSHI_DEP_SHARD", "1") == "1"
 
         # ---- input embeddings: one flat table [text (32001) | audio_0 (2049) | ... | audio_15 (2049)]
         tabs = [g("text_emb.weight")] + [g(f"emb.{k}.weight") for k in range(cfg.n_q)]
@@ -274,7 +275,7 @@ class MoshiLM(nn.Module):
     # ---------------------------------------------------------------- temporal transformer
     def temporal(self, tokens, reset, active, ctx: int):
         if self.kernels:
-            return self.temporal_kernels(tokens, reset, active)
+            return self.temporal_kernels(tokens, reset, active, ctx)
         cfg, B, H, D, C = self.cfg, self.B, self.cfg.num_heads, self.cfg.head_dim, self.C
         valid = (tokens >= 0).to(self.dtype).unsqueeze(-1)
         x = (F.embedding(tokens.clamp(min=0) + self.emb_off, self.emb) * valid).sum(1, keepdim=True)  # [B,1,dim]
@@ -329,7 +330,7 @@ class MoshiLM(nn.Module):
         tout = rms_f32(x, self.out_norm, cfg.eps)              # [B,1,dim]
         return tout, F.linear(tout, self.text_linear).float()[:, 0]  # [B,32000]
 
-    def temporal_kernels(self, tokens, reset, active):
+    def temporal_kernels(self, tokens, reset, active, ctx=None):
         """Helium step on nkilib fused decode kernels.
 
         Ring KV in blocks: frame f lives in slot f mod SCTX (block (f mod SCTX) // BLK, offset f % BLK) of the row's
@@ -361,11 +362,15 @@ class MoshiLM(nn.Module):
         start_blk = (s0 % SCTX) // BLK
         ofs = s0 % BLK
         end = ofs + (t - s0)
-        j = torch.arange(NBLK, device=dev).view(1, NBLK)
+        # Context bucket (ctx < SCTX slots): the window [ofs, end] of every row fits in the first nb table entries
+        # (caller guarantees max(end) + 1 < ctx, i.e. ctx >= fill + BLK + 1); the kernel then reads only nb blocks
+        # instead of NBLK. The current token goes to the bucket's last slot, which is never inside the window.
+        nb = NBLK if (ctx is None or ctx >= SCTX) else ctx // BLK
+        j = torch.arange(nb, device=dev).view(1, nb)
         rows = torch.arange(B, device=dev).view(B, 1)
-        blocks = rows * NBLK + (start_blk.view(B, 1) + j) % NBLK                        # [B,NBLK] pool block ids
+        blocks = rows * NBLK + (start_blk.view(B, 1) + j) % NBLK                        # [B,nb] pool block ids
         hh = torch.arange(H, device=dev).view(1, H, 1)
-        table = (blocks.view(B, 1, NBLK) * H + hh).to(torch.int32)                      # [B,H,NBLK] head-inner
+        table = (blocks.view(B, 1, nb) * H + hh).to(torch.int32)                        # [B,H,nb] head-inner
         wslot = t % SCTX
         wblk = rows.view(B) * NBLK + wslot // BLK
         widx = ((wblk.view(B, 1) * H + hh.view(1, H)) * BLK + (wslot % BLK).view(B, 1))  # [B,H]
@@ -500,7 +505,22 @@ class MoshiFrame(nn.Module):
         tout, tl = self.lm.temporal(tokens, reset, active, self.ctx)
         text = sample(tl, gumbel_text, self.tt, self.kt)
         text = torch.where(use_force, force_text, text)
-        audio, al = self.lm.depformer(tout, text, gumbel_audio, self.ta, self.ka, force_audio, use_force)
+        lm = self.lm
+        B = tout.shape[0]
+        if lm.tp > 1 and lm.dep_shard and B % lm.tp == 0 and B >= lm.tp and not self.debug:
+            # row-shard the latency-bound depformer chain across TP ranks (rows r*B/tp .. (r+1)*B/tp), then
+            # all-gather the sampled codes inside the graph. The text token is computed identically on every rank.
+            import torch.distributed as dist
+            from torch.distributed._functional_collectives import all_gather_tensor
+            bl = B // lm.tp
+            r0 = lm.tp_rank * bl
+            sl = slice(r0, r0 + bl)
+            a_l, _ = lm.depformer(tout[sl], text[sl], gumbel_audio[sl], self.ta, self.ka,
+                                  force_audio[sl], use_force[sl])
+            audio = all_gather_tensor(a_l.contiguous(), gather_dim=0, group=dist.group.WORLD)
+            al = None
+        else:
+            audio, al = lm.depformer(tout, text, gumbel_audio, self.ta, self.ka, force_audio, use_force)
         out = torch.cat([text.view(-1, 1), audio], 1)
         if self.debug:
             return out, tl, al, tout[:, 0].float()

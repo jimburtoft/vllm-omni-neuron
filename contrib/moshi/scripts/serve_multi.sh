@@ -20,6 +20,6 @@ r = [json.loads(l) for l in sys.stdin]
 print('$TAG n=$N sessions', len(r), 'min frames', min(x['chunks'] for x in r), 'first audio max', round(max(x['first_audio_s'] for x in r), 3),
       'p50', round(min(x['lag_p50_ms'] for x in r)), '-', round(max(x['lag_p50_ms'] for x in r)), 'p99 max', round(max(x['lag_p99_ms'] for x in r)), flush=True)"
   grep -hE "MoshiS0\] 200 steps" ~/serve_$TAG.log | tail -1 | cut -c95-300
-  sleep 3
+  sleep 20
 done
 echo DONE_$TAG

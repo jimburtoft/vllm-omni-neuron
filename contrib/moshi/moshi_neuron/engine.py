@@ -73,8 +73,19 @@ class MoshiStage0:
         self.lm = MoshiLM(lm_path, B, dtype=lm_dtype).to(device).eval()
         tt, ta = (0.0, 0.0) if greedy else (temp_text, temp)
         self.sampling = not greedy
-        self.frame = cf(MoshiFrame(self.lm, ctx=self.lm.C, temp_text=tt, top_k_text=top_k_text, temp=ta,
-                                   top_k=top_k).to(device))
+        # Context buckets (MOSHI_CTX_BUCKETS="512,1536,3072", kernel path only): one frame graph per attended-slot
+        # count; a step uses the smallest that covers every active row's window (fill + BLK + 1 slots).
+        self._frames = {}
+        cb = os.environ.get("MOSHI_CTX_BUCKETS", "")
+        sctx = getattr(self.lm, "SCTX", self.lm.C)
+        self.ctx_buckets = (sorted({int(x) for x in cb.split(",") if x.strip()} | {sctx})
+                            if (cb and getattr(self.lm, "kernels", False)) else [sctx])
+        blk = getattr(self.lm, "BLK", 1)
+        for c in self.ctx_buckets:
+            assert c % 128 == 0 and c % blk == 0, f"ctx bucket {c} must be a multiple of 128 and of the KV block"
+            self._frames[c] = cf(MoshiFrame(self.lm, ctx=c, temp_text=tt, top_k_text=top_k_text, temp=ta,
+                                            top_k=top_k).to(device))
+        self.frame = self._frames[sctx]
         self.host = LMGenHost(B, self.cfg)
         self.gens = [torch.Generator().manual_seed(seed + b) for b in range(B)]
         # MOSHI_SAMPLER=multinomial (default): inverse-CDF multinomial over top-k, 1 uniform per sampler;
@@ -83,6 +94,7 @@ class MoshiStage0:
         self._prof = os.environ.get("MOSHI_PARTS", "0") == "1"
         self._pt, self._pn, self._plast = {}, 0, 0.0
         self.nseen = torch.zeros(B, dtype=torch.long)
+        self.lm_frames = torch.zeros(B, dtype=torch.long)   # host mirror of lm.offset (frames in each row's KV)
         z = lambda *s, **k: torch.zeros(*s, device=device, **k)
         self._zt, self._za = z(B, self.cfg.text_card), z(B, self.cfg.dep_q, self.cfg.card)
         self._ft, self._fa = z(B, dtype=torch.long), z(B, self.cfg.dep_q, dtype=torch.long)
@@ -95,6 +107,7 @@ class MoshiStage0:
         m = torch.zeros(self.B, dtype=torch.bool)
         m[rows] = True
         self.nseen = torch.where(m, torch.zeros_like(self.nseen), self.nseen)
+        self.lm_frames = torch.where(m, torch.zeros_like(self.lm_frames), self.lm_frames)
         self.host.reset(rows)
         if seed is not None:
             for b in rows:
@@ -129,6 +142,26 @@ class MoshiStage0:
             now = time.perf_counter()
             self._pt[name] = self._pt.get(name, 0.0) + now - self._plast
             self._plast = now
+
+    def ctx_for(self, reset, active, Bb):
+        """smallest context bucket whose table covers every active row's window: ofs + (t - s0) + 1 < ctx"""
+        if len(self.ctx_buckets) == 1:
+            return self.ctx_buckets[0]
+        lm = self.lm
+        W, blk = lm.cfg.context - 1, lm.BLK
+        t = torch.where(reset, torch.zeros_like(self.lm_frames), self.lm_frames)[:Bb]
+        a = active[:Bb]
+        if not bool(a.any()):
+            return self.ctx_buckets[0]
+        tt = t[a]
+        s0 = torch.clamp(tt - W, min=0)
+        need = int(((s0 % blk) + (tt - s0)).max()) + 2   # window end index + current-token slot
+        for c in self.ctx_buckets:
+            if c >= need:
+                self.last_ctx = c
+                return c
+        self.last_ctx = self.ctx_buckets[-1]
+        return self.ctx_buckets[-1]
 
     def bucket_for(self, active):
         """smallest bucket covering the highest active row"""
@@ -177,8 +210,9 @@ class MoshiStage0:
         self._tick("host_inputs")
         gt, ga = self._noise()
         self._tick("noise_h2d")
-        raw_b = self.frame(tokens[:Bb].to(dev), reset[:Bb].to(dev), active[:Bb].to(dev), gt[:Bb], ga[:Bb],
-                           self._ft[:Bb], self._fa[:Bb], self._uf[:Bb])
+        frame = self._frames[self.ctx_for(reset, active, Bb)]
+        raw_b = frame(tokens[:Bb].to(dev), reset[:Bb].to(dev), active[:Bb].to(dev), gt[:Bb], ga[:Bb],
+                      self._ft[:Bb], self._fa[:Bb], self._uf[:Bb])
         self._tick("lm_call")
         self._prefetch()  # overlaps the device frame
         self._tick("prefetch")
@@ -188,6 +222,8 @@ class MoshiStage0:
         t2 = time.perf_counter()
         out, ready = self.host.commit(raw, active)
         self.nseen = self.nseen + active.long()
+        self.lm_frames = torch.where(active, torch.where(reset, torch.ones_like(self.lm_frames), self.lm_frames + 1),
+                                     self.lm_frames)
         self._tick("host_commit")
         if self.decode_here:
             t3 = time.perf_counter()
