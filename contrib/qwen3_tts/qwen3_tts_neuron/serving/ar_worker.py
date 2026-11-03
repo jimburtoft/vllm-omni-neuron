@@ -108,7 +108,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         # QTTS_ASYNC_OUT=1: sample_tokens returns an AsyncModelRunnerOutput (needs async_scheduling in the stage
         # config); the device->host copy of a frame's codes happens when vLLM collects it, after it has already
         # scheduled the next step.
-        self.async_out = os.environ.get("QTTS_ASYNC_OUT", "0") == "1"
+        self.async_out = os.environ.get("QTTS_ASYNC_OUT", "1") == "1" and not cpu_mode()
         self.prefill_rows_fn = c(_M(lambda x, r, p: bt.prefill_rows(x, r, p, ctx=self.pctx), bt)) if self.prefill_rows else None
         self.frame_fns = {cb: c(FusedFrameRows(self.eng, self.fe.bt, vec_cp=vec, ctx=cb).to(self.device))
                           for cb in self.ctx_buckets}

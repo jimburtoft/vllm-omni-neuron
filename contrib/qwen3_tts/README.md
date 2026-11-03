@@ -80,8 +80,10 @@ servers can:
 | LNC=1, 1 server, 4T + 4V | 129-141 | 3.7-9.8 s |
 | LNC=1, 2 servers x (2T + 2V), default host threads | 173-195 | 3.2-7.8 s |
 | LNC=1, 2 servers x (2T + 2V), `QTTS_HOST_THREADS=1 QTTS_PREFILL_CTX_BUCKETS=64,128` | 248 (conc 256) / 250 (conc 400) | 3.7 / 6.0 s |
-| **LNC=1, same, `QTTS_SLOT_LEN=1024`, `QTTS_B=80`** (upstream bench tool) | **309 (conc 400) / 318 (conc 640)** | **5.1 / 8.3 s** |
-| LNC=1, same, `QTTS_SLOT_LEN=1024`, `QTTS_B=96` | 315 (conc 480) / 319 (conc 768) | 6.1 / 9.9 s |
+| LNC=1, same, `QTTS_SLOT_LEN=1024`, `QTTS_B=80` (upstream bench tool) | 309 (conc 400) / 318 (conc 640) | 5.1 / 8.3 s |
+| LNC=1, same + 2-row prefill (default at LNC=1, B>=64) | 327-331 (conc 400) | 4.7 s |
+| **LNC=1, same + async output (default)** | **365-373 (conc 400)**, 349 (conc 600), 262 (conc 200, TTFP 260 ms) | **4.2-4.3 s** |
+| LNC=2, 1 server 2T B=48 + 2V, async output (default) | 176 (conc 128) / 186 (conc 256) | 2.8 / 5.7 s |
 | LNC=1, 4 servers x (1T + 1V), same env | 244-247 | 3.8-9.4 s |
 
 Streaming, LNC=1 2 servers: 265x at concurrency 256 (TTFA p50 0.93 s); 101x at concurrency 64 per server (TTFA 133 ms).
@@ -130,7 +132,9 @@ generate a second YAML with `QTTS_DEV0=2 QTTS_DEV1=3` and start it on another po
 | `QTTS_REP0` / `QTTS_REP1` | 1 / 1 | replicas of the talker / code2wav stage |
 | `QTTS_SLOT_LEN` | 2048 | per-request KV slots = stage-0 `max_model_len` (prompt + frames; 12.5 frames per second of audio, so ~2.5 min) |
 | `QTTS_PREFILL_CTX` / `QTTS_PREFILL_CTX_BUCKETS` | 256 / 128 | prefill buckets that attend only the first N KV slots when the prompt fits (exact; Tb=128 prefill 65 -> 16 ms at B=32) |
-| `QTTS_HOST_THREADS` | 2 | torch host threads per stage process |
+| `QTTS_HOST_THREADS` | 2 (1 at LNC=1) | torch host threads per stage process |
+| `QTTS_ASYNC_OUT` | 1 on device | `sample_tokens` returns an async output so the device->host copy of a frame overlaps vLLM's scheduling of the next step (sets `async_scheduling: true` on the talker stage) |
+| `QTTS_PREFILL_ROWS` | 2 at LNC=1 with B>=64, else off | new requests prefilled in pairs (4+ rows is slower) |
 | `QTTS_C2W_BATCH` | 4 | full-context vocoder windows decoded per call across requests (exact in fp32) |
 | `QTTS_C2W_NKI_BLOCKS` | `1,2,3` on device (off in CPU mode) | decoder blocks run as fused NKI kernels (`1,2,3` recommended; sharded over the LNC=2 cores: vocoder window 19.2 -> 7.0 ms at B=1, 12.5 -> 4.9 ms/window at B=4; same accuracy) |
 | `QTTS_CP_VEC` | 0 | `1` = elementwise code-predictor attention (slower under lite: 24 vs 10 ms at B=32) |

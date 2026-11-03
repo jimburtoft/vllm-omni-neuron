@@ -9,7 +9,7 @@ d["model_runner"] = "v1"
 d.pop("platforms", None)
 s0, s1 = d["stages"]
 s0.update(worker_cls="qwen3_tts_neuron.serving.ar_worker.NeuronTTSARWorker",
-          async_scheduling=os.environ.get("QTTS_ASYNC_OUT", "0") == "1",
+          async_scheduling=os.environ.get("QTTS_ASYNC_OUT", "1") == "1" and os.environ.get("VLLM_NEURON_CPU_MODE", "0") != "1",
           max_num_seqs=B, max_num_batched_tokens=4096, max_model_len=int(os.environ.get("QTTS_SLOT_LEN", "2048")),
           devices=os.environ.get("QTTS_DEV0", "0"), enforce_eager=True)
 s1.update(worker_cls="qwen3_tts_neuron.serving.c2w_worker.NeuronCode2WavWorker", async_scheduling=False,
