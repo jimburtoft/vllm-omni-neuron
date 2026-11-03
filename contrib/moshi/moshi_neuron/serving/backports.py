@@ -151,6 +151,13 @@ def _patch_pipeline_processor():
 
 def apply():
     applied = []
+    if os.environ.get("MOSHI_FRAMESYNC", "0") == "1":
+        try:
+            from .framesync import install
+            if install():
+                applied.append("engine_core:frame-sync-gate")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"frame-sync gate failed: {e!r}")
     try:
         if _patch_pipeline_processor():
             applied.append("personaplex.pipeline:moshi-processor")
