@@ -298,12 +298,12 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         occupied = set(self.slot_of.values())
         for b in range(self.B):
             if b in occupied:
-                self.pos[b] += 1
+                # a row already at the last slot keeps rewriting it (it was force-finished with EOS; with async
+                # scheduling vLLM may schedule it once more before it sees that EOS)
+                self.pos[b] = min(int(self.pos[b]) + 1, self.S - 1)
                 self.steps[b] += 1
             else:
                 self.pos[b] = 0  # park free slots: writes go to their own (dead) KV slot 0, never out of bounds
-        if (self.pos >= self.S).any():
-            raise RuntimeError(f"slot position overflow (max {int(self.pos.max())} >= S={self.S}); raise QTTS_SLOT_LEN")
         return codes if self.async_out else codes.cpu()
 
     def _build_prompt_safe(self, info):
@@ -401,7 +401,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
             for rid in active:
                 b = self.slot_of[rid]
                 # safety; scheduler stops at max_model_len
-                force_eos[rid] = int(self.pos[b]) >= self.S - 1 or self.steps[b] > self.row_max[b]
+                force_eos[rid] = int(self.pos[b]) >= self.S - 2 or self.steps[b] > self.row_max[b]
                 self.requests[rid].pop("new_slot", None)
             if self.async_out:
                 self._pending_codes = (codes, {rid: self.slot_of[rid] for rid in active}, force_eos)
