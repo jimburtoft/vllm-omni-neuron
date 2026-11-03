@@ -97,6 +97,8 @@ class MoshiStage0:
         # MOSHI_SAMPLER=multinomial (default): inverse-CDF multinomial over top-k, 1 uniform per sampler;
         # MOSHI_SAMPLER=gumbel: full-vocab Gumbel-max (B x 48k host random numbers per frame)
         self.uniform_sampler = os.environ.get("MOSHI_SAMPLER", "multinomial") == "multinomial"
+        self.dev_gather = os.environ.get("MOSHI_DEV_GATHER", "0") == "1"
+        self._decgather, self._cf = {}, cf
         self._prof = os.environ.get("MOSHI_PARTS", "0") == "1"
         self._pt, self._pn, self._plast = {}, 0, 0.0
         self.nseen = torch.zeros(B, dtype=torch.long)
@@ -291,6 +293,20 @@ class MoshiStage0:
             if r == 0 and bool(ready[sel].any()):
                 full[sel] = self.mimi_dec.decode(out[sel, 1:].clamp(min=0), reset=dreset[sel], active=ready[sel]).cpu()
             return full
+        if tp > 1 and self.dev_gather:
+            # decode + device all-gather in one compiled graph: no host gloo round trip; every rank always runs it
+            # (collective), with inactive rows masked by `active`
+            g = self._decgather.get(Bb)
+            if g is None:
+                g = self._decgather[Bb] = self._cf(_DecGather(self.mimi_dec.dec))
+            pcm_all = g(out[sel, 1:].clamp(min=0).to(self.device), dreset[sel].to(self.device),
+                        ready[sel].to(self.device)).cpu()                       # [tp * Bb/tp, 1920] rank-major
+            full = torch.zeros(self.B, FRAME)
+            nb = sel.numel()
+            for q in range(tp):
+                rows = torch.arange(q, Bb, tp) if self.interleave else torch.arange(q * self.Bl, (q + 1) * self.Bl)
+                full[rows] = pcm_all[q * nb:(q + 1) * nb]
+            return full
         if bool(ready[sel].any()):
             pcm = self.mimi_dec.decode(out[sel, 1:].clamp(min=0), reset=dreset[sel], active=ready[sel]).cpu()
         else:
@@ -313,6 +329,20 @@ class MoshiStage0:
             full[sel] = pcm
             pcm = full
         return pcm
+
+
+class _DecGather(torch.nn.Module):
+    """Mimi decoder for this rank's rows + in-graph all-gather of the PCM across TP ranks."""
+
+    def __init__(self, dec):
+        super().__init__()
+        self.dec = dec
+
+    def forward(self, codes, reset, active):
+        import torch.distributed as dist
+        from torch.distributed._functional_collectives import all_gather_tensor
+        pcm = self.dec(codes, reset, active).view(codes.shape[0], -1)
+        return all_gather_tensor(pcm.contiguous(), gather_dim=0, group=dist.group.WORLD)
 
 
 class MoshiDecoderRows:
