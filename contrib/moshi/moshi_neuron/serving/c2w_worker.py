@@ -97,8 +97,18 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
             return audio.reshape(-1).to(torch.long)
         return torch.tensor(st["tokens"][nc: nc + n], dtype=torch.long)
 
+    def _trace(self, ev, n):
+        p = os.environ.get("MOSHI_TRACE")
+        if not p:
+            return
+        f = self.__dict__.get("_tf")
+        if f is None:
+            f = self._tf = open(f"{p}.s1.{os.getpid()}", "a", buffering=1)
+        f.write(f"{ev} {time.time():.6f} {n}\n")
+
     @torch.inference_mode()
     def execute_model(self, scheduler_output, intermediate_tensors=None):
+        self._trace("s1_enter", len(scheduler_output.num_scheduled_tokens))
         from vllm_omni.engine.serialization import deserialize_additional_information
         if hasattr(self, "_omni_connector"):
             for request in getattr(scheduler_output, "pending_input_registrations", []):
@@ -158,6 +168,7 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
                 wavs.append(wav)
                 texts.append(self.text.get(rid, ""))
             self._last = (req_ids, wavs, texts)
+            self._trace("s1_exit", sum(1 for w in wavs if w.numel()))
             return None
         # gather new frames per request
         req_ids, frames = [], {}

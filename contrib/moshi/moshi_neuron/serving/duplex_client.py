@@ -32,6 +32,7 @@ async def one_session(i, args, pcm, model):
     from vllm_omni.clients.duplex import AudioFormat, DuplexClient, SessionConfig
     cfg = SessionConfig(input_audio=AudioFormat("pcm_f32le", 24000), output_audio=AudioFormat("pcm16", 24000))
     audio, text, arrivals, sent = [], [], [], []
+    trace = open(f"{args.trace}.client.{i}", "w", buffering=1) if args.trace else None
     t_start = None
     async with DuplexClient(args.url, model=model, config=cfg, handshake_timeout_s=600) as cl:
         async def reader():
@@ -41,6 +42,8 @@ async def one_session(i, args, pcm, model):
                     if a:
                         audio.append(np.frombuffer(a, dtype="<i2").astype(np.float32) / 32768.0)
                         arrivals.append((time.perf_counter() - t_start, len(a) // 2))
+                        if trace is not None:
+                            trace.write(f"recv {i} {len(arrivals) - 1} {time.time():.6f}\n")
                     t = ev.raw.get("text")
                     if isinstance(t, str) and t:
                         text.append(t)
@@ -58,6 +61,8 @@ async def one_session(i, args, pcm, model):
             if delay > 0:
                 await asyncio.sleep(delay)
             sent.append(time.perf_counter() - t_start)
+            if trace is not None:
+                trace.write(f"send {i} {k} {time.time():.6f}\n")
             await cl.append_audio(pcm[k * 1920:(k + 1) * 1920].astype("<f4").tobytes())
         await asyncio.sleep(args.tail_s)
         rt.cancel()
@@ -100,6 +105,7 @@ def main():
     ap.add_argument("--sessions", type=int, default=1)
     ap.add_argument("--tail-s", type=float, default=2.0)
     ap.add_argument("--out", default="out_duplex")
+    ap.add_argument("--trace", default="")
     asyncio.run(main_async(ap.parse_args()))
 
 

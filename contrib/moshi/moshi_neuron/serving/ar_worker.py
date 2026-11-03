@@ -139,9 +139,20 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
             self.free.sort()  # always hand out the lowest free row -> smallest batch bucket
 
     # ------------------------------------------------------------------ engine-core API
+    def _trace(self, ev, rows):
+        """MOSHI_TRACE=path: append 'event wallclock rows' lines (one file per process) for latency attribution."""
+        p = os.environ.get("MOSHI_TRACE")
+        if not p:
+            return
+        f = self.__dict__.get("_tf")
+        if f is None:
+            f = self._tf = open(f"{p}.s0.{os.getpid()}", "a", buffering=1)
+        f.write(f"{ev} {time.time():.6f} {rows}\n")
+
     @torch.inference_mode()
     def execute_model(self, scheduler_output, intermediate_tensors=None):
         _tx0 = time.perf_counter()
+        self._trace("s0_enter", len(scheduler_output.num_scheduled_tokens))
         if os.environ.get("MOSHI_STEP_STATS", "0") == "1":
             st_ = self.__dict__.setdefault("_gap", dict(last=None, gap=0.0, n=0, pre=0.0, post=0.0))
             if st_["last"] is not None:
@@ -230,6 +241,7 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                                 getattr(self.s0, "last_bucket", "-"))
                     st.update(enc=0.0, lm=0.0, dec=0.0, rows=0, t0=now)
         self._last = (list(scheduler_output.num_scheduled_tokens.keys()), emitted)
+        self._trace("s0_exit", len(rows))
         if os.environ.get("MOSHI_STEP_STATS", "0") == "1":
             g = self._gap
             g["last"] = time.perf_counter()
