@@ -249,6 +249,10 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                 logger.info("[MoshiS0 overhead/200] outside execute_model %.1f ms, execute pre-step %.1f ms",
                             1e3 * g["gap"] / 200, 1e3 * g["pre"] / 200)
                 g.update(gap=0.0, pre=0.0)
+        if os.environ.get("MOSHI_ONE_RPC", "1") == "1":
+            # return the output from execute_model: EngineCore.step skips the sample_tokens RPC (one broadcast +
+            # gather round trip to every TP worker less per step)
+            return self.sample_tokens(None)
         return None
 
     @torch.inference_mode()
