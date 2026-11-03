@@ -23,6 +23,7 @@ from vllm.logger import init_logger
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
+from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.mixins import OmniWorkerMixin
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin, needs_omni_connector
@@ -104,6 +105,10 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         _pr_default = "2" if (os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2") == "1" and self.B >= 64) else ""
         self.prefill_rows = sorted({int(r) for r in os.environ.get("QTTS_PREFILL_ROWS", _pr_default).split(",")
                                     if r.strip() and 1 < int(r) <= self.B})
+        # QTTS_ASYNC_OUT=1: sample_tokens returns an AsyncModelRunnerOutput (needs async_scheduling in the stage
+        # config); the device->host copy of a frame's codes happens when vLLM collects it, after it has already
+        # scheduled the next step.
+        self.async_out = os.environ.get("QTTS_ASYNC_OUT", "0") == "1"
         self.prefill_rows_fn = c(_M(lambda x, r, p: bt.prefill_rows(x, r, p, ctx=self.pctx), bt)) if self.prefill_rows else None
         self.frame_fns = {cb: c(FusedFrameRows(self.eng, self.fe.bt, vec_cp=vec, ctx=cb).to(self.device))
                           for cb in self.ctx_buckets}
@@ -299,7 +304,7 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                 self.pos[b] = 0  # park free slots: writes go to their own (dead) KV slot 0, never out of bounds
         if (self.pos >= self.S).any():
             raise RuntimeError(f"slot position overflow (max {int(self.pos.max())} >= S={self.S}); raise QTTS_SLOT_LEN")
-        return codes.cpu()
+        return codes if self.async_out else codes.cpu()
 
     def _build_prompt_safe(self, info):
         try:
@@ -392,14 +397,18 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         _t_pre = time.perf_counter()
         if active:
             codes = self._run_frame()
+            force_eos = {}
             for rid in active:
                 b = self.slot_of[rid]
-                c = codes[b]
-                cb0 = int(c[0])
-                if int(self.pos[b]) >= self.S - 1 or self.steps[b] > self.row_max[b]:  # safety; scheduler stops at max_model_len
-                    cb0 = self.eos
-                emitted[rid] = (cb0, c)
+                # safety; scheduler stops at max_model_len
+                force_eos[rid] = int(self.pos[b]) >= self.S - 1 or self.steps[b] > self.row_max[b]
                 self.requests[rid].pop("new_slot", None)
+            if self.async_out:
+                self._pending_codes = (codes, {rid: self.slot_of[rid] for rid in active}, force_eos)
+            else:
+                for rid in active:
+                    c = codes[self.slot_of[rid]]
+                    emitted[rid] = (self.eos if force_eos[rid] else int(c[0]), c)
         _t_frame = time.perf_counter()
         if _t_frame - _t_enter > 0.5:
             logger.info("[NeuronTTS] slow step: setup+prefill %.3fs (%d prefills) frame %.3fs active=%d maxpos=%d",
@@ -423,11 +432,50 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
                                                                   for k, v in pp.items()})
                     self._pre_parts = {}
                 self._ss.update(gap=0.0, active=0, frame=0.0, pre=0.0, prefills=0)
+        if self.async_out and not scheduler_output.num_scheduled_tokens:
+            # with async scheduling vLLM uses execute_model's result directly when nothing was scheduled (no
+            # sample_tokens call); None there is treated as a failure
+            return self._build_output([], {})
         return None
+
+    def _resolve_pending(self, emitted):
+        pend, self._pending_codes = getattr(self, "_pending_codes", None), None
+        if pend is None:
+            return emitted
+        codes, slots, force_eos = pend
+        codes = codes.cpu()  # waits for this step's frame on the device
+        for rid, b in slots.items():
+            c = codes[b]
+            emitted[rid] = (self.eos if force_eos[rid] else int(c[0]), c)
+        return emitted
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output=None):
+        if os.environ.get("QTTS_ASYNC_DEBUG") == "1":
+            logger.info("[NeuronTTS] sample_tokens async=%s last=%s", self.async_out, None if getattr(self, "_last", None) is None else len(self._last[0]))
+        if self.async_out:
+            req_ids, emitted = self._last
+            runner = self
+
+            class _Out(AsyncModelRunnerOutput):  # vLLM resolves this while it schedules the next step
+                def __init__(self, emitted):
+                    self._emitted = emitted
+                    self._pend = runner._pending_codes
+                    runner._pending_codes = None
+
+                def get_output(self):
+                    try:
+                        runner._pending_codes = self._pend
+                        with torch.inference_mode():
+                            return runner._build_output(req_ids, runner._resolve_pending(self._emitted))
+                    except Exception:
+                        logger.exception("[NeuronTTS] async get_output failed")
+                        raise
+            return _Out(emitted)
         req_ids, emitted = self._last
+        return self._build_output(req_ids, emitted)
+
+    def _build_output(self, req_ids, emitted):
         out_ids, sampled, inter = [], [], []
         for rid in req_ids:
             out_ids.append(rid)
