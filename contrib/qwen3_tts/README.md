@@ -79,7 +79,9 @@ servers can:
 | LNC=2, 1 server, 2T + 2V (B=48) | 150-162 | 3.0-9.4 s |
 | LNC=1, 1 server, 4T + 4V | 129-141 | 3.7-9.8 s |
 | LNC=1, 2 servers x (2T + 2V), default host threads | 173-195 | 3.2-7.8 s |
-| **LNC=1, 2 servers x (2T + 2V), `QTTS_HOST_THREADS=1 QTTS_PREFILL_CTX_BUCKETS=64,128`** | **248 (conc 256) / 250 (conc 400)** | **3.7 / 6.0 s** |
+| LNC=1, 2 servers x (2T + 2V), `QTTS_HOST_THREADS=1 QTTS_PREFILL_CTX_BUCKETS=64,128` | 248 (conc 256) / 250 (conc 400) | 3.7 / 6.0 s |
+| **LNC=1, same, `QTTS_SLOT_LEN=1024`, `QTTS_B=80`** (upstream bench tool) | **309 (conc 400) / 318 (conc 640)** | **5.1 / 8.3 s** |
+| LNC=1, same, `QTTS_SLOT_LEN=1024`, `QTTS_B=96` | 315 (conc 480) / 319 (conc 768) | 6.1 / 9.9 s |
 | LNC=1, 4 servers x (1T + 1V), same env | 244-247 | 3.8-9.4 s |
 
 Streaming, LNC=1 2 servers: 265x at concurrency 256 (TTFA p50 0.93 s); 101x at concurrency 64 per server (TTFA 133 ms).
@@ -89,12 +91,15 @@ Quality: no measurable difference between LNC=1 and LNC=2 (3 x 100 prompts each,
 
 ```bash
 export NEURON_LOGICAL_NC_CONFIG=1   # implies QTTS_HOST_THREADS=1 and QTTS_PREFILL_CTX_BUCKETS=64,128 by default
-QTTS_B=48 QTTS_REP0=2 QTTS_DEV0=0,2 QTTS_REP1=2 QTTS_DEV1=1,3 QTTS_B1=96 python -m qwen3_tts_neuron.serving.make_deploy /tmp/a.yaml
-QTTS_B=48 QTTS_REP0=2 QTTS_DEV0=4,6 QTTS_REP1=2 QTTS_DEV1=5,7 QTTS_B1=96 python -m qwen3_tts_neuron.serving.make_deploy /tmp/b.yaml
+QTTS_SLOT_LEN=1024 QTTS_B=80 QTTS_REP0=2 QTTS_DEV0=0,2 QTTS_REP1=2 QTTS_DEV1=1,3 QTTS_B1=160 python -m qwen3_tts_neuron.serving.make_deploy /tmp/a.yaml
+QTTS_SLOT_LEN=1024 QTTS_B=80 QTTS_REP0=2 QTTS_DEV0=4,6 QTTS_REP1=2 QTTS_DEV1=5,7 QTTS_B1=160 python -m qwen3_tts_neuron.serving.make_deploy /tmp/b.yaml
 QTTS_NC_COUNT=8 python -m qwen3_tts_neuron.serving.serve_launcher serve <model> --deploy-config /tmp/a.yaml --port 8101 ... &
 QTTS_NC_COUNT=8 python -m qwen3_tts_neuron.serving.serve_launcher serve <model> --deploy-config /tmp/b.yaml --port 8102 ... &
 # put a load balancer in front of 8101/8102
 ```
+`QTTS_SLOT_LEN=1024` caps a request at 1024 positions (prompt + ~80 s of audio). Half the KV cache leaves room for
+B=80 talker slots per half-size core; at B=48 it alone measured +3 % (264 -> 271x), B=80 then +14 %.
+
 Why the two env settings matter at LNC=1:
 - 8 stage processes plus 2 API servers share 12 vCPUs, so 1 torch thread per stage is enough.
 - At LNC=1 the full-cache 64-token prefill is 14 ms vs 11 ms ctx-limited.
