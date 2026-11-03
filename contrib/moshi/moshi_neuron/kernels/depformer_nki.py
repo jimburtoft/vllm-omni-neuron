@@ -69,16 +69,23 @@ def _rms_T(dstT, srcT, w_sb, B, eps):
 
 
 def _proj(out_sb, hT, w_hbm, layer, B, n_out):
-    """out_sb[B, n_out] (fp32) = h @ W  with hT [128, DC_in, B] bf16 (stationary per K chunk) and W [in, out] in HBM
-    streamed in [128, <=512] tiles as the moving operand."""
+    """out_sb[B, n_out] (fp32) = h @ W  with hT [128, DC_in, B] bf16 (stationary per K chunk) and W [in, out] in HBM.
+    The whole [in, out] weight of the projection is loaded with ONE dma per 512-column block ([128, kin, 512] =
+    kin*128 KiB), each block into its own SBUF buffer so the DMAs of later blocks overlap the matmuls of earlier ones."""
     kin = hT.shape[1]
-    for n0 in range(0, n_out, NMAX):
+    nblk = (n_out + NMAX - 1) // NMAX
+    wv = w_hbm[layer].reshape((kin, P, n_out)).rearrange(("c", "p", "n"), ("p", "c", "n"))
+    wts = []
+    for bi in range(nblk):
+        n0 = bi * NMAX
         nn = min(NMAX, n_out - n0)
+        wt = nl.ndarray((P, kin, NMAX), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=wt[:, :, 0:nn], src=wv[:, :, n0:n0 + nn])
+        wts.append((wt, n0, nn))
+    for wt, n0, nn in wts:
         ps = nl.ndarray((B, NMAX), dtype=nl.float32, buffer=nl.psum)
         for c in range(kin):
-            wt = nl.ndarray((P, NMAX), dtype=nl.bfloat16, buffer=nl.sbuf)
-            nisa.dma_copy(dst=wt[:, 0:nn], src=w_hbm[layer, c * P:(c + 1) * P, n0:n0 + nn])
-            nisa.nc_matmul(dst=ps[:, 0:nn], stationary=hT[:, c, :], moving=wt[:, 0:nn])
+            nisa.nc_matmul(dst=ps[:, 0:nn], stationary=hT[:, c, :], moving=wt[:, c, 0:nn])
         nisa.tensor_copy(dst=out_sb[:, n0:n0 + nn], src=ps[:, 0:nn])
 
 
@@ -93,7 +100,8 @@ def _transpose_to_T(dstT, src, B, nchunks):
 
 
 @nki.jit
-def depformer_step(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps):
+def depformer_step(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps, ver=2):
+    # `ver`: lite's NKI cache keys on this top-level source + args only -- bump it when a helper changes.
     B = x.shape[0]
     y = nl.ndarray((B, D), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     k_new = nl.ndarray((L, B, D), dtype=nl.bfloat16, buffer=nl.shared_hbm)

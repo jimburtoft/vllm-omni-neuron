@@ -270,6 +270,27 @@ class MoshiLM(nn.Module):
                 win=P(torch.stack([g(p + f"gating.{k}.linear_in.weight") for k in range(Q)])),
                 wout=P(torch.stack([g(p + f"gating.{k}.linear_out.weight") for k in range(Q)])))))
         self.onehot_emb = os.environ.get("MOSHI_ONEHOT_EMB", "0") == "1"
+        # MOSHI_DEP_NKI_MINB=N: use the NKI depformer-step kernel (6 layers per launch) when the depformer batch >= N
+        # (it costs ~0.75 ms/step at any B; the torch chain ~0.43 ms at B=1 rising to ~5 ms at B=24). 0 disables.
+        self.dep_nki_minb = int(os.environ.get("MOSHI_DEP_NKI_MINB", "0"))
+        if self.dep_nki_minb > 0 and not os.environ.get("VLLM_NEURON_CPU_MODE") == "1":
+            NL = cfg.dep_layers
+            # [step, layer, in, out] weights, transposed to [in, out] for the kernel
+            st = lambda key: torch.stack([torch.stack([self.dep_layers[i][key][k].t() for i in range(NL)])
+                                          for k in range(Q)]).contiguous()
+            self.dn_wqkv = P(st("wqkv")); self.dn_wo = P(st("wo"))
+            I = cfg.dep_hidden
+            self.dn_wg = P(torch.stack([torch.stack([self.dep_layers[i]["win"][k][:I].t() for i in range(NL)])
+                                        for k in range(Q)]).contiguous())
+            self.dn_wu = P(torch.stack([torch.stack([self.dep_layers[i]["win"][k][I:].t() for i in range(NL)])
+                                        for k in range(Q)]).contiguous())
+            self.dn_wd = P(st("wout"))
+            self.dn_n1 = P(torch.stack([self.dep_layers[i]["n1"].float() for i in range(NL)]))
+            self.dn_n2 = P(torch.stack([self.dep_layers[i]["n2"].float() for i in range(NL)]))
+            from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+            from .kernels.depformer_nki import depformer_step
+            self._dep_k = wrap_nki(depformer_step)
+            self._dep_grid = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"))
         self.dep_in_fused = os.environ.get("MOSHI_DEP_IN_FUSED", "1") == "1"
 
     # ---------------------------------------------------------------- temporal transformer
@@ -450,6 +471,34 @@ class MoshiLM(nn.Module):
         tout = rms_f32(x, self.out_norm, cfg.eps)
         return tout, F.linear(tout, self.text_linear).float()[:, 0]
 
+    def depformer_nki(self, tout, text, gumbel_audio, temp, top_k, force_audio=None, use_force=None):
+        """Depformer with one NKI launch per step (6 layers); per-step K/V of earlier steps passed in [6,B,8,1024]."""
+        cfg, B = self.cfg, tout.shape[0]
+        Q, dd, NL = cfg.dep_q, cfg.dep_dim, cfg.dep_layers
+        tout = tout[:, 0]
+        din = F.linear(tout, self.dep_in.view(-1, self.dep_in.shape[-1])).view(B, Q, -1)
+        prev = self._lookup(self.dep_text_emb, text)
+        kc = torch.zeros(NL, B, Q, dd, dtype=self.dtype, device=tout.device)
+        vc = torch.zeros(NL, B, Q, dd, dtype=self.dtype, device=tout.device)
+        codes, logits_all = [], []
+        k = self._dep_k[self._dep_grid]
+        for s in range(Q):
+            x = (din[:, s] + prev).to(self.dtype).contiguous()
+            y, kn, vn = k(x, kc, vc, self.dn_wqkv[s], self.dn_wo[s], self.dn_wg[s], self.dn_wu[s], self.dn_wd[s],
+                          self.dn_n1, self.dn_n2, s, cfg.eps, 2)
+            if s + 1 < Q:
+                kc = torch.cat([kc[:, :, :s], kn.unsqueeze(2), kc[:, :, s + 1:]], 2)
+                vc = torch.cat([vc[:, :, :s], vn.unsqueeze(2), vc[:, :, s + 1:]], 2)
+            lg = F.linear(y, self.dep_heads[s]).float()
+            logits_all.append(lg)
+            c = sample(lg, gumbel_audio[:, s], temp, top_k)
+            if force_audio is not None:
+                c = torch.where(use_force, force_audio[:, s], c)
+            codes.append(c)
+            if s + 1 < Q:
+                prev = self._lookup(self.dep_emb[s], c)
+        return torch.stack(codes, 1), torch.stack(logits_all, 1)
+
     # ---------------------------------------------------------------- depformer
     def _lookup(self, table, idx):
         if self.onehot_emb:
@@ -459,6 +508,8 @@ class MoshiLM(nn.Module):
 
     def depformer(self, tout, text, gumbel_audio, temp: float, top_k: int, force_audio=None, use_force=None):
         cfg, B = self.cfg, tout.shape[0]
+        if 0 < self.dep_nki_minb <= B and hasattr(self, "_dep_k"):
+            return self.depformer_nki(tout, text, gumbel_audio, temp, top_k, force_audio, use_force)
         Hd, Dd = cfg.dep_heads, cfg.dep_dim // cfg.dep_heads
         tout = tout[:, 0]                                      # [B,4096]
         ks, vs = [[] for _ in self.dep_layers], [[] for _ in self.dep_layers]
