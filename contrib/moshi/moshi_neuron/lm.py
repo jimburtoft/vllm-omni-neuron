@@ -544,6 +544,25 @@ class MoshiLM(nn.Module):
         return torch.stack(codes, 1), torch.stack(logits_all, 1)
 
 
+class MoshiEncFrame(nn.Module):
+    """Mimi encode + LM frame in ONE graph (MOSHI_FUSE_ENC=1): removes the encoder d2h, the host round trip and a
+    launch per step. User codebook 0 has acoustic delay 0, so the frame consumes this step's freshly encoded cb0;
+    cb1..7 (delay 1) come from the previous step's codes, which the host ring already holds. The host passes the
+    token frame built from last step's state with a mask `use_cb0` marking rows whose user-cb0 slot (column 9) must
+    be replaced by the code encoded here; the fresh codes are returned so the host ring stays authoritative."""
+
+    def __init__(self, enc, frame):
+        super().__init__()
+        self.enc, self.frame = enc, frame
+
+    def forward(self, pcm, mreset, tokens, use_cb0, reset, active, gt, ga, ft, fa, uf):
+        codes = self.enc(pcm, mreset, active)                       # [B,8]
+        tok = tokens.clone()
+        tok[:, 9] = torch.where(use_cb0, codes[:, 0], tokens[:, 9])
+        out = self.frame(tok, reset, active, gt, ga, ft, fa, uf)
+        return out, codes
+
+
 class MoshiFrame(nn.Module):
     """The compiled unit: one 80 ms LM step for all B rows. Static config: ctx bucket, sampling, debug outputs."""
 
@@ -600,11 +619,18 @@ class LMGenHost:
         self.cache = torch.where(m.view(-1, 1, 1), torch.full_like(self.cache, -2), self.cache)
         self.offsets = torch.where(m, torch.zeros_like(self.offsets), self.offsets)
 
-    def inputs(self, user_codes, active=None):
+    def inputs(self, user_codes, active=None, dry=False):
+        """dry=True: compute the input frame without writing user_codes into the ring (fused-encoder path, where
+        user cb0 comes from the device and cb1..7 at this step were written by the previous step)."""
         cfg, B, CT = self.cfg, self.B, self.CT
         active = torch.ones(B, dtype=torch.bool) if active is None else active
         d_user = self.delays[cfg.dep_q + 1:]
         wp = (self.offsets.view(B, 1) + d_user.view(1, -1)) % CT                  # [B,8]
+        if dry:
+            is_init = (self.offsets.view(B, 1) <= self.delays.view(1, -1)) | ~active.view(B, 1)
+            pos = (self.offsets % CT).view(B, 1, 1).expand(B, self.K, 1)
+            inp = self.cache.gather(2, pos).squeeze(-1)
+            return torch.where(is_init, self.initial.view(1, -1), inp)
         self.cache = self.cache.clone()
         sub = self.cache[:, cfg.dep_q + 1:]                                        # view [B,8,CT]
         old = sub.gather(2, wp.unsqueeze(-1)).squeeze(-1)

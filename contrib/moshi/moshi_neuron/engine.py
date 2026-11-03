@@ -86,6 +86,12 @@ class MoshiStage0:
             self._frames[c] = cf(MoshiFrame(self.lm, ctx=c, temp_text=tt, top_k_text=top_k_text, temp=ta,
                                             top_k=top_k).to(device))
         self.frame = self._frames[sctx]
+        # MOSHI_FUSE_ENC=1: one graph = Mimi encode + LM frame (only with the encoder replicated per rank / TP1)
+        self.fuse_enc = os.environ.get("MOSHI_FUSE_ENC", "0") == "1" and (self.tp == 1 or self.enc_all)
+        if self.fuse_enc:
+            from .lm import MoshiEncFrame
+            self._encframes = {c: cf(MoshiEncFrame(self.mimi.enc, fr._orig_mod if hasattr(fr, "_orig_mod") else fr))
+                               for c, fr in self._frames.items()}
         self.host = LMGenHost(B, self.cfg)
         self.gens = [torch.Generator().manual_seed(seed + b) for b in range(B)]
         # MOSHI_SAMPLER=multinomial (default): inverse-CDF multinomial over top-k, 1 uniform per sampler;
@@ -190,6 +196,8 @@ class MoshiStage0:
         t0 = time.perf_counter()
         mreset = (self.nseen <= 1) & active
         reset = (self.nseen == 0) & active
+        if self.fuse_enc:
+            return self._step_fused(pcm_in, active, Bb, mreset, reset, t0)
         if self.enc_all:
             codes = self.mimi.encode(pcm_in[:Bb], reset=mreset[:Bb], active=active[:Bb])
             self._tick("enc_call")
@@ -231,6 +239,38 @@ class MoshiStage0:
             self.t_dec = time.perf_counter() - t3
             self._tick("decode+gather")
         return raw, out, ready, (t1 - t0, t2 - t1)
+
+    @torch.inference_mode()
+    def _step_fused(self, pcm_in, active, Bb, mreset, reset, t0):
+        B, dev = self.B, self.device
+        h = self.host
+        # tokens with last step's user codes for cb1..7 and a placeholder for cb0 (filled on device)
+        prev_codes = h.last_user if hasattr(h, "last_user") else torch.zeros(B, 8, dtype=torch.long)
+        tokens = h.inputs(prev_codes, active, dry=True)
+        is_init0 = (h.offsets <= h.delays[h.cfg.dep_q + 1]) | ~active
+        use_cb0 = ~is_init0
+        gt, ga = self._noise()
+        fn = self._encframes[self.ctx_for(reset, active, Bb)]
+        x = pcm_in[:Bb].to(dev).view(Bb, 1, -1)
+        raw_b, codes_b = fn(x, mreset[:Bb].to(dev), tokens[:Bb].to(dev), use_cb0[:Bb].to(dev), reset[:Bb].to(dev),
+                            active[:Bb].to(dev), gt[:Bb], ga[:Bb], self._ft[:Bb], self._fa[:Bb], self._uf[:Bb])
+        self._prefetch()
+        raw_b, codes_b = raw_b.cpu(), codes_b.cpu()
+        t1 = time.perf_counter()
+        codes = torch.zeros(B, 8, dtype=torch.long)
+        codes[:Bb] = codes_b
+        h.inputs(codes, active)          # commit this step's user codes into the ring (real write)
+        h.last_user = codes
+        raw = raw_b if Bb == B else torch.cat([raw_b, torch.zeros(B - Bb, raw_b.shape[1], dtype=raw_b.dtype)])
+        out, ready = h.commit(raw, active)
+        self.nseen = self.nseen + active.long()
+        self.lm_frames = torch.where(active, torch.where(reset, torch.ones_like(self.lm_frames), self.lm_frames + 1),
+                                     self.lm_frames)
+        if self.decode_here:
+            t3 = time.perf_counter()
+            self.last_pcm = self._decode_rows(out, ready, Bb)
+            self.t_dec = time.perf_counter() - t3
+        return raw, out, ready, (0.0, t1 - t0)
 
     @torch.inference_mode()
     def _decode_rows(self, out, ready, Bb=None):
