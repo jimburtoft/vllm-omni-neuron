@@ -137,6 +137,7 @@ generate a second YAML with `QTTS_DEV0=2 QTTS_DEV1=3` and start it on another po
 | `QTTS_PREFILL_ROWS` | 2 at LNC=1 with B>=64, else off | new requests prefilled in pairs (4+ rows is slower) |
 | `QTTS_C2W_BATCH` | 4 | full-context vocoder windows decoded per call across requests (exact in fp32) |
 | `QTTS_C2W_NKI_BLOCKS` | `1,2,3` on device (off in CPU mode) | decoder blocks run as fused NKI kernels (`1,2,3` recommended; sharded over the LNC=2 cores: vocoder window 19.2 -> 7.0 ms at B=1, 12.5 -> 4.9 ms/window at B=4; same accuracy) |
+| `QTTS_CP_NKI` | `0` | experimental: each code-predictor step (5 layers) as one NKI launch (`kernels/cp_nki.py`). Per step the kernel matches the compiled torch layers (~1.05 vs 1.03 ms at B=80, LNC=1), but the full frame is slower (B=80: 20.8 vs 19.5 ms; B=8: 15.3 vs 10.3 ms). Leave off |
 | `QTTS_CP_VEC` | 0 | `1` = elementwise code-predictor attention (slower under lite: 24 vs 10 ms at B=32) |
 | `QTTS_GREEDY` | 0 | `1` writes greedy defaults into the YAML |
 

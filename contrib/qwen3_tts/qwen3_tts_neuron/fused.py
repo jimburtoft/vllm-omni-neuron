@@ -116,7 +116,77 @@ def _sample_rows_candidates(logits, gumbel, temp, topk):
     return torch.where(k.view(B) > 0, topk_pick, full).view(out_shape)
 
 
+def cp_frame_nki(cp, talker_hidden, cb0_embed, gumbel, rows):
+    """Code-predictor frame with each step's 5 layers in one NKI launch (kernels/cp_nki.py). Same math as
+    cp_frame_vec (positions 0,1 for the talker hidden + CB0, then one position per generated code)."""
+    cfg = cp.cfg
+    B = talker_hidden.shape[0]
+    pp = cp._nki_params
+    k = cp._nki_k
+    cache = {}
+
+    def step(x, pos):  # x [B, 1024] -> rms-normed last hidden [B, 1, 1024]; kc/vc written at pos in place
+        y = k[cp._nki_grid](x.contiguous(), cache["k"], cache["v"], pp["wqkv"], pp["wo"], pp["wgu"], pp["wd"],
+                            pp["ln1"], pp["ln2"], pp["qn"], pp["kn"], pp["norm"], pp["cos"], pp["sin"], pos, cfg.eps)
+        return y.view(B, 1, -1)
+
+    if os.environ.get("QTTS_CP_NKI_PREFIX", "torch") == "torch":
+        # positions 0/1 (talker hidden + CB0) through the torch layers in one 2-token call; this also fills the
+        # cache layout the kernel reads ([L, B, kv, S, d])
+        x0 = torch.cat([talker_hidden, cb0_embed], 1) @ cp.proj_w + cp.proj_b
+        pos2 = torch.arange(2, device=x0.device)
+        cos, sin = cp.cos.index_select(0, pos2), cp.sin.index_select(0, pos2)
+        jj = torch.arange(cp.S, device=x0.device)
+        m = torch.where(jj.view(1, -1) <= pos2.view(-1, 1), 0.0, -1e30).to(torch.float32)
+        hh = x0
+        ks, vs = [], []
+        for i, l in enumerate(cp.layers):
+            q, kk, vv = l._qkv(hh, cos, sin)
+            kz = torch.zeros(B, cfg.kv, cp.S, cfg.head_dim, dtype=cp.dtype, device=x0.device).index_copy(2, pos2, kk)
+            vz = torch.zeros_like(kz).index_copy(2, pos2, vv)
+            o = l._attn(q, kz, vz, m)
+            hh = hh + o @ l.w_o
+            hh = hh + l._mlp(hh)
+            ks.append(kz); vs.append(vz)
+        cache["k"] = torch.stack(ks).contiguous(); cache["v"] = torch.stack(vs).contiguous()
+        h = rms(hh[:, -1:, :], cp.norm, cfg.eps)
+        return _cp_tail(cp, h, talker_hidden, gumbel, rows, step)
+
+    cache["k"] = torch.zeros(len(cp.layers), B, cfg.kv, cp.S, cfg.head_dim, dtype=cp.dtype, device=talker_hidden.device)
+    cache["v"] = torch.zeros_like(cache["k"])
+    x0 = torch.cat([talker_hidden, cb0_embed], 1) @ cp.proj_w + cp.proj_b  # [B, 2, 1024]
+    step(x0[:, 0], 0)
+    h = step(x0[:, 1], 1)
+    return _cp_tail(cp, h, talker_hidden, gumbel, rows, step)
+
+
+def _cp_tail(cp, h, talker_hidden, gumbel, rows, step):
+    cfg = cp.cfg
+    codes, emb_sum = [], torch.zeros_like(talker_hidden)
+    for g in range(cfg.groups - 1):
+        lg = (h @ cp.heads[g]).float()
+        c = sample_rows(lg, gumbel[:, g], rows[0], rows[1])
+        codes.append(c)
+        e = F.embedding(c, cp.embeds[g])
+        emb_sum = emb_sum + e
+        if g < cfg.groups - 2:
+            h = step((e @ cp.proj_w + cp.proj_b)[:, 0], g + 2)
+    return torch.cat(codes, -1), emb_sum
+
+
+def prepare_cp_nki(cp):
+    """Pack the code-predictor weights for the NKI step kernel (call after the model is on the device)."""
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+    from .kernels.cp_nki import cp_params, cp_step
+    dev = cp.proj_w.device
+    cp._nki_params = {k: v.to(dev) for k, v in cp_params(cp).items()}
+    cp._nki_k = wrap_nki(cp_step)
+    cp._nki_grid = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"))
+
+
 def cp_frame_vec(cp, talker_hidden, cb0_embed, vec=True, gumbel=None, temperature=0.0, top_k=0, rows=None):
+    if rows is not None and getattr(cp, "_nki_params", None) is not None:
+        return cp_frame_nki(cp, talker_hidden, cb0_embed, gumbel, rows)
     cfg = cp.cfg
     B, dev, L = talker_hidden.shape[0], talker_hidden.device, len(cp.layers)
     kc = [torch.zeros(B, cfg.kv, cp.S, cfg.head_dim, dtype=cp.dtype, device=dev) for _ in range(L)]

@@ -110,6 +110,11 @@ class NeuronTTSARModelRunner(OmniConnectorModelRunnerMixin):
         # scheduled the next step.
         self.async_out = os.environ.get("QTTS_ASYNC_OUT", "1") == "1" and not cpu_mode()
         self.prefill_rows_fn = c(_M(lambda x, r, p: bt.prefill_rows(x, r, p, ctx=self.pctx), bt)) if self.prefill_rows else None
+        # QTTS_CP_NKI=1: code-predictor steps as one NKI launch each (kernels/cp_nki.py)
+        if os.environ.get("QTTS_CP_NKI", "0") == "1" and not cpu_mode():
+            from ..fused import prepare_cp_nki
+            prepare_cp_nki(self.eng.cp)
+            logger.info("[NeuronTTS] code predictor: NKI step kernel")
         self.frame_fns = {cb: c(FusedFrameRows(self.eng, self.fe.bt, vec_cp=vec, ctx=cb).to(self.device))
                           for cb in self.ctx_buckets}
         self.noise = RowNoise(self.B, self.eng.talker.cfg.vocab, self.eng.cp.cfg.vocab, self.device,
