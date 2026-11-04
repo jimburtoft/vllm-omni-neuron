@@ -174,7 +174,8 @@ class MoshiLM(nn.Module):
             # MOSHI_FP8_KV=1: FP8 (e4m3) KV cache. Per-layer quant scales: scale = FP8_MAX / amax(K or V), amax from
             # MOSHI_KV_SCALES (json {"k": [32], "v": [32]} of bf16 amax per layer) or a default amax.
             self.fp8_kv = os.environ.get("MOSHI_FP8_KV", "0") == "1"
-            self.attn_chunk = int(os.environ.get("MOSHI_ATTN_CHUNK", "4"))
+            # 0 = auto: split only odd B (see _attn_chunks); >0 = fixed chunk size
+            self.attn_chunk = int(os.environ.get("MOSHI_ATTN_CHUNK", "0"))
             if self.fp8_kv:
                 import json
                 fmax = float(os.environ.get("MOSHI_FP8_MAX", "240"))
@@ -351,6 +352,17 @@ class MoshiLM(nn.Module):
         tout = rms_f32(x, self.out_norm, cfg.eps)              # [B,1,dim]
         return tout, F.linear(tout, self.text_linear).float()[:, 0]  # [B,32000]
 
+    def _attn_chunks(self, B, H):
+        """Row ranges for the per-layer attention kernel calls. bf16 KV: one call. FP8 KV: fixed chunks if
+        MOSHI_ATTN_CHUNK > 0, else one call for even B (or B*H <= 128) and (B-1) + 1 for odd B."""
+        if not self.fp8_kv:
+            return [(0, B)]
+        if self.attn_chunk > 0:
+            return [(r0, min(B, r0 + self.attn_chunk)) for r0 in range(0, B, self.attn_chunk)]
+        if B % 2 == 0 or B * H <= 128:
+            return [(0, B)]
+        return [(0, B - 1), (B - 1, B)]
+
     def temporal_kernels(self, tokens, reset, active, ctx=None):
         """Helium step on nkilib fused decode kernels.
 
@@ -409,13 +421,12 @@ class MoshiLM(nn.Module):
             if "noattn" in abl:
                 a = x
             else:
-              # The kernel folds the 32 KV heads into its batch; its FP8-KV path is only correct while
-              # B*32 <= 128 partitions (measured: B<=4 correct, B>=5 garbage). Chunk rows for FP8 KV; the KV pool
-              # and the global block tables are shared, so per-chunk calls are exact.
-              ch = self.attn_chunk if self.fp8_kv else B
+              # The kernel folds the KV heads into its batch. With FP8 KV on LNC2 it is wrong when the folded
+              # batch is split across the two cores mid-sequence: odd B with B*heads > 128 (fails at B=5,7,9 @32
+              # heads and B=17,23,33 @8 heads; even B is correct). Split odd B into (B-1) + 1. The KV pool and the
+              # global block tables are shared, so per-chunk calls are exact.
               parts = []
-              for r0 in range(0, B, ch):
-                  r1 = min(B, r0 + ch)
+              for r0, r1 in self._attn_chunks(B, H):
                   parts.append(attention_decode(
                       X=x[r0:r1], X_hidden_dim_actual=cfg.dim, rmsnorm_X_enabled=True, rmsnorm_X_eps=cfg.eps,
                       rmsnorm_X_gamma=l["n1"], W_qkv=l["wqkv"], bias_qkv=None,
