@@ -151,6 +151,27 @@ def _patch_pipeline_processor():
 
 def apply():
     applied = []
+    if os.environ.get("MOSHI_CONS_FIX", "0") == "1":
+        try:
+            from .phases import install_consolidate_fix
+            if install_consolidate_fix():
+                applied.append("mm_outputs:amortized-audio-append")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"consolidate fix failed: {e!r}")
+    if os.environ.get("MOSHI_CONS_LOG") == "1":
+        try:
+            from .phases import install_consolidate_log
+            if install_consolidate_log():
+                applied.append("mm_outputs:consolidate-log")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"consolidate log failed: {e!r}")
+    if os.environ.get("MOSHI_PHASES"):
+        try:
+            from .phases import install as _ph
+            if _ph():
+                applied.append("engine_core:phase-timing")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"phase timing failed: {e!r}")
     if os.environ.get("MOSHI_FRAMESYNC", "0") == "1":
         try:
             from .framesync import install

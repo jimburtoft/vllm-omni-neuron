@@ -93,13 +93,19 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
     def warmup(self):
         t0 = time.time()
         z = torch.zeros(self.B, FRAME)
-        for bb in self.s0.buckets:  # compile / load every batch-bucket graph
+        # every (batch bucket x context bucket) graph: a session crossing into a context bucket that was not warmed
+        # would otherwise compile it on demand inside the serving step (minutes; all sessions stall)
+        ctxs = list(getattr(self.s0, "ctx_buckets", [None]))
+        for bb in self.s0.buckets:
             act = torch.zeros(self.B, dtype=torch.bool)
             act[:bb] = True
-            for _ in range(2):
-                self.s0.step(z, act)
-            self.s0.reset(range(self.B))
-            logger.info("[MoshiS0] warmed bucket %d (%.1fs)", bb, time.time() - t0)
+            for c in ctxs:
+                self.s0.force_ctx = c if len(ctxs) > 1 else None
+                for _ in range(2):
+                    self.s0.step(z, act)
+                self.s0.reset(range(self.B))
+            self.s0.force_ctx = None
+            logger.info("[MoshiS0] warmed bucket %d x ctx %s (%.1fs)", bb, ctxs, time.time() - t0)
         logger.info("[MoshiS0] warmup %.1fs", time.time() - t0)
         return time.time() - t0
 
@@ -398,7 +404,9 @@ def _make_tp_worker():
                 os.sched_setaffinity(0, cpus)
             except Exception:  # noqa: BLE001
                 pass
-            torch.set_num_threads(len(cpus))
+            # MOSHI_WORKER_THREADS: torch intra-op threads per TP rank (host ops here are tiny; >1 makes them wait
+            # on helper threads that share CPUs with other ranks / the API server)
+            torch.set_num_threads(int(os.environ.get("MOSHI_WORKER_THREADS", str(len(cpus)))))
             # vllm-neuron convention: with NEURON_VISIBLE_DEVICES set, the device index is the local rank
             self.device = torch.device(f"neuron:{self.local_rank}")
             self.model_runner = MoshiStage0Runner(self.vllm_config, self.device)

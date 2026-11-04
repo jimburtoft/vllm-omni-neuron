@@ -79,10 +79,17 @@ def install_import_hook():
     import importlib.util
     import sys
 
-    if os.environ.get("MOSHI_FRAMESYNC", "0") != "1":
+    if os.environ.get("MOSHI_FRAMESYNC", "0") != "1" and not os.environ.get("MOSHI_PHASES"):
         return
+
+    def _all(mod):
+        if os.environ.get("MOSHI_FRAMESYNC", "0") == "1":
+            _patch(mod)
+        if os.environ.get("MOSHI_PHASES"):
+            from .phases import install as _ph
+            _ph()
     if "vllm.v1.engine.core" in sys.modules:
-        _patch(sys.modules["vllm.v1.engine.core"])
+        _all(sys.modules["vllm.v1.engine.core"])
         return
 
     class _Finder(importlib.abc.MetaPathFinder):
@@ -98,7 +105,7 @@ def install_import_hook():
             def exec_module(module):
                 orig_exec(module)
                 try:
-                    _patch(module)
+                    _all(module)
                 except Exception as e:  # noqa: BLE001
                     sys.stderr.write(f"[MoshiFS] patch failed: {e}\n")
             spec.loader.exec_module = exec_module

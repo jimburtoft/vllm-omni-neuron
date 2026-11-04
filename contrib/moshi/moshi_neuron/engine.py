@@ -155,6 +155,9 @@ class MoshiStage0:
         """smallest context bucket whose table covers every active row's window: ofs + (t - s0) + 1 < ctx"""
         if len(self.ctx_buckets) == 1:
             return self.ctx_buckets[0]
+        if getattr(self, "force_ctx", None) is not None:   # warmup: compile / load every ctx bucket graph
+            self.last_ctx = self.force_ctx
+            return self.force_ctx
         lm = self.lm
         W, blk = lm.cfg.context - 1, lm.BLK
         t = torch.where(reset, torch.zeros_like(self.lm_frames), self.lm_frames)[:Bb]
@@ -307,20 +310,27 @@ class MoshiStage0:
                 rows = torch.arange(q, Bb, tp) if self.interleave else torch.arange(q * self.Bl, (q + 1) * self.Bl)
                 full[rows] = pcm_all[q * nb:(q + 1) * nb]
             return full
+        _pt0 = time.perf_counter()
         if bool(ready[sel].any()):
             pcm = self.mimi_dec.decode(out[sel, 1:].clamp(min=0), reset=dreset[sel], active=ready[sel]).cpu()
         else:
             pcm = torch.zeros(sel.numel(), FRAME)
+        _pt1 = time.perf_counter()
         if tp > 1:
             import torch.distributed as dist
             if r == 0:
                 parts = [torch.empty_like(pcm) for _ in range(tp)]
                 dist.gather(pcm, parts, dst=0)
+                _pt2 = time.perf_counter()
                 full = torch.zeros(self.B, FRAME)
                 for q in range(tp):
                     rows = torch.arange(q, Bb, tp) if self.interleave else torch.arange(q * self.Bl, (q + 1) * self.Bl)
                     full[rows] = parts[q]
                 pcm = full
+                if self._prof:
+                    for k, v in (("dec_dev", _pt1 - _pt0), ("dec_gather_wait", _pt2 - _pt1),
+                                 ("dec_assemble", time.perf_counter() - _pt2)):
+                        self._pt[k] = self._pt.get(k, 0.0) + v
             else:
                 dist.gather(pcm, None, dst=0)
                 pcm = torch.zeros(self.B, FRAME)
