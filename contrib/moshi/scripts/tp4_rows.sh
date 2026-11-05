@@ -12,7 +12,7 @@ sf.write('/home/ubuntu/q.wav', np.load('/home/ubuntu/goldens/clip_utt2.npy'), 24
 R=~/runs/$TAG; mkdir -p $R
 MOSHI_B=${MOSHI_B:-32} MOSHI_TP0=4 MOSHI_DEV0=0,1,2,3 MOSHI_DEV1=0 MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 \
   python -m moshi_neuron.serving.make_deploy $R/deploy.yaml > /dev/null || exit 1
-export MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 MOSHI_BUCKETS=${MOSHI_BUCKETS:-1,2,4,8,16,24,32} MOSHI_CTX_BUCKETS=512,1024,2048 \
+export MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 MOSHI_BUCKETS=${MOSHI_BUCKETS:-1,2,4,8,16,24,32} MOSHI_CTX_BUCKETS=${MOSHI_CTX_BUCKETS:-512,1024,2048} \
   MOSHI_NC_COUNT=4 MOSHI_STEP_STATS=1 MOSHI_TRACE=$R/trace MOSHI_PHASES=${MOSHI_PHASES-$R/ph} MOSHI_PARTS=${MOSHI_PARTS-1} MOSHI_CONS_LOG=${MOSHI_CONS_LOG-1}
 MOSHI_DEP_SHARD=${MOSHI_DEP_SHARD:-1} nohup python -m moshi_neuron.serving.serve_launcher serve kyutai/moshiko-pytorch-bf16 \
   --deploy-config $R/deploy.yaml --port 8000 --omni --init-timeout 10800 --stage-init-timeout 10800 > $R/serve.log 2>&1 &

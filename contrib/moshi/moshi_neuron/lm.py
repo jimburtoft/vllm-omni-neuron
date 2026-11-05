@@ -478,25 +478,33 @@ class MoshiLM(nn.Module):
         tout = tout[:, 0]
         din = F.linear(tout, self.dep_in.view(-1, self.dep_in.shape[-1])).view(B, Q, -1)
         prev = self._lookup(self.dep_text_emb, text)
-        kc = torch.zeros(NL, B, Q, dd, dtype=self.dtype, device=tout.device)
-        vc = torch.zeros(NL, B, Q, dd, dtype=self.dtype, device=tout.device)
+        NS = max(Q, int(os.environ.get("MOSHI_DEP_STEPS", str(Q))))   # PersonaPlex perf proxy (see depformer())
+        kc = torch.zeros(NL, B, NS, dd, dtype=self.dtype, device=tout.device)
+        vc = torch.zeros(NL, B, NS, dd, dtype=self.dtype, device=tout.device)
         codes, logits_all = [], []
+        extra = None
         k = self._dep_k[self._dep_grid]
-        for s in range(Q):
+        for s_ in range(NS):
+            s = s_ % Q
             x = (din[:, s] + prev).to(self.dtype).contiguous()
             y, kn, vn = k(x, kc, vc, self.dn_wqkv[s], self.dn_wo[s], self.dn_wg[s], self.dn_wu[s], self.dn_wd[s],
-                          self.dn_n1, self.dn_n2, s, cfg.eps, 2)
-            if s + 1 < Q:
-                kc = torch.cat([kc[:, :, :s], kn.unsqueeze(2), kc[:, :, s + 1:]], 2)
-                vc = torch.cat([vc[:, :, :s], vn.unsqueeze(2), vc[:, :, s + 1:]], 2)
+                          self.dn_n1, self.dn_n2, s_, cfg.eps, 3)
+            if s_ + 1 < NS:
+                kc = torch.cat([kc[:, :, :s_], kn.unsqueeze(2), kc[:, :, s_ + 1:]], 2)
+                vc = torch.cat([vc[:, :, :s_], vn.unsqueeze(2), vc[:, :, s_ + 1:]], 2)
             lg = F.linear(y, self.dep_heads[s]).float()
-            logits_all.append(lg)
             c = sample(lg, gumbel_audio[:, s], temp, top_k)
-            if force_audio is not None:
-                c = torch.where(use_force, force_audio[:, s], c)
-            codes.append(c)
-            if s + 1 < Q:
-                prev = self._lookup(self.dep_emb[s], c)
+            if s_ < Q:
+                logits_all.append(lg)
+                if force_audio is not None:
+                    c = torch.where(use_force, force_audio[:, s], c)
+                codes.append(c)
+            else:
+                extra = c if extra is None else extra + c
+            if s_ + 1 < NS:
+                prev = self._lookup(self.dep_emb[min(s, Q - 2)], c)
+        if extra is not None:
+            codes[-1] = codes[-1] + (extra < 0).to(codes[-1].dtype)
         return torch.stack(codes, 1), torch.stack(logits_all, 1)
 
     # ---------------------------------------------------------------- depformer
@@ -518,15 +526,21 @@ class MoshiLM(nn.Module):
         if self.dep_in_fused:
             # all 8 per-step input projections read the same transformer output: one [8*1024, 4096] matmul
             din = F.linear(tout, self.dep_in.view(-1, self.dep_in.shape[-1])).view(B, cfg.dep_q, -1)
-        for s in range(cfg.dep_q):
+        # MOSHI_DEP_STEPS=16: PersonaPlex-shaped PERF PROXY (PersonaPlex dep_q=16: 8 agent + 8 user codebooks predicted,
+        # only the first 8 vocoded; its loader copies weights 0..7 -> 8..15). Steps >= dep_q reuse weight set s % dep_q
+        # and are discarded -- cost matches PersonaPlex, outputs beyond step dep_q are not meaningful.
+        NS = max(cfg.dep_q, int(os.environ.get("MOSHI_DEP_STEPS", str(cfg.dep_q))))
+        extra = None
+        for s_ in range(NS):
+            s = s_ % cfg.dep_q
             x = ((din[:, s] if self.dep_in_fused else F.linear(tout, self.dep_in[s])) + prev).view(B, 1, -1)
             for i, l in enumerate(self.dep_layers):
                 h = rms_f32(x, l["n1"], cfg.eps)
                 q, k, v = F.linear(h, l["wqkv"][s]).view(B, 1, 3, Hd, Dd).permute(2, 0, 3, 1, 4)
                 ks[i].append(k)
                 vs[i].append(v)
-                K = torch.cat(ks[i], 2) if s else k
-                V = torch.cat(vs[i], 2) if s else v
+                K = torch.cat(ks[i], 2) if s_ else k
+                V = torch.cat(vs[i], 2) if s_ else v
                 sc = (q @ K.transpose(-1, -2)).float() * (Dd ** -0.5)
                 o = (torch.softmax(sc, -1).to(V.dtype) @ V).transpose(1, 2).reshape(B, 1, -1)
                 x = x + F.linear(o, l["wo"][s])
@@ -534,13 +548,19 @@ class MoshiLM(nn.Module):
                 gu = F.linear(h, l["win"][s]).view(B, 1, 2, -1)
                 x = x + F.linear(F.silu(gu[..., 0, :]) * gu[..., 1, :], l["wout"][s])
             lg = F.linear(x[:, 0], self.dep_heads[s]).float()  # [B,2048]
-            logits_all.append(lg)
             c = sample(lg, gumbel_audio[:, s], temp, top_k)
-            if force_audio is not None:
-                c = torch.where(use_force, force_audio[:, s], c)
-            codes.append(c)
-            if s + 1 < cfg.dep_q:
-                prev = self._lookup(self.dep_emb[s], c)
+            if s_ >= cfg.dep_q:
+                extra = c if extra is None else extra + c
+            if s_ < cfg.dep_q:
+                logits_all.append(lg)
+                if force_audio is not None:
+                    c = torch.where(use_force, force_audio[:, s], c)
+                codes.append(c)
+            if s_ + 1 < NS:
+                prev = self._lookup(self.dep_emb[min(s, cfg.dep_q - 2)], c)
+        if extra is not None:
+            # keep the proxy steps live (codes >= 0, so this adds 0, but the compiler cannot prove it)
+            codes[-1] = codes[-1] + (extra < 0).to(codes[-1].dtype)
         return torch.stack(codes, 1), torch.stack(logits_all, 1)
 
 

@@ -46,7 +46,7 @@ def main():
     B, s, eps = int(os.environ.get("B", "4")), int(os.environ.get("S", "3")), 1e-8
     r = lambda *sh, sc=0.02: bf(rng.standard_normal(sh).astype(np.float32) * sc)
     x = r(B, D, sc=1.0)
-    kc, vc = r(L, B, 8, D, sc=1.0), r(L, B, 8, D, sc=1.0)
+    QN = int(os.environ.get("Q", "8")); kc, vc = r(L, B, QN, D, sc=1.0), r(L, B, QN, D, sc=1.0)
     wqkvT, woT = r(L, D, 3 * D), r(L, D, D)
     wgT, wuT, wdT = r(L, D, FF), r(L, D, FF), r(L, FF, D)
     n1 = (1 + 0.1 * rng.standard_normal((L, D))).astype(np.float32)

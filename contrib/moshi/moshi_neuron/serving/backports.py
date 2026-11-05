@@ -151,6 +151,13 @@ def _patch_pipeline_processor():
 
 def apply():
     applied = []
+    if os.environ.get("MOSHI_FAST_APPEND", "0") == "1":
+        try:
+            from .phases import install_fast_append
+            if install_fast_append():
+                applied.append("async_omni_engine:fast-append")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"fast append failed: {e!r}")
     if os.environ.get("MOSHI_CONS_FIX", "0") == "1":
         try:
             from .phases import install_consolidate_fix

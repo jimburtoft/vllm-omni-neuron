@@ -180,3 +180,88 @@ def install_consolidate_fix():
 
     mo._consolidate_tensor_list = cons
     return True
+
+
+def install_fast_append():
+    """MOSHI_FAST_APPEND=1 (API-server process), 0.29 analog of vllm-omni PR #9491 (submit without thread offload).
+
+    Stock 0.29 `AsyncOmniEngine.append_duplex_input_async` runs every 80 ms frame of every session through
+    `loop.run_in_executor` -> `DuplexControlClient.execute` -> janus sync put -> blocking wait on a per-call
+    queue.Queue filled by the RPC result router thread (two thread handoffs per frame, GIL ping-pong with the
+    orchestrator thread). Here the event-loop thread enqueues directly (non-blocking janus put) and awaits an
+    asyncio future that the router thread resolves via call_soon_threadsafe. Same message, same post-processing
+    (DuplexControlClient over a pre-resolved transport), same errors."""
+    import asyncio
+    import uuid
+    from vllm_omni.engine import async_omni_engine as aoe
+    from vllm_omni.engine.duplex.control_client import DuplexControlClient
+    from vllm_omni.engine.duplex.messages import AppendDuplexInputMessage
+    E = aoe.AsyncOmniEngine
+    if getattr(E, "_moshi_fa", False):
+        return False
+    E._moshi_fa = True
+    orig = E.append_duplex_input_async
+
+    class _FutWaiter:
+        __slots__ = ("loop", "fut")
+
+        def __init__(self, loop, fut):
+            self.loop, self.fut = loop, fut
+
+        def put_nowait(self, m):
+            def _set():
+                if not self.fut.done():
+                    self.fut.set_result(m)
+            self.loop.call_soon_threadsafe(_set)
+
+    class _Pre:
+        def __init__(self, result):
+            self.result = result
+
+        def execute(self, key, message, *, timeout=None, timeout_message="", block_on_submit=False):
+            return self.result
+
+    async def append_async(self, session_id, *, mode, payload, operation_id=None, final=False, expected_epoch=None,
+                           fence, timeout=10.0):
+        rpc = getattr(self, "_correlated_rpc_client", None)
+        router = getattr(rpc, "_router", None)
+        if router is None or (expected_epoch is not None and expected_epoch != fence.epoch):
+            return await orig(self, session_id, mode=mode, payload=payload, operation_id=operation_id, final=final,
+                              expected_epoch=expected_epoch, fence=fence, timeout=timeout)
+        cid = uuid.uuid4().hex
+        msg = AppendDuplexInputMessage(control_id=cid, operation_id=operation_id, fence=fence, session_id=session_id,
+                                       expected_epoch=expected_epoch, mode=mode, payload=payload, final=final)
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        key = ("duplex", cid)
+        w = _FutWaiter(loop, fut)
+        with router._lock:
+            if router._terminal_error is not None:
+                raise RuntimeError(router._terminal_error.error)
+            router._pending[key] = w
+        try:
+            try:
+                self.request_queue.sync_q.put_nowait(msg)
+            except Exception:  # queue full: fall back to the blocking path off the loop
+                with router._lock:
+                    router._pending.pop(key, None)
+                return await orig(self, session_id, mode=mode, payload=payload, operation_id=operation_id,
+                                  final=final, expected_epoch=expected_epoch, fence=fence, timeout=timeout)
+            try:
+                result = await asyncio.wait_for(fut, timeout)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(f"duplex control timed out after {timeout} seconds") from exc
+        finally:
+            with router._lock:
+                if router._pending.get(key) is w:
+                    router._pending.pop(key, None)
+        from vllm_omni.engine.messages import ErrorMessage
+        if isinstance(result, ErrorMessage):
+            raise RuntimeError(result.error)
+        # reuse the stock post-processing (fence check, result dict, error raising) with the same control id
+        return DuplexControlClient(_Pre(result), control_id_factory=lambda: cid).append(
+            session_id, mode=mode, payload=payload, operation_id=operation_id, final=final,
+            expected_epoch=expected_epoch, fence=fence, timeout=timeout)
+
+    E.append_duplex_input_async = append_async
+    return True

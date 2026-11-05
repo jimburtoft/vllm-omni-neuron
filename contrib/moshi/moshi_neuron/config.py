@@ -20,7 +20,8 @@ class LMConfig:
     num_heads: int = 32
     num_layers: int = 32
     hidden: int = 11264  # gated FFN hidden (2/3 of 4.125*dim)
-    context: int = 3000
+    # attended window in frames (moshiko trained 3000; the reference serving setup uses a 1500-frame sliding window)
+    context: int = int(os.environ.get("MOSHI_CONTEXT", "3000"))
     text_card: int = 32000
     card: int = 2048
     n_q: int = 16

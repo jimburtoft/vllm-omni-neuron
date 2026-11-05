@@ -45,6 +45,7 @@ P = 128
 DC = D // P            # 8 chunks of the model dim
 FC = (FF + P - 1) // P  # 22 chunks of the FFN dim (2816 = 22 * 128)
 NMAX = 512
+QMAX = 16             # max depformer positions per frame (moshiko 8, PersonaPlex 16)
 
 
 def _rms_T(dstT, srcT, w_sb, B, eps):
@@ -100,7 +101,7 @@ def _transpose_to_T(dstT, src, B, nchunks):
 
 
 @nki.jit
-def depformer_step(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps, ver=2):
+def depformer_step(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps, ver=3):
     # `ver`: lite's NKI cache keys on this top-level source + args only -- bump it when a helper changes.
     B = x.shape[0]
     y = nl.ndarray((B, D), dtype=nl.bfloat16, buffer=nl.shared_hbm)
@@ -132,8 +133,8 @@ def depformer_step(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps, ver=2):
         nisa.dma_copy(dst=v_new[l, 0:B, 0:D], src=vb)
         # scores over positions 0..s: elementwise on [B, D] tiles, per-head sums on the free axis
         npos = s + 1
-        sc = nl.ndarray((B, NH, 8), dtype=nl.float32, buffer=nl.sbuf)
-        vall = nl.ndarray((B, 8, D), dtype=nl.float32, buffer=nl.sbuf)
+        sc = nl.ndarray((B, NH, QMAX), dtype=nl.float32, buffer=nl.sbuf)
+        vall = nl.ndarray((B, QMAX, D), dtype=nl.float32, buffer=nl.sbuf)
         for j in range(npos):
             kj = nl.ndarray((B, D), dtype=nl.float32, buffer=nl.sbuf)
             if j < s:
@@ -152,7 +153,7 @@ def depformer_step(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps, ver=2):
         # softmax over j (scale 1/8)
         mx = nl.ndarray((B, NH), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_reduce(dst=mx, data=sc[:, :, 0:npos], op=nl.maximum, axis=(2,))
-        ex = nl.ndarray((B, NH, 8), dtype=nl.float32, buffer=nl.sbuf)
+        ex = nl.ndarray((B, NH, QMAX), dtype=nl.float32, buffer=nl.sbuf)
         for j in range(npos):
             dj = nl.ndarray((B, NH), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_tensor(dst=dj, data1=sc[:, :, j], data2=mx, op=nl.subtract)
