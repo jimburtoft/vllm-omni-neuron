@@ -68,7 +68,7 @@ def test_client_hook():
     p._moshi_flush = lambda: calls.append(1)
 
     async def go():
-        for t in ("input_audio_buffer.append", "conversation.item.retrieve"):
+        for t in ("input_audio_buffer.append", "session.event_ack", "playback.ack", "conversation.item.retrieve"):
             try:
                 await p._to_duplex_event({"type": t, "audio": "", "item_id": "x"})
             except Exception:  # noqa: BLE001
@@ -78,4 +78,4 @@ def test_client_hook():
 
 
 if __name__ == "__main__" and os.environ.get("HOOK") == "1":
-    print("flush calls for [append, retrieve]:", len(test_client_hook()))
+    print("flush calls for [append, event_ack, playback.ack, retrieve] (expect 1):", len(test_client_hook()))

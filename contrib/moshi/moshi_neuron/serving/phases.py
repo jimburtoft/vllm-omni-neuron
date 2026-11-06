@@ -354,7 +354,9 @@ def install_realtime_marks_fix():
             def _needs(a, k):
                 ev = a[0] if a and isinstance(a[0], dict) else k.get("event")
                 t = ev.get("type") if isinstance(ev, dict) else None
-                return not (isinstance(t, str) and t.startswith("input_audio_buffer."))
+                # per-frame / per-event client traffic that never reads conversation items
+                return not (isinstance(t, str) and (t.startswith("input_audio_buffer.") or t in (
+                    "session.event_ack", "playback.ack", "session.heartbeat")))
             if __import__("inspect").iscoroutinefunction(fn):
                 async def w(self, *a, **k):
                     f = getattr(self, "_moshi_flush", None)
