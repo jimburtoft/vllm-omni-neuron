@@ -29,9 +29,13 @@ def main():
                 act = torch.zeros(Bmax, dtype=torch.bool); act[:B] = True
                 s0.force_ctx = c
                 for _ in range(5): s0.step(x, act)
+                s0._prof = os.environ.get("MOSHI_PARTS", "0") == "1"; s0._pt = {}; s0._pn = 0
                 t0 = time.perf_counter()
                 for _ in range(N): s0.step(x, act)
                 res[(B, c)] = (time.perf_counter() - t0) / N * 1e3
+                if rank == 0 and s0._prof:
+                    print(f"PARTS B={B}: " + str({k: round(v / N * 1e3, 2) for k, v in s0._pt.items()}), flush=True)
+                s0._prof = False
                 s0.reset(range(Bmax))
             s0.force_ctx = None
     if rank == 0:

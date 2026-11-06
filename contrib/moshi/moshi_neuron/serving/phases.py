@@ -265,3 +265,108 @@ def install_fast_append():
 
     E.append_duplex_input_async = append_async
     return True
+
+
+def install_realtime_marks_fix():
+    """MOSHI_MARKS_FIX=1 (API-server process): O(1)-per-frame response bookkeeping in vLLM-Omni's realtime output
+    projector (0.29 entrypoints/duplex/realtime_output.py). Stock code does, for EVERY audio delta of a session:
+      - _remember_response_audio_metadata: list(all marks) + extend + dict-dedupe + full sort  -> O(n log n)
+      - _refresh_in_progress_response_item (up to twice): rebuilds the in-progress conversation item with a dict copy
+        of every mark and "".join(all transcript parts)                                       -> O(n)
+    i.e. quadratic in session length on the single API event-loop thread (60 -> 75% CPU over a 60 s session).
+    Fix: marks are appended in order when monotonic (the normal case: each frame's marks end later than the last);
+    the full merge/sort runs only when a mark arrives out of order. The in-progress item refresh is deferred: the
+    item is marked dirty and rebuilt only when something reads it (conversation.item.retrieve / truncate / done)."""
+    from vllm_omni.entrypoints.duplex import realtime_output as ro
+    P = ro.RealtimeOutputProjector
+    if getattr(P, "_moshi_mf", False):
+        return False
+    P._moshi_mf = True
+    orig_remember = P._remember_response_audio_metadata
+    orig_refresh = P._refresh_in_progress_response_item
+
+    def remember(self, response_id, event):
+        state = self._response_state(response_id)
+        if state is None:
+            return
+        marks = event.get("audio_text_marks")
+        if not isinstance(marks, list) or not marks:
+            return orig_remember(self, response_id, event)
+        clean = []
+        for m in marks:
+            if not isinstance(m, dict):
+                continue
+            tc = m.get("text_chars")
+            ae = m.get("audio_end_ms", m.get("audio_ms"))
+            if not isinstance(tc, int | float) or not isinstance(ae, int | float):
+                continue
+            clean.append({"text_chars": max(0, int(tc)), "audio_end_ms": max(0, int(ae))})
+        cur = state.audio_text_marks
+        last = (cur[-1]["audio_end_ms"], cur[-1]["text_chars"]) if cur else (-1, -1)
+        keys = [(c["audio_end_ms"], c["text_chars"]) for c in clean]
+        if clean and all(k > last for k in keys) and keys == sorted(set(keys)):
+            # fast path: strictly after the last stored mark, sorted, unique -> same result as merge+dedupe+sort
+            duration = event.get("audio_duration_ms")
+            playback = event.get("playback")
+            if not isinstance(duration, int | float) and isinstance(playback, dict):
+                duration = playback.get("sent_ms") or playback.get("generated_ms")
+            if isinstance(duration, int | float):
+                state.audio_duration_ms = max(state.audio_duration_ms or 0, int(duration))
+            cur.extend(clean)
+            return
+        return orig_remember(self, response_id, event)
+
+    def refresh(self, response_id):
+        d = self.__dict__.setdefault("_moshi_dirty", set())
+        d.add(response_id)
+
+    def _flush(self):
+        d = self.__dict__.get("_moshi_dirty")
+        if d:
+            for rid in list(d):
+                orig_refresh(self, rid)
+            d.clear()
+
+    P._remember_response_audio_metadata = remember
+    P._refresh_in_progress_response_item = refresh
+    P._moshi_flush = _flush
+    # Every projected event except an audio delta sees an up-to-date item (done / item events / transcript etc.).
+    orig_from = P._from_duplex_event
+
+    _cheap = {"response.output_audio.delta", "response.text.delta", "playback.acknowledged",
+              "input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped"}
+
+    def from_event(self, event):
+        if not (isinstance(event, dict) and event.get("type") in _cheap):
+            _flush(self)
+        return orig_from(self, event)
+    P._from_duplex_event = from_event
+    # Client-side reads of conversation items (retrieve / truncate) go through the input translator, which is a
+    # mixin of the same session object in 0.29: flush before handling any client realtime event.
+    from vllm_omni.entrypoints.duplex import realtime_input as ri
+    T = ri.RealtimeInputTranslator
+    for name in ["_to_duplex_event"]:
+        fn = getattr(T, name)
+
+        def mk(fn):
+            # only events that read or mutate conversation items need the deferred refresh applied first
+            # (the per-frame input_audio_buffer.append must stay O(1))
+            def _needs(a, k):
+                ev = a[0] if a and isinstance(a[0], dict) else k.get("event")
+                t = ev.get("type") if isinstance(ev, dict) else None
+                return not (isinstance(t, str) and t.startswith("input_audio_buffer."))
+            if __import__("inspect").iscoroutinefunction(fn):
+                async def w(self, *a, **k):
+                    f = getattr(self, "_moshi_flush", None)
+                    if f and _needs(a, k):
+                        f()
+                    return await fn(self, *a, **k)
+            else:
+                def w(self, *a, **k):
+                    f = getattr(self, "_moshi_flush", None)
+                    if f and _needs(a, k):
+                        f()
+                    return fn(self, *a, **k)
+            return w
+        setattr(T, name, mk(fn))
+    return True

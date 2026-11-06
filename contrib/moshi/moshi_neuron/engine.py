@@ -60,7 +60,18 @@ class MoshiStage0:
         # MOSHI_ENC_ALL=1: every TP rank encodes all B rows (identical results, no host all-gather of codes, which
         # costs 10-17 ms per step through gloo while the encoder graph itself is ~2 ms)
         self.enc_all = self.tp > 1 and os.environ.get("MOSHI_ENC_ALL", "1") == "1"
-        if self.enc_all:
+        # MOSHI_ENC_SHARD=1 (with ENC_ALL layout): rank r encodes only its interleaved rows r, r+tp, ... and the codes
+        # are all-gathered INSIDE the encoder graph (no gloo); every rank then holds all codes as with ENC_ALL.
+        self.enc_shard = self.enc_all and os.environ.get("MOSHI_ENC_SHARD", "0") == "1"
+        if self.enc_shard:
+            self.mimi = MimiStreaming(mimi_path, self.Bl, device, dtype=mimi_dtype, compile_fn=lambda m: m,
+                                      decoder=False)
+            self._encgather = {}
+            self._cf_enc = cf
+            self.mimi_dec = (MimiStreaming(mimi_path, self.Bl, device, dtype=mimi_dtype, compile_fn=cf, encoder=False)
+                             if self.decode_here else None)
+            self.interleave = True
+        elif self.enc_all:
             self.mimi = MimiStreaming(mimi_path, B, device, dtype=mimi_dtype, compile_fn=cf, decoder=False)
             self.mimi_dec = (MimiStreaming(mimi_path, self.Bl, device, dtype=mimi_dtype, compile_fn=cf, encoder=False)
                              if self.decode_here else None)
@@ -203,7 +214,26 @@ class MoshiStage0:
         reset = (self.nseen == 0) & active
         if self.fuse_enc:
             return self._step_fused(pcm_in, active, Bb, mreset, reset, t0)
-        if self.enc_all:
+        if self.enc_shard and Bb >= self.tp:
+            tp, r = self.tp, self.rank
+            sel = torch.arange(r, Bb, tp)
+            g = self._encgather.get(Bb)
+            if g is None:
+                g = self._encgather[Bb] = self._cf_enc(_EncGather(self.mimi.enc))
+            dv = self.device
+            cg = g(pcm_in[sel].to(dv).view(sel.numel(), 1, -1), mreset[sel].to(dv), active[sel].to(dv))
+            self._tick("enc_call")
+            cg = cg.cpu()                                               # [tp * Bb/tp, 8] rank-major
+            nb = sel.numel()
+            codes = torch.zeros(Bb, cg.shape[1], dtype=cg.dtype)
+            for q in range(tp):
+                codes[torch.arange(q, Bb, tp)] = cg[q * nb:(q + 1) * nb]
+            self._tick("enc_d2h")
+        elif self.enc_shard:
+            # tiny buckets (< tp rows): every rank encodes all of them through the same per-rank-state graph is not
+            # possible (state rows are per-rank); fall back to rank-local rows 0..Bb-1 is wrong -> require Bb >= tp
+            raise RuntimeError("MOSHI_ENC_SHARD needs batch buckets >= TP")
+        elif self.enc_all:
             codes = self.mimi.encode(pcm_in[:Bb], reset=mreset[:Bb], active=active[:Bb])
             self._tick("enc_call")
             codes = codes.cpu()
@@ -339,6 +369,20 @@ class MoshiStage0:
             full[sel] = pcm
             pcm = full
         return pcm
+
+
+class _EncGather(torch.nn.Module):
+    """Mimi encoder for this rank's rows + in-graph all-gather of the codes across TP ranks."""
+
+    def __init__(self, enc):
+        super().__init__()
+        self.enc = enc
+
+    def forward(self, pcm, reset, active):
+        import torch.distributed as dist
+        from torch.distributed._functional_collectives import all_gather_tensor
+        codes = self.enc(pcm, reset, active)                            # [Bl, 8]
+        return all_gather_tensor(codes.contiguous(), gather_dim=0, group=dist.group.WORLD)
 
 
 class _DecGather(torch.nn.Module):

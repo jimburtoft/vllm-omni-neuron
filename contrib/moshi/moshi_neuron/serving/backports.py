@@ -151,6 +151,29 @@ def _patch_pipeline_processor():
 
 def apply():
     applied = []
+    if os.environ.get("MOSHI_WS_NO_DEFLATE", "0") == "1":
+        # permessage-deflate on every 80 ms audio delta was ~13% of the API event-loop thread at 28 sessions;
+        # PCM barely compresses and the bandwidth is small (~64 KB/s per session base64), so do not negotiate it.
+        try:
+            import uvicorn.config as _uc
+            _orig_init = _uc.Config.__init__
+
+            def _init(self, *a, **k):
+                k["ws_per_message_deflate"] = False
+                _orig_init(self, *a, **k)
+            if not getattr(_uc.Config, "_moshi_nd", False):
+                _uc.Config.__init__ = _init
+                _uc.Config._moshi_nd = True
+                applied.append("uvicorn:ws-no-deflate")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"ws no-deflate failed: {e!r}")
+    if os.environ.get("MOSHI_MARKS_FIX", "0") == "1":
+        try:
+            from .phases import install_realtime_marks_fix
+            if install_realtime_marks_fix():
+                applied.append("realtime_output:marks-fix")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"marks fix failed: {e!r}")
     if os.environ.get("MOSHI_FAST_APPEND", "0") == "1":
         try:
             from .phases import install_fast_append

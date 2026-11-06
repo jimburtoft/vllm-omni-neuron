@@ -490,6 +490,7 @@ class MoshiLM(nn.Module):
         din = F.linear(tout, self.dep_in.view(-1, self.dep_in.shape[-1])).view(B, Q, -1)
         prev = self._lookup(self.dep_text_emb, text)
         NS = max(Q, int(os.environ.get("MOSHI_DEP_STEPS", str(Q))))   # PersonaPlex perf proxy (see depformer())
+        NS = min(NS, int(os.environ.get("MOSHI_DEP_RUN", str(NS))))
         kc = torch.zeros(NL, B, NS, dd, dtype=self.dtype, device=tout.device)
         vc = torch.zeros(NL, B, NS, dd, dtype=self.dtype, device=tout.device)
         codes, logits_all = [], []
@@ -541,6 +542,11 @@ class MoshiLM(nn.Module):
         # only the first 8 vocoded; its loader copies weights 0..7 -> 8..15). Steps >= dep_q reuse weight set s % dep_q
         # and are discarded -- cost matches PersonaPlex, outputs beyond step dep_q are not meaningful.
         NS = max(cfg.dep_q, int(os.environ.get("MOSHI_DEP_STEPS", str(cfg.dep_q))))
+        # MOSHI_DEP_RUN=N (<= NS): only the first N depformer steps are computed. For PersonaPlex (16 steps: 8 agent +
+        # 8 user codebooks) N=8 skips the user-stream predictions -- at inference the user codes are always provided
+        # by the encoder (the reference overwrites them via `provided`), so steps 8..15 only feed their own successors
+        # and never reach any output. Steps 0..7 are unchanged (causal: step s attends to steps <= s).
+        NS = min(NS, int(os.environ.get("MOSHI_DEP_RUN", str(NS))))
         extra = None
         for s_ in range(NS):
             s = s_ % cfg.dep_q
