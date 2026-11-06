@@ -372,3 +372,150 @@ def install_realtime_marks_fix():
             return w
         setattr(T, name, mk(fn))
     return True
+
+
+def install_snapshot_fix():
+    """MOSHI_SNAP_FIX=1 (stage-0 engine-core process): vllm-omni's chunk adapter snapshots the stage-0 Request for
+    every 80 ms frame before handing it to the custom stage processor (`_snapshot_processor_request`), copying
+    `_all_token_ids` / `_output_token_ids` (one token per frame for the whole session -> O(session length) per
+    frame, quadratic per session) and deep-copying `additional_information`. Our PCM pass-through processor
+    (MOSHI_S0_DECODE=1, processors.pcm_passthrough_async_chunk) reads only `additional_information` (this frame's
+    PCM + text token, replaced every step) and `resumable`, so the snapshot keeps those and shares the token lists
+    read-only."""
+    if os.environ.get("MOSHI_S0_DECODE", "0") != "1":
+        return False
+    from vllm_omni.distributed.omni_connectors.transfer_adapter import chunk_transfer_adapter as cta
+    A = cta.OmniChunkTransferAdapter
+    if getattr(A, "_moshi_sf", False):
+        return False
+    A._moshi_sf = True
+    import copy as _copy
+
+    def snap(request):
+        s = _copy.copy(request)
+        ai = getattr(request, "additional_information", None)
+        if isinstance(ai, dict):
+            s.additional_information = dict(ai)
+        return s
+
+    A._snapshot_processor_request = staticmethod(snap)
+    return True
+
+
+def install_stage_events_cap():
+    """MOSHI_STAGE_EVENTS_CAP=N (API-server process): vllm-omni's OrchestratorAggregator appends one
+    StageRequestStats (+ StageStats) per 80 ms frame to stage_events[request_id] for the whole duplex session and
+    never trims it (the resumable duplex request never finishes) -- ~24k objects/30 s at 32 sessions, the API server's
+    RSS grows ~4 MB/s. All per-frame readers read `stage_events[rid][cursor:]` where cursor was taken at the start
+    of the current append (DuplexRequestClient.append -> stage_event_cursor), i.e. only the newest few events. Keep
+    the last N per request; the cursor is rebased by remembering how many were dropped."""
+    from vllm_omni.metrics import stats as st
+    A = st.OrchestratorAggregator
+    if getattr(A, "_moshi_cap", False):
+        return False
+    A._moshi_cap = True
+    cap = int(os.environ.get("MOSHI_STAGE_EVENTS_CAP", "64"))
+
+    class _Capped(list):
+        """list whose logical indices keep growing while only the tail is stored: len() and slices [c:] are in
+        logical coordinates, so `cursor = len(x)` then `x[cursor:]` works as with the full list."""
+        __slots__ = ("dropped",)
+
+        def __init__(self, *a):
+            super().__init__(*a)
+            self.dropped = 0
+
+        def append(self, v):
+            super().append(v)
+            n = super().__len__()
+            if n > 2 * cap:
+                del self[:n - cap]  # list.__delitem__ (physical)
+                self.dropped += n - cap
+
+        def __len__(self):
+            return super().__len__() + self.dropped
+
+        def __getitem__(self, k):
+            if isinstance(k, slice) and k.step is None and (k.start is None or k.start >= 0) and k.stop is None:
+                s = (k.start or 0) - self.dropped
+                return list.__getitem__(self, slice(max(0, s), None))
+            return list.__getitem__(self, k)
+
+        def __iter__(self):
+            return list.__iter__(self)
+
+        def __bool__(self):
+            return list.__len__(self) > 0
+
+    orig_init = A.__init__
+
+    import weakref
+    live = weakref.WeakSet()
+
+    def init(self, *a, **k):
+        orig_init(self, *a, **k)
+        live.add(self)
+
+        class _D(dict):
+            def setdefault(self, key, default=None):
+                if key not in self:
+                    dict.__setitem__(self, key, _Capped(default or []))
+                return dict.__getitem__(self, key)
+        self.stage_events = _D(self.stage_events)
+
+    A.__init__ = init
+    if os.environ.get("MOSHI_STAGE_EVENTS_LOG"):
+        import sys
+        import threading
+
+        def _log():
+            while True:
+                time.sleep(float(os.environ["MOSHI_STAGE_EVENTS_LOG"]))
+                aggs = list(live)
+                stored = sum(sum(list.__len__(v) if isinstance(v, list) else 0 for v in a.stage_events.values())
+                             for a in aggs)
+                logical = sum(sum(len(v) for v in a.stage_events.values()) for a in aggs)
+                other = sum(len(getattr(a, "transfer_events", {})) + len(getattr(a, "e2e_events", []))
+                            + sum(len(v) for v in getattr(a, "accumulated_gen_time_ms", {}).values())
+                            for a in aggs)
+                sys.stderr.write(f"[MoshiSE] aggregators {len(aggs)} stage_events stored {stored} logical {logical} "
+                                 f"other {other}\n")
+        threading.Thread(target=_log, daemon=True, name="moshi-se").start()
+    return True
+
+
+def install_mark_coalesce():
+    """MOSHI_MARK_COALESCE=1 (API-server process): `DuplexSession.mark_audio_sent` appends ~2 audio/text marks per
+    80 ms frame for the whole response (kept for barge-in truncation: audio position -> transcript chars). All
+    consumers interpolate chars piecewise-linearly between consecutive marks (protocol._text_chars_for_audio_ms,
+    realtime_input._text_chars_for_audio_ms_from_marks). Marks are appended in non-decreasing audio_end_ms; for a run
+    of marks with the SAME text_chars, the interior marks change nothing except where the segment starts, so
+    keeping the first and the last of each run gives identical results at every audio position. Appended marks
+    that only extend the last run replace its last element instead of growing the list."""
+    from vllm_omni.entrypoints.duplex import protocol as pr
+    S = pr.DuplexSession
+    if getattr(S, "_moshi_mc", False):
+        return False
+    S._moshi_mc = True
+    orig = S.mark_audio_sent
+
+    def mark_audio_sent(self, duration_ms=None, *, text_chars=None, audio_text_marks=None):
+        lst = self._response.assistant_audio_text_marks
+        n0 = len(lst)
+        orig(self, duration_ms, text_chars=text_chars, audio_text_marks=audio_text_marks)
+        # coalesce the newly appended tail into the existing runs
+        i = max(0, n0)
+        while i < len(lst):
+            m = lst[i]
+            if (i >= 2 and lst[i - 1].text_chars == m.text_chars == lst[i - 2].text_chars
+                    and lst[i - 1].audio_end_ms <= m.audio_end_ms):
+                # [.., a(c), b(c), m(c)] -> [.., a(c), m(c)]: b is interior to a flat run
+                del lst[i - 1]
+                continue
+            if i >= 1 and lst[i - 1].text_chars == m.text_chars and lst[i - 1].audio_end_ms == m.audio_end_ms:
+                del lst[i]  # exact duplicate
+                continue
+            i += 1
+
+    S.mark_audio_sent = mark_audio_sent
+    return True

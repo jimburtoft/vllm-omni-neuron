@@ -84,7 +84,12 @@ async def one_session(i, args, pcm, model):
 async def main_async(args):
     pcm = load_wav(os.path.expanduser(args.wav))
     os.makedirs(args.out, exist_ok=True)
-    res = await asyncio.gather(*[one_session(i, args, pcm, args.model) for i in range(args.sessions)])
+    async def delayed(i):
+        # --stagger-s S: session i starts at i*S seconds (production-like arrivals instead of all at once)
+        if args.stagger_s > 0:
+            await asyncio.sleep(i * args.stagger_s)
+        return await one_session(i, args, pcm, args.model)
+    res = await asyncio.gather(*[delayed(i) for i in range(args.sessions)])
     import soundfile as sf
     summ = []
     for r, wav in res:
@@ -106,6 +111,7 @@ def main():
     ap.add_argument("--tail-s", type=float, default=2.0)
     ap.add_argument("--out", default="out_duplex")
     ap.add_argument("--trace", default="")
+    ap.add_argument("--stagger-s", type=float, default=0.0)
     asyncio.run(main_async(ap.parse_args()))
 
 

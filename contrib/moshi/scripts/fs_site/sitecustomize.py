@@ -52,7 +52,9 @@ if os.environ.get("MOSHI_GC_LOG") or os.environ.get("MOSHI_GC_FULL") == "0" or o
 
     gc.callbacks.append(_gc_cb)
 
-if os.environ.get("MOSHI_HEAP_LOG"):
+if os.environ.get("MOSHI_HEAP_LOG") and "serve_launcher" in open("/proc/self/cmdline", "rb").read().decode(errors="ignore"):
+    # API-server process only: a gc.get_objects() scan in a worker during torch.compile tracing broke Dynamo
+    # ("tupleobject.c: bad argument to internal function")
     # MOSHI_HEAP_LOG=<s>: every <s> seconds log the object count by type growth (top 8) for this process
     import gc as _gc
     import sys as _sys
@@ -71,3 +73,31 @@ if os.environ.get("MOSHI_HEAP_LOG"):
                                   " ".join(f"{k}:+{v}" for v, k in d if v > 0) + "\n")
             prev = c
     _th.Thread(target=_heap, daemon=True, name="moshi-heap").start()
+
+def _cmdline():
+    try:
+        return open("/proc/self/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="ignore")
+    except OSError:
+        return ""
+
+
+if os.environ.get("MOSHI_TRACEMALLOC") and "serve_launcher" in _cmdline():
+    # MOSHI_TRACEMALLOC=<s>: API-server only; every <s> seconds log the top-10 allocation sites by size growth
+    import sys as _s2
+    import threading as _t2
+    import time as _tm2
+    import tracemalloc as _tr
+    _tr.start(8)
+
+    def _tm():
+        prev = None
+        while True:
+            _tm2.sleep(float(os.environ["MOSHI_TRACEMALLOC"]))
+            snap = _tr.take_snapshot().filter_traces([_tr.Filter(False, _tr.__file__)])
+            if prev is not None:
+                top = snap.compare_to(prev, "traceback")[:6]
+                for st in top:
+                    fr = " <- ".join(f"{f.filename.split('site-packages/')[-1]}:{f.lineno}" for f in st.traceback[:5])
+                    _s2.stderr.write(f"[MoshiTM] +{st.size_diff / 1e6:.1f} MB ({st.count_diff:+d}) {fr}\n")
+            prev = snap
+    _t2.Thread(target=_tm, daemon=True, name="moshi-tm").start()

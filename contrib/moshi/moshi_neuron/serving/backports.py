@@ -151,6 +151,27 @@ def _patch_pipeline_processor():
 
 def apply():
     applied = []
+    if os.environ.get("MOSHI_MARK_COALESCE", "0") == "1":
+        try:
+            from .phases import install_mark_coalesce
+            if install_mark_coalesce():
+                applied.append("duplex_protocol:mark-coalesce")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"mark coalesce failed: {e!r}")
+    if os.environ.get("MOSHI_STAGE_EVENTS_CAP"):
+        try:
+            from .phases import install_stage_events_cap
+            if install_stage_events_cap():
+                applied.append("metrics:stage-events-cap")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"stage events cap failed: {e!r}")
+    if os.environ.get("MOSHI_SNAP_FIX", "0") == "1":
+        try:
+            from .phases import install_snapshot_fix
+            if install_snapshot_fix():
+                applied.append("chunk_transfer_adapter:light-snapshot")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"snapshot fix failed: {e!r}")
     if os.environ.get("MOSHI_WS_NO_DEFLATE", "0") == "1":
         # permessage-deflate on every 80 ms audio delta was ~13% of the API event-loop thread at 28 sessions;
         # PCM barely compresses and the bandwidth is small (~64 KB/s per session base64), so do not negotiate it.

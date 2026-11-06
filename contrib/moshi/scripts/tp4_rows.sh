@@ -23,7 +23,9 @@ for n in $NS; do
   for f in $R/trace.s0.*; do [ -f $f ] && : > $f; done
   pidstat -u -t -h 5 > $R/pidstat_$n.log 2>&1 & PS=$!
   for f in $R/ph.ec.*; do [ -f $f ] && : > $f; done
-  python -m moshi_neuron.serving.duplex_client --wav ${WAV:-$HOME/q.wav} --sessions $n --out $R/o_$n/ > $R/c_$n.log 2>&1 &
+  ( while true; do ps -eo pid,rss,args | grep -E "VLLM::|serve_launcher" | grep -v grep | awk '{print systime(), $1, $2, $3}' >> $R/rss_$n.log; sleep 10; done ) &
+  RSSP=$!
+  python -m moshi_neuron.serving.duplex_client --wav ${WAV:-$HOME/q.wav} --sessions $n --stagger-s ${STAGGER:-0} --out $R/o_$n/ > $R/c_$n.log 2>&1 &
   CL=$!
   if [ "${SPY:-0}" = "1" ]; then
     sleep ${SPY_AT:-14}
@@ -36,7 +38,7 @@ for n in $NS; do
     ps -eo pid,comm,args | grep -E "VLLM|Stage|serve_launcher" | grep -v grep > $R/ps_$n.txt
   fi
   wait $CL
-  kill $PS
+  kill $PS $RSSP 2>/dev/null
   mkdir -p $R/ph_$n; cp $R/ph.ec.* $R/ph_$n/ 2>/dev/null
   mkdir -p $R/tr_$n; cp $R/trace.s0.* $R/tr_$n/ 2>/dev/null
   python3 ~/rows.py $R $n
