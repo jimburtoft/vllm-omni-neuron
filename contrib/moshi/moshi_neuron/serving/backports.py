@@ -151,6 +151,32 @@ def _patch_pipeline_processor():
 
 def apply():
     applied = []
+    if os.environ.get("MOSHI_PCM_FAST", "0") == "1":
+        try:
+            from .audio_encoding_fast import install as _pcm
+            if _pcm():
+                applied.append("runtime_bridge:numpy-pcm16 (#8405)")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"pcm fast failed: {e!r}")
+    if os.environ.get("MOSHI_SHM_PROBE", "0") == "1":
+        try:
+            from .audio_encoding_fast import install_shm_probe as _shp
+            if _shp():
+                applied.append("shm_connector:os.access-probe (#8405)")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"shm probe failed: {e!r}")
+    if os.environ.get("MOSHI_API_TORCH_THREADS"):
+        # #8703 part 2: cap torch intra-op threads in the API process (small host tensor ops otherwise keep a large
+        # OpenMP pool spinning next to the stage processes). Only in the API-server process.
+        try:
+            if "serve_launcher" in open("/proc/self/cmdline", "rb").read().decode(errors="ignore"):
+                import torch
+                n = int(os.environ["MOSHI_API_TORCH_THREADS"])
+                if 0 < n < torch.get_num_threads():
+                    torch.set_num_threads(n)
+                    applied.append(f"api torch threads={n} (#8703)")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"api torch threads failed: {e!r}")
     if os.environ.get("MOSHI_MARK_COALESCE", "0") == "1":
         try:
             from .phases import install_mark_coalesce
