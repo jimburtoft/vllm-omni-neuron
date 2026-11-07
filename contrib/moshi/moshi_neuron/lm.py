@@ -266,8 +266,10 @@ class MoshiLM(nn.Module):
             p = f"depformer.layers.{i}."
             self.dep_layers.append(nn.ParameterDict(dict(
                 n1=P(g(p + "norm1.alpha").view(-1)), n2=P(g(p + "norm2.alpha").view(-1)),
-                wqkv=P(g(p + "self_attn.in_proj_weight").view(Q, 3 * dd, dd)),
-                wo=P(g(p + "self_attn.out_proj.weight").view(Q, dd, dd)),
+                # PersonaPlex checkpoints hold 16 weight sets per depformer layer (8 agent + 8 user codebooks); the
+                # agent half (sets 0..dep_q-1) is all the 8-codebook depformer needs (MOSHI_DEP_RUN semantics)
+                wqkv=P(g(p + "self_attn.in_proj_weight").view(-1, 3 * dd, dd)[:Q]),
+                wo=P(g(p + "self_attn.out_proj.weight").view(-1, dd, dd)[:Q]),
                 win=P(torch.stack([g(p + f"gating.{k}.linear_in.weight") for k in range(Q)])),
                 wout=P(torch.stack([g(p + f"gating.{k}.linear_out.weight") for k in range(Q)])))))
         self.onehot_emb = os.environ.get("MOSHI_ONEHOT_EMB", "0") == "1"
