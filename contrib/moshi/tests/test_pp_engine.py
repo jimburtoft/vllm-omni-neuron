@@ -17,9 +17,14 @@ if __name__ == "__main__":
     B = int(os.environ.get("B", "2"))
     s0 = MoshiStage0(B=B, device=dev, compile_fn=compile_fn(), greedy=True, seed=0)
     s0.reset(range(B))
-    P = s0.prefill_prompt(0, g["voice"], g["prompt"])
-    print("prompt steps", P, flush=True)
     act = torch.zeros(B, dtype=torch.bool); act[0] = True
+    if os.environ.get("QUEUED", "0") == "1":
+        P = s0.start_prompt(0, g["voice"], g["prompt"])
+        while s0.prompting(0):
+            s0.step(torch.zeros(B, 1920), act)
+    else:
+        P = s0.prefill_prompt(0, g["voice"], g["prompt"])
+    print("prompt steps", P, "queued" if os.environ.get("QUEUED") == "1" else "inline", flush=True)
     T = g["tokens"].shape[0]
     ours = []
     for t in range(T):

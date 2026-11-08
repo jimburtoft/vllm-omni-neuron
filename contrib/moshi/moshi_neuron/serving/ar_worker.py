@@ -103,6 +103,15 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                 self.s0.force_ctx = c if len(ctxs) > 1 else None
                 for _ in range(2):
                     self.s0.step(z, act)
+                if getattr(self.s0, "emb_inputs", False):
+                    # the prompting-row variant of the frame call (embedding override active on a row) -- compile
+                    # it here, not inside the first PersonaPlex session
+                    self.s0.__dict__.setdefault("_pq", {})[0] = dict(
+                        emb=torch.zeros(2, self.s0.cfg.dim, dtype=self.s0._ze.dtype), ring=None, P=10 ** 9,
+                        offset=0, i=0)
+                    for _ in range(2):
+                        self.s0.step(z, act)
+                    self.s0._pq.clear()
                 self.s0.reset(range(self.B))
             self.s0.force_ctx = None
             logger.info("[MoshiS0] warmed bucket %d x ctx %s (%.1fs)", bb, ctxs, time.time() - t0)
@@ -199,11 +208,17 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                 if (voice and int(duplex.get("seq") or 0) <= 1 and b not in self.__dict__.setdefault("_prompted", set())
                         and os.environ.get("MOSHI_PP_PROMPT", "1") == "1"):
                     # PersonaPlex system prompt (voice + persona) for this session's row, before its first user frame
-                    t_p = time.perf_counter()
-                    np_ = self.s0.prefill_prompt(b, str(voice), str(rc.get("personaplex_persona") or ""))
+                    if os.environ.get("MOSHI_PP_INLINE", "0") == "1":
+                        t_p = time.perf_counter()
+                        np_ = self.s0.prefill_prompt(b, str(voice), str(rc.get("personaplex_persona") or ""))
+                        logger.info("[MoshiS0] row %d: PersonaPlex prompt inline (%s, %d steps) in %.0f ms", b,
+                                    voice, np_, 1e3 * (time.perf_counter() - t_p))
+                    else:
+                        # queued: the row consumes one prompt frame per serving step inside the batch (user frames
+                        # arriving meanwhile are dropped -- the reference runs the prompt before any user audio)
+                        np_ = self.s0.start_prompt(b, str(voice), str(rc.get("personaplex_persona") or ""))
+                        logger.info("[MoshiS0] row %d: PersonaPlex prompt queued (%s, %d steps)", b, voice, np_)
                     self._prompted.add(b)
-                    logger.info("[MoshiS0] row %d: PersonaPlex prompt (%s, %d steps) in %.0f ms", b, voice, np_,
-                                1e3 * (time.perf_counter() - t_p))
                 if not st.pop("fresh", False):
                     emitted[rid] = None  # nothing new for this row this step
                     continue

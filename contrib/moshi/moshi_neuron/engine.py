@@ -137,6 +137,46 @@ class MoshiStage0:
                 self.gens[b] = torch.Generator().manual_seed(int(seed) + b)
             self._next = None
 
+    def start_prompt(self, row: int, voice: str, persona: str):
+        """Queue the PersonaPlex system prompt for a freshly reset row: the row consumes one prompt frame per
+        serving step (inside the normal batched frame graph, so other sessions are not stalled), then continues with
+        user audio. Returns the prompt length in steps. Its user audio is not consumed while the prompt runs (the
+        worker holds the row's frames), matching the reference, where the prompt completes before audio starts."""
+        if not self.emb_inputs:
+            raise RuntimeError("PersonaPlex prompts need MOSHI_EMB_INPUTS=1")
+        from .prompt import PromptBuilder
+        if getattr(self, "_pb", None) is None:
+            import sentencepiece
+            self._pb = PromptBuilder(self.lm, self.cfg, sentencepiece.SentencePieceProcessor(self.tok_path))
+        key = (voice, persona)
+        cache = self.__dict__.setdefault("_prompt_cache", {})
+        if key not in cache:
+            cache[key] = self._pb.build(voice, persona)
+        emb, ring, P, offset = cache[key]
+        q = self.__dict__.setdefault("_pq", {})
+        q[row] = dict(emb=emb, ring=ring, P=P, offset=offset, i=0)
+        return P
+
+    def prompting(self, row: int) -> bool:
+        return row in self.__dict__.get("_pq", {})
+
+    def _finish_prompt(self, row, st):
+        h = self.host
+        h.cache = h.cache.clone()
+        ring, offset, P = st["ring"], st["offset"], st["P"]
+        CTr = ring.shape[-1]
+        for qpos in range(offset - min(CTr, h.CT), offset + 1):
+            if qpos >= 0:
+                h.cache[row, :, qpos % h.CT] = ring[:, qpos % CTr].to(h.cache.dtype)
+        h.offsets = h.offsets.clone()
+        h.offsets[row] = offset
+        self.lm_frames[row] = P
+        self.nseen[row] = 0
+        self.prompted = self.__dict__.get("prompted", torch.zeros(self.B, dtype=torch.bool))
+        self.prompted[row] = True
+        self.dec_fresh = self.__dict__.get("dec_fresh", torch.zeros(self.B, dtype=torch.bool))
+        self.dec_fresh[row] = True
+
     @torch.inference_mode()
     def prefill_prompt(self, row: int, voice: str, persona: str):
         """PersonaPlex system prompt for one freshly reset row (voice-prompt embeddings + silence + text persona +
@@ -170,8 +210,8 @@ class MoshiStage0:
             reset[row] = p == 0
             r = frame(tok, reset.to(dev), use, self._zt[:Bb], self._za[:Bb], self._ft[:Bb], self._fa[:Bb],
                       self._uf[:Bb], e.to(dev), use)
-            if p % 16 == 15:
-                r.cpu()   # bound the device execution queue (63 requests)
+            if p % 4 == 3:
+                r.cpu()   # bound the device execution queue (63 requests; TP graphs enqueue several per call)
         r.cpu()
         # host bookkeeping: token ring + offsets as the reference after the prompt; LM offset already advanced by P
         h = self.host
@@ -269,7 +309,13 @@ class MoshiStage0:
         Bb = self.bucket_for(active)
         self.last_bucket = Bb
         t0 = time.perf_counter()
-        mreset = (self.nseen <= 1) & active
+        enc_active = active
+        pq_e = self.__dict__.get("_pq", {}) if self.emb_inputs else {}
+        if pq_e:
+            enc_active = active.clone()
+            for row in pq_e:
+                enc_active[row] = False
+        mreset = (self.nseen <= 1) & enc_active
         reset = (self.nseen == 0) & active
         pr = self.__dict__.get("prompted")
         if pr is not None:
@@ -285,7 +331,7 @@ class MoshiStage0:
             if g is None:
                 g = self._encgather[Bb] = self._cf_enc(_EncGather(self.mimi.enc))
             dv = self.device
-            cg = g(pcm_in[sel].to(dv).view(sel.numel(), 1, -1), mreset[sel].to(dv), active[sel].to(dv))
+            cg = g(pcm_in[sel].to(dv).view(sel.numel(), 1, -1), mreset[sel].to(dv), enc_active[sel].to(dv))
             self._tick("enc_call")
             cg = cg.cpu()                                               # [tp * Bb/tp, 8] rank-major
             nb = sel.numel()
@@ -313,15 +359,36 @@ class MoshiStage0:
         if codes.shape[0] < B:
             codes = torch.cat([codes, torch.zeros(B - codes.shape[0], codes.shape[1], dtype=codes.dtype)])
         t1 = time.perf_counter()
-        tokens = self.host.inputs(codes, active)
+        pq0 = self.__dict__.get("_pq", {}) if self.emb_inputs else {}
+        if pq0:
+            act_in = active.clone()
+            for row in pq0:
+                act_in[row] = False       # prompting rows: no user codes into the ring yet
+            tokens = self.host.inputs(codes, act_in)
+        else:
+            tokens = self.host.inputs(codes, active)
         self._tick("host_inputs")
         gt, ga = self._noise()
         self._tick("noise_h2d")
         frame = self._frames[self.ctx_for(reset, active, Bb)]
         if self.emb_inputs:
-            # same graph signature as the PersonaPlex prompt prefill (no row uses the embedding override here)
-            raw_b = frame(tokens[:Bb].to(dev), reset[:Bb].to(dev), active[:Bb].to(dev), gt[:Bb], ga[:Bb],
-                          self._ft[:Bb], self._fa[:Bb], self._uf[:Bb], self._ze[:Bb], self._uf[:Bb])
+            # same graph signature as the PersonaPlex prompt prefill; prompting rows consume their next prompt
+            # embedding (LM reset on their first prompt frame) instead of the user frame
+            pq = self.__dict__.get("_pq", {})
+            if pq:
+                e = torch.zeros(Bb, self.cfg.dim, dtype=self._ze.dtype)
+                ue = torch.zeros(Bb, dtype=torch.bool)
+                rst = reset[:Bb].clone()
+                for row, st in pq.items():
+                    if row < Bb and bool(active[row]):
+                        e[row] = st["emb"][min(st["i"], st["emb"].shape[0] - 1)]
+                        ue[row] = True
+                        rst[row] = st["i"] == 0
+                raw_b = frame(tokens[:Bb].to(dev), rst.to(dev), active[:Bb].to(dev), gt[:Bb], ga[:Bb],
+                              self._ft[:Bb], self._fa[:Bb], self._uf[:Bb], e.to(dev), ue.to(dev))
+            else:
+                raw_b = frame(tokens[:Bb].to(dev), reset[:Bb].to(dev), active[:Bb].to(dev), gt[:Bb], ga[:Bb],
+                              self._ft[:Bb], self._fa[:Bb], self._uf[:Bb], self._ze[:Bb], self._uf[:Bb])
         else:
             raw_b = frame(tokens[:Bb].to(dev), reset[:Bb].to(dev), active[:Bb].to(dev), gt[:Bb], ga[:Bb],
                           self._ft[:Bb], self._fa[:Bb], self._uf[:Bb])
@@ -332,6 +399,30 @@ class MoshiStage0:
         raw = raw_b if Bb == B else torch.cat([raw_b, torch.zeros(B - Bb, raw_b.shape[1], dtype=raw_b.dtype)])
         self._tick("lm_d2h")
         t2 = time.perf_counter()
+        pq = self.__dict__.get("_pq", {}) if self.emb_inputs else {}
+        pmask = torch.zeros(B, dtype=torch.bool)
+        for row in pq:
+            pmask[row] = bool(active[row])
+        if bool(pmask.any()):
+            # prompting rows: their host ring / Mimi state stay untouched; outputs are discarded (all forced)
+            act_u = active & ~pmask
+            self.host.cache = self.host.cache  # (commit below only touches act_u rows)
+            out, ready = self.host.commit(raw, act_u)
+            for row in [r for r in pq if bool(pmask[r])]:
+                st = pq[row]
+                st["i"] += 1
+                if st["i"] >= st["P"]:
+                    del pq[row]
+                    self._finish_prompt(row, st)
+            self.nseen = self.nseen + act_u.long()
+            self.lm_frames = torch.where(act_u, torch.where(reset, torch.ones_like(self.lm_frames),
+                                                            self.lm_frames + 1), self.lm_frames)
+            self._tick("host_commit")
+            if self.decode_here:
+                t3 = time.perf_counter()
+                self.last_pcm = self._decode_rows(out, ready, Bb)
+                self.t_dec = time.perf_counter() - t3
+            return raw, out, ready, (t1 - t0, t2 - t1)
         out, ready = self.host.commit(raw, active)
         self.nseen = self.nseen + active.long()
         self.lm_frames = torch.where(active, torch.where(reset, torch.ones_like(self.lm_frames), self.lm_frames + 1),
