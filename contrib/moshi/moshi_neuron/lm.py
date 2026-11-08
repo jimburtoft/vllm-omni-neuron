@@ -297,12 +297,24 @@ class MoshiLM(nn.Module):
         self.dep_in_fused = os.environ.get("MOSHI_DEP_IN_FUSED", "1") == "1"
 
     # ---------------------------------------------------------------- temporal transformer
-    def temporal(self, tokens, reset, active, ctx: int):
+    @torch.no_grad()
+    def embed_tokens(self, tokens):
+        """tokens [N, K] (host) -> transformer input embeddings [N, dim] on CPU (same as the frame's first op)."""
+        emb = self.emb.detach().to("cpu")
+        off = self.emb_off.to("cpu")
+        valid = (tokens >= 0).to(emb.dtype).unsqueeze(-1)
+        return (torch.nn.functional.embedding(tokens.clamp(min=0) + off, emb) * valid).sum(1)
+
+    def temporal(self, tokens, reset, active, ctx: int, emb_in=None, use_emb=None):
+        """emb_in [B, dim] / use_emb [B] bool (optional): rows with use_emb consume emb_in as the transformer input
+        instead of the token embedding sum (PersonaPlex voice prompt frames are stored as input embeddings)."""
         if self.kernels:
-            return self.temporal_kernels(tokens, reset, active, ctx)
+            return self.temporal_kernels(tokens, reset, active, ctx, emb_in, use_emb)
         cfg, B, H, D, C = self.cfg, self.B, self.cfg.num_heads, self.cfg.head_dim, self.C
         valid = (tokens >= 0).to(self.dtype).unsqueeze(-1)
         x = (F.embedding(tokens.clamp(min=0) + self.emb_off, self.emb) * valid).sum(1, keepdim=True)  # [B,1,dim]
+        if emb_in is not None:
+            x = torch.where(use_emb.view(B, 1, 1), emb_in.view(B, 1, -1).to(x.dtype), x)
         off = torch.where(reset, torch.zeros_like(self.offset), self.offset)
         cos, sin = rope_tables(off.view(B, 1), D, cfg.max_period)          # [B,1,1,D/2] fp32
         if self.rope_half:
@@ -365,7 +377,7 @@ class MoshiLM(nn.Module):
             return [(0, B)]
         return [(0, B - 1), (B - 1, B)]
 
-    def temporal_kernels(self, tokens, reset, active, ctx=None):
+    def temporal_kernels(self, tokens, reset, active, ctx=None, emb_in=None, use_emb=None):
         """Helium step on nkilib fused decode kernels.
 
         Ring KV in blocks: frame f lives in slot f mod SCTX (block (f mod SCTX) // BLK, offset f % BLK) of the row's
@@ -392,6 +404,8 @@ class MoshiLM(nn.Module):
         dev = tokens.device
         valid = (tokens >= 0).to(self.dtype).unsqueeze(-1)
         x = (F.embedding(tokens.clamp(min=0) + self.emb_off, self.emb) * valid).sum(1)  # [B,dim]
+        if emb_in is not None:
+            x = torch.where(use_emb.view(B, 1), emb_in.to(x.dtype), x)
         t = torch.where(reset, torch.zeros_like(off_b), off_b)                          # frames before this one
         s0 = torch.clamp(t - W, min=0)                                                  # oldest attended frame
         start_blk = (s0 % SCTX) // BLK
@@ -610,8 +624,9 @@ class MoshiFrame(nn.Module):
         self.lm, self.ctx, self.debug = lm, ctx, debug
         self.tt, self.kt, self.ta, self.ka = float(temp_text), int(top_k_text), float(temp), int(top_k)
 
-    def forward(self, tokens, reset, active, gumbel_text, gumbel_audio, force_text, force_audio, use_force):
-        tout, tl = self.lm.temporal(tokens, reset, active, self.ctx)
+    def forward(self, tokens, reset, active, gumbel_text, gumbel_audio, force_text, force_audio, use_force,
+                emb_in=None, use_emb=None):
+        tout, tl = self.lm.temporal(tokens, reset, active, self.ctx, emb_in, use_emb)
         text = sample(tl, gumbel_text, self.tt, self.kt)
         text = torch.where(use_force, force_text, text)
         lm = self.lm

@@ -49,6 +49,6 @@ def model_dir(name_or_path: str) -> str | None:
         return name_or_path
     try:
         from huggingface_hub import snapshot_download
-        return snapshot_download(name_or_path, allow_patterns=["*.safetensors", "*.model", "*.json"])
+        return snapshot_download(name_or_path, allow_patterns=["*.safetensors", "*.model", "*.json", "voices.tgz"])
     except Exception:
         return None

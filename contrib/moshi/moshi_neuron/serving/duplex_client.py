@@ -30,7 +30,12 @@ def load_wav(p):
 
 async def one_session(i, args, pcm, model):
     from vllm_omni.clients.duplex import AudioFormat, DuplexClient, SessionConfig
-    cfg = SessionConfig(input_audio=AudioFormat("pcm_f32le", 24000), output_audio=AudioFormat("pcm16", 24000))
+    kw = {}
+    if getattr(args, "voice", None):
+        kw["voice"] = args.voice
+    if getattr(args, "instructions", None):
+        kw["instructions"] = args.instructions
+    cfg = SessionConfig(input_audio=AudioFormat("pcm_f32le", 24000), output_audio=AudioFormat("pcm16", 24000), **kw)
     audio, text, arrivals, sent = [], [], [], []
     trace = open(f"{args.trace}.client.{i}", "w", buffering=1) if args.trace else None
     t_start = None
@@ -112,6 +117,8 @@ def main():
     ap.add_argument("--out", default="out_duplex")
     ap.add_argument("--trace", default="")
     ap.add_argument("--stagger-s", type=float, default=0.0)
+    ap.add_argument("--voice", default="", help="PersonaPlex voice prompt, e.g. NATF2.pt")
+    ap.add_argument("--instructions", default="", help="PersonaPlex persona / system prompt text")
     asyncio.run(main_async(ap.parse_args()))
 
 

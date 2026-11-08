@@ -118,6 +118,10 @@ class MoshiStage0:
         self._zt, self._za = z(B, self.cfg.text_card), z(B, self.cfg.dep_q, self.cfg.card)
         self._ft, self._fa = z(B, dtype=torch.long), z(B, self.cfg.dep_q, dtype=torch.long)
         self._uf = z(B, dtype=torch.bool)
+        # MOSHI_EMB_INPUTS=1 (PersonaPlex prompts): every frame call carries the input-embedding override arguments,
+        # so prompt prefill and serving steps share one compiled graph per bucket (no in-serving compile)
+        self.emb_inputs = os.environ.get("MOSHI_EMB_INPUTS", "0") == "1"
+        self._ze = z(B, self.cfg.dim, dtype=lm_dtype) if self.emb_inputs else None
         self.tok_path = tok_path
 
     @torch.inference_mode()
@@ -132,6 +136,61 @@ class MoshiStage0:
             for b in rows:
                 self.gens[b] = torch.Generator().manual_seed(int(seed) + b)
             self._next = None
+
+    @torch.inference_mode()
+    def prefill_prompt(self, row: int, voice: str, persona: str):
+        """PersonaPlex system prompt for one freshly reset row (voice-prompt embeddings + silence + text persona +
+        silence, all streams forced, as NVIDIA personaplex LMGen.step_system_prompts). Runs the row alone through the
+        smallest batch bucket graph, one step per prompt frame (P ~ 50-150 steps), then leaves the row's token ring
+        and offsets exactly as the reference leaves them; the Mimi encoder of the row starts fresh with the first
+        user frame (the reference resets Mimi streaming after the prompt)."""
+        if not self.emb_inputs:
+            raise RuntimeError("PersonaPlex prompt prefill needs MOSHI_EMB_INPUTS=1 (shared frame graph signature)")
+        from .prompt import PromptBuilder
+        if getattr(self, "_pb", None) is None:
+            import sentencepiece
+            self._pb = PromptBuilder(self.lm, self.cfg, sentencepiece.SentencePieceProcessor(self.tok_path))
+        key = (voice, persona)
+        cache = self.__dict__.setdefault("_prompt_cache", {})
+        if key not in cache:
+            cache[key] = self._pb.build(voice, persona)
+        emb, ring, P, offset = cache[key]
+        dev, B = self.device, self.B
+        act = torch.zeros(B, dtype=torch.bool)
+        act[row] = True
+        Bb = self.bucket_for(act)
+        frame = self._frames[self.ctx_buckets[0] if P + 2 + getattr(self.lm, "BLK", 0) < self.ctx_buckets[0]
+                             else self.ctx_buckets[-1]]
+        tok = torch.zeros(Bb, self.cfg.num_codebooks, dtype=torch.long, device=dev)
+        use = act[:Bb].to(dev)
+        e = torch.zeros(Bb, emb.shape[-1], dtype=self._ze.dtype)
+        for p in range(P):
+            e[row] = emb[p]
+            reset = torch.zeros(Bb, dtype=torch.bool)
+            reset[row] = p == 0
+            r = frame(tok, reset.to(dev), use, self._zt[:Bb], self._za[:Bb], self._ft[:Bb], self._fa[:Bb],
+                      self._uf[:Bb], e.to(dev), use)
+            if p % 16 == 15:
+                r.cpu()   # bound the device execution queue (63 requests)
+        r.cpu()
+        # host bookkeeping: token ring + offsets as the reference after the prompt; LM offset already advanced by P
+        h = self.host
+        h.cache = h.cache.clone()
+        # reference ring width CT_ref (voice .pt) -> ours: logical position q lives in column q % CT (both rings
+        # hold the last CT positions; the next step reads offset-1 and writes offset + delay <= offset + 1)
+        CTr = ring.shape[-1]
+        for q in range(offset - min(CTr, h.CT), offset + 1):
+            if q >= 0:
+                h.cache[row, :, q % h.CT] = ring[:, q % CTr].to(h.cache.dtype)
+        h.offsets = h.offsets.clone()
+        h.offsets[row] = offset
+        self.dec_fresh = self.__dict__.get("dec_fresh", torch.zeros(B, dtype=torch.bool))
+        self.dec_fresh[row] = True    # the Mimi decoder starts with this row's first user-frame output
+        self.lm_frames[row] = P
+        self.nseen[row] = 0           # Mimi encoder resets with the first user frame
+        self.prompted = self.__dict__.get("prompted", torch.zeros(B, dtype=torch.bool))
+        self.prompted[row] = True
+        return P
 
     def _draw(self):
         if self.uniform_sampler:
@@ -212,6 +271,11 @@ class MoshiStage0:
         t0 = time.perf_counter()
         mreset = (self.nseen <= 1) & active
         reset = (self.nseen == 0) & active
+        pr = self.__dict__.get("prompted")
+        if pr is not None:
+            # prompted rows: the LM KV / offset continue after the prompt (only Mimi restarts)
+            reset = reset & ~pr
+            self.prompted = pr & ~active
         if self.fuse_enc:
             return self._step_fused(pcm_in, active, Bb, mreset, reset, t0)
         if self.enc_shard and Bb >= self.tp:
@@ -254,8 +318,13 @@ class MoshiStage0:
         gt, ga = self._noise()
         self._tick("noise_h2d")
         frame = self._frames[self.ctx_for(reset, active, Bb)]
-        raw_b = frame(tokens[:Bb].to(dev), reset[:Bb].to(dev), active[:Bb].to(dev), gt[:Bb], ga[:Bb],
-                      self._ft[:Bb], self._fa[:Bb], self._uf[:Bb])
+        if self.emb_inputs:
+            # same graph signature as the PersonaPlex prompt prefill (no row uses the embedding override here)
+            raw_b = frame(tokens[:Bb].to(dev), reset[:Bb].to(dev), active[:Bb].to(dev), gt[:Bb], ga[:Bb],
+                          self._ft[:Bb], self._fa[:Bb], self._uf[:Bb], self._ze[:Bb], self._uf[:Bb])
+        else:
+            raw_b = frame(tokens[:Bb].to(dev), reset[:Bb].to(dev), active[:Bb].to(dev), gt[:Bb], ga[:Bb],
+                          self._ft[:Bb], self._fa[:Bb], self._uf[:Bb])
         self._tick("lm_call")
         self._prefetch()  # overlaps the device frame
         self._tick("prefetch")
@@ -314,6 +383,10 @@ class MoshiStage0:
         Bb = Bb or self.B
         tp, r = self.tp, self.rank
         dreset = ready & (self.host.offsets == self.host.max_delay + 1)
+        df = self.__dict__.get("dec_fresh")
+        if df is not None:
+            dreset = dreset | (ready & df)
+            self.dec_fresh = df & ~ready
         small = tp > 1 and Bb < tp
         if small:
             sel = torch.arange(Bb) if r == 0 else torch.arange(0)

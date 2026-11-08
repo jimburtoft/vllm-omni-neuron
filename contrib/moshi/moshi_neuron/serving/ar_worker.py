@@ -140,6 +140,8 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
             return  # another request id of the same session still holds the row
         if key is not None:
             self.row_of_session.pop(key, None)
+        if b is not None:
+            self.__dict__.setdefault("_prompted", set()).discard(b)
         if b is not None and b not in self.free:
             self.free.append(b)
             self.free.sort()  # always hand out the lowest free row -> smallest batch bucket
@@ -192,6 +194,16 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                 emitted[rid] = (EOS_TEXT, None)
                 continue
             if isinstance(duplex, dict) and duplex.get("data_plane"):
+                rc = duplex.get("runtime_config") if isinstance(duplex.get("runtime_config"), dict) else {}
+                voice = rc.get("personaplex_voice_prompt")
+                if (voice and int(duplex.get("seq") or 0) <= 1 and b not in self.__dict__.setdefault("_prompted", set())
+                        and os.environ.get("MOSHI_PP_PROMPT", "1") == "1"):
+                    # PersonaPlex system prompt (voice + persona) for this session's row, before its first user frame
+                    t_p = time.perf_counter()
+                    np_ = self.s0.prefill_prompt(b, str(voice), str(rc.get("personaplex_persona") or ""))
+                    self._prompted.add(b)
+                    logger.info("[MoshiS0] row %d: PersonaPlex prompt (%s, %d steps) in %.0f ms", b, voice, np_,
+                                1e3 * (time.perf_counter() - t_p))
                 if not st.pop("fresh", False):
                     emitted[rid] = None  # nothing new for this row this step
                     continue
