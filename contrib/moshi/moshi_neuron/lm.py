@@ -156,6 +156,15 @@ class MoshiLM(nn.Module):
             self.SCTX = int(os.environ.get("MOSHI_KV_SLOTS", "3072"))  # >= context + BLK, multiple of 128
             assert self.SCTX % self.BLK == 0 and self.SCTX % 128 == 0 and self.SCTX >= cfg.context + self.BLK
             self.NBLK = self.SCTX // self.BLK
+            # MOSHI_PP_PIN=<max_pinned>: PersonaPlex pinned system prompt (reference PinnedRingKVCache): the row's
+            # first NPB blocks hold the prompt frames 0..n-1 for the whole conversation; the remaining blocks are a
+            # ring of the latest context - n frames. 0 = plain sliding window (moshiko / no prompt).
+            self.pin_max = int(os.environ.get("MOSHI_PP_PIN", "0"))
+            self.NPB = -(-self.pin_max // self.BLK) if self.pin_max else 0
+            self.pin_slots = self.NPB * self.BLK
+            if self.pin_max:
+                assert self.SCTX - self.pin_slots >= cfg.context + self.BLK, \
+                    "MOSHI_KV_SLOTS must cover pinned blocks + context + one block"
             # MOSHI_FP8_MLP=1: Helium MLP weights stored FP8 e4m3 with per-output-row scales (weight-only; activations
             # bf16; dequant scale applied to the matmul output). Halves 8.9 of the 15.4 GB of weights.
             self.fp8_mlp = os.environ.get("MOSHI_FP8_MLP", "0") == "1" or os.environ.get("MOSHI_W8", "") == "int8"
@@ -253,6 +262,12 @@ class MoshiLM(nn.Module):
         self.out_norm = P(g("out_norm.alpha").view(-1))
         self.text_linear = P(g("text_linear.weight"))
         self.register_buffer("offset", torch.zeros(B, dtype=torch.long), persistent=False)
+        # per-row pinned prompt length (0 = none); prompt keys stored un-rotated for the per-step re-rotation
+        self.register_buffer("pin_n", torch.zeros(B, dtype=torch.long), persistent=False)
+        if getattr(self, "pin_max", 0):
+            for i in range(L):
+                self.register_buffer(f"pk{i}", torch.zeros(B, self.pin_max, self.Hl, D, dtype=dtype),
+                                     persistent=False)
         self.register_buffer("hoff", torch.arange(H), persistent=False)
 
         # ---- depformer
@@ -407,33 +422,100 @@ class MoshiLM(nn.Module):
         if emb_in is not None:
             x = torch.where(use_emb.view(B, 1), emb_in.to(x.dtype), x)
         t = torch.where(reset, torch.zeros_like(off_b), off_b)                          # frames before this one
-        s0 = torch.clamp(t - W, min=0)                                                  # oldest attended frame
-        start_blk = (s0 % SCTX) // BLK
-        ofs = s0 % BLK
-        end = ofs + (t - s0)
-        # Context bucket (ctx < SCTX slots): the window [ofs, end] of every row fits in the first nb table entries
-        # (caller guarantees max(end) + 1 < ctx, i.e. ctx >= fill + BLK + 1); the kernel then reads only nb blocks
-        # instead of NBLK. The current token goes to the bucket's last slot, which is never inside the window.
-        nb = NBLK if (ctx is None or ctx >= SCTX) else ctx // BLK
-        j = torch.arange(nb, device=dev).view(1, nb)
         rows = torch.arange(B, device=dev).view(B, 1)
-        blocks = rows * NBLK + (start_blk.view(B, 1) + j) % NBLK                        # [B,nb] pool block ids
         hh = torch.arange(H, device=dev).view(1, H, 1)
-        table = (blocks.view(B, 1, nb) * H + hh).to(torch.int32)                        # [B,H,nb] head-inner
-        wslot = t % SCTX
-        wblk = rows.view(B) * NBLK + wslot // BLK
+        pin_mask = None
+        if self.pin_max:
+            # Pinned system prompt (reference PinnedRingKVCache, capacity C = context, n = pinned frames): frames
+            # f < n live in the row's first NPB blocks (slot f) for the whole conversation; frames f >= n in the ring
+            # of the other blocks (slot NPB*BLK + (f - n) mod ring). The query at t attends the n pinned frames and the
+            # ring frames [max(n, t + 1 - C + n), t). Table = [pinned blocks] + [ring blocks from the window start];
+            # the mask is the union of two bands; the pinned keys are re-rotated by shift = max(0, t + 1 - C) every
+            # step (below, per layer) so they sit right before the oldest ring frame, as the reference.
+            C, PS = cfg.context, self.pin_slots
+            ring = SCTX - PS
+            n = torch.where(reset, torch.zeros_like(self.pin_n[:B]), self.pin_n[:B])
+            s0 = torch.maximum(n, t + 1 - C + n)                                        # oldest ring frame
+            rs = torch.remainder(s0 - n, ring)
+            ofs = rs % BLK
+            nwin = torch.clamp(t - s0, min=0)                                           # prior ring frames
+            nb = NBLK
+            nbw = nb - self.NPB
+            jw = torch.arange(nbw, device=dev).view(1, nbw)
+            wblocks = rows * NBLK + self.NPB + (rs.view(B, 1) // BLK + jw) % (ring // BLK)
+            pblocks = rows * NBLK + torch.arange(self.NPB, device=dev).view(1, -1)
+            blocks = torch.cat([pblocks.expand(B, -1), wblocks], 1)
+            table = (blocks.view(B, 1, nb) * H + hh).to(torch.int32)
+            win_lo = (PS + ofs).to(torch.float32)
+            win_hi = (PS + ofs + nwin).to(torch.float32)
+            pin_hi = torch.minimum(n, t).to(torch.float32)                              # during the prompt: < t
+            wslot_f = torch.where(t < n, t, PS + torch.remainder(t - n, ring))
+            wblk = rows.view(B) * NBLK + wslot_f // BLK
+            wslot = wslot_f
+            shift = torch.clamp(t + 1 - C, min=0)
+            pin_mask = (pin_hi, win_lo, win_hi, n, shift)
+            end = win_hi
+        else:
+            s0 = torch.clamp(t - W, min=0)                                              # oldest attended frame
+            start_blk = (s0 % SCTX) // BLK
+            ofs = s0 % BLK
+            end = ofs + (t - s0)
+            # Context bucket (ctx < SCTX slots): the window [ofs, end] of every row fits in the first nb table
+            # entries (caller guarantees max(end) + 1 < ctx, i.e. ctx >= fill + BLK + 1); the kernel then reads only
+            # nb blocks instead of NBLK. The current token goes to the bucket's last slot, never inside the window.
+            nb = NBLK if (ctx is None or ctx >= SCTX) else ctx // BLK
+            j = torch.arange(nb, device=dev).view(1, nb)
+            blocks = rows * NBLK + (start_blk.view(B, 1) + j) % NBLK                    # [B,nb] pool block ids
+            table = (blocks.view(B, 1, nb) * H + hh).to(torch.int32)                    # [B,H,nb] head-inner
+            wslot = t % SCTX
+            wblk = rows.view(B) * NBLK + wslot // BLK
         widx = ((wblk.view(B, 1) * H + hh.view(1, H)) * BLK + (wslot % BLK).view(B, 1))  # [B,H]
         # inactive rows: -1 in int32 == 0xFFFFFFFF as uint32 -> the kernel skips the write
         widx = torch.where(active.view(B, 1), widx.to(torch.int32), torch.full_like(widx, -1, dtype=torch.int32))
         widx = widx.view(B, H, 1).to(torch.uint32)
         pos_ids = end.view(B, 1).to(torch.float32)
         swa_start = ofs.view(B, 1).to(torch.float32)
+
         cos, sin = rope_tables(t.view(B, 1), D, cfg.max_period)                         # [B,1,1,D/2]
         cos = cos.view(B, 1, D // 2).permute(2, 0, 1).contiguous().to(self.dtype)       # [D/2,B,1]
         sin = sin.view(B, 1, D // 2).permute(2, 0, 1).contiguous().to(self.dtype)
         x = x.view(B, 1, -1)
+        chunk_masks = {}
+        if pin_mask is not None:
+            from vllm_neuron.functional.attention.attention_decode_mask import gen_attention_decode_mask
+            pin_hi, win_lo, win_hi, n_pin, shift = pin_mask
+            for r0, r1 in self._attn_chunks(B, H):
+                bc = r1 - r0
+                kw_ = dict(bs=bc, q_head=self.Hq_local if hasattr(self, "Hq_local") else H, s_active=1,
+                           s_prior=nb * BLK, block_len=BLK)
+                m_pin = gen_attention_decode_mask(pos_ids=pin_hi[r0:r1].view(1, bc),
+                                                  start_pos=torch.zeros(1, bc, device=dev), **kw_)
+                m_win = gen_attention_decode_mask(pos_ids=win_hi[r0:r1].view(1, bc),
+                                                  start_pos=win_lo[r0:r1].view(1, bc), **kw_)
+                chunk_masks[(r0, r1)] = torch.maximum(m_pin, m_win)
+            # rotation of the pinned keys by shift (rotate-half layout, fp32)
+            pcos, psin = rope_tables(shift.view(B, 1), D, cfg.max_period)              # [B,1,1,D/2]
+            pcos = pcos.view(B, 1, 1, D // 2)
+            psin = psin.view(B, 1, 1, D // 2)
+            pslot = torch.arange(self.pin_max, device=dev)
+            pblk = (rows * NBLK + pslot.view(1, -1) // BLK)                             # [B,pin_max]
+            poff = (pslot % BLK).view(1, -1).expand(B, -1)
+            pkeep = (pslot.view(1, -1) < n_pin.view(B, 1))                              # [B,pin_max]
         abl = getattr(self, "_abl", "")  # profiling ablations only
         for i, l in enumerate(self.layers):
+            if pin_mask is not None:
+                pk = getattr(self, f"pk{i}").float()                                    # [B,pin_max,H,D] rot @ j
+                a1, a2 = pk[..., :D // 2], pk[..., D // 2:]
+                rot = torch.cat([a1 * pcos - a2 * psin, a2 * pcos + a1 * psin], -1)
+                kb_ = getattr(self, f"k{i}")
+                if self.fp8_kv:
+                    rot = rot * self.kv_scales[i][0]
+                rot = rot.to(kb_.dtype)
+                bb = pblk.view(B, -1, 1).expand(B, self.pin_max, H)
+                oo = poff.view(B, -1, 1).expand(B, self.pin_max, H)
+                hh3 = torch.arange(H, device=dev).view(1, 1, H).expand(B, self.pin_max, H)
+                cur = kb_[bb, hh3, oo]
+                kb_.index_put_((bb, hh3, oo), torch.where(pkeep.view(B, -1, 1, 1), rot, cur))
             if "noattn" in abl:
                 a = x
             else:
@@ -448,9 +530,11 @@ class MoshiLM(nn.Module):
                       rmsnorm_X_gamma=l["n1"], W_qkv=l["wqkv"], bias_qkv=None,
                       cos=cos[:, r0:r1].contiguous(), sin=sin[:, r0:r1].contiguous(), rope_contiguous_layout=True,
                       K_cache_transposed=False, active_blocks_table=table[r0:r1].contiguous(),
-                      K_cache=getattr(self, f"k{i}"), V_cache=getattr(self, f"v{i}"), attention_mask=None,
+                      K_cache=getattr(self, f"k{i}"), V_cache=getattr(self, f"v{i}"),
                       softmax_scale=D ** -0.5 / (self.kv_scales[i][0] if self.fp8_kv else 1.0), sink=None,
-                      pos_ids=pos_ids[r0:r1].contiguous(), swa_start_pos_ids=swa_start[r0:r1].contiguous(),
+                      **(dict(attention_mask=chunk_masks[(r0, r1)], pos_ids=None, swa_start_pos_ids=None)
+                         if pin_mask is not None else
+                         dict(pos_ids=pos_ids[r0:r1].contiguous(), swa_start_pos_ids=swa_start[r0:r1].contiguous())),
                       update_cache=True, kv_cache_update_idx=widx[r0:r1].contiguous(),
                       k_scale=getattr(self, f"ks{i}") if self.fp8_kv else None,
                       v_scale=getattr(self, f"vs{i}") if self.fp8_kv else None,
@@ -769,6 +853,14 @@ class MoshiPrefill(nn.Module):
             bb = blk.view(P, 1).expand(P, H)
             oo = off_in.view(P, 1).expand(P, H)
             m3 = valid.view(P, 1, 1)
+            if lm.pin_max:
+                pk = getattr(lm, f"pk{i}")                                     # [B,pin_max,H,D]
+                npk = min(P, lm.pin_max)
+                ri = row.view(1, 1).expand(npk, H) if torch.is_tensor(row) else torch.full((npk, H), int(row), device=dev)
+                ji = torch.arange(npk, device=dev).view(npk, 1).expand(npk, H)
+                hi = torch.arange(H, device=dev).view(1, H).expand(npk, H)
+                newk = k[0].transpose(0, 1)[:npk].to(pk.dtype)                  # [npk,H,D]
+                pk.index_put_((ri, ji, hi), torch.where(valid[:npk].view(npk, 1, 1), newk, pk[ri, ji, hi]))
             kb.index_put_((bb, hh, oo), torch.where(m3, kw, kb[bb, hh, oo]))
             vb.index_put_((bb, hh, oo), torch.where(m3, vw, vb[bb, hh, oo]))
             wo = l["wo"]

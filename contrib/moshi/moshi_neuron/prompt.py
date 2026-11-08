@@ -49,9 +49,17 @@ def load_voice(name: str, repo: str = "nvidia/personaplex-7b-v1") -> dict:
         base = name if name.endswith(".pt") else name + ".pt"
         path = os.path.join(d, "voices", base)
         if not os.path.isfile(path):
-            os.makedirs(d, exist_ok=True)
+            # several TP ranks may get here at once: extract into a private dir, then atomically rename into place
+            import shutil
+            import uuid
+            tmp = f"{d}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+            os.makedirs(tmp, exist_ok=True)
             with tarfile.open(tgz) as t:
-                t.extractall(d)
+                t.extractall(tmp)
+            try:
+                os.rename(tmp, d)
+            except OSError:          # another rank won the race; its copy is complete
+                shutil.rmtree(tmp, ignore_errors=True)
     st = torch.load(path, map_location="cpu")
     _voice_cache[name] = st
     return st

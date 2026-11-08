@@ -132,6 +132,10 @@ class MoshiStage0:
         self.nseen = torch.where(m, torch.zeros_like(self.nseen), self.nseen)
         self.lm_frames = torch.where(m, torch.zeros_like(self.lm_frames), self.lm_frames)
         self.host.reset(rows)
+        if getattr(self.lm, "pin_max", 0):
+            pn = self.lm.pin_n.clone().cpu()
+            pn[rows] = 0
+            self.lm.pin_n.copy_(pn.to(self.lm.pin_n.device))
         if seed is not None:
             for b in rows:
                 self.gens[b] = torch.Generator().manual_seed(int(seed) + b)
@@ -186,6 +190,12 @@ class MoshiStage0:
         off = self.lm.offset.clone().cpu()
         off[row] = P
         self.lm.offset.copy_(off.to(self.lm.offset.device))
+        if getattr(self.lm, "pin_max", 0):
+            if P > self.lm.pin_max:
+                raise ValueError(f"prompt {P} frames > MOSHI_PP_PIN={self.lm.pin_max}")
+            pn = self.lm.pin_n.clone().cpu()
+            pn[row] = P
+            self.lm.pin_n.copy_(pn.to(self.lm.pin_n.device))
         self._finish_prompt(row, dict(ring=ring, offset=offset, P=P))
         return P
 

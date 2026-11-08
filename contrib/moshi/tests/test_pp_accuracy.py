@@ -51,6 +51,8 @@ def main():
             e[:P] = g["prompt_emb"].to(torch.bfloat16)
             pf(e.to(dev), torch.tensor(P, device=dev), torch.tensor(0, device=dev)).cpu()
             lm.offset.copy_(torch.full_like(lm.offset, P))
+            if getattr(lm, "pin_max", 0):
+                lm.pin_n.copy_(torch.full_like(lm.pin_n, P))
             P_steps = 0
         else:
             P_steps = P
@@ -71,10 +73,16 @@ def main():
             stats["dep_top1"].append(float((al.argmax(-1) == fa[t]).float().mean()))
             stats["text_rel"].append(rel(tl, g["text_logits"][t]))
             stats["dep_rel"].append(rel(al, g["dep_logits"][t]))
-            if t < 4 or t % 60 == 0:
+            if t < 4 or t % 150 == 0:
                 print(f"  t={t} text_top1 {np.mean(stats['text_top1']):.3f} dep_top1 {np.mean(stats['dep_top1']):.3f} "
                       f"text_rel {stats['text_rel'][-1]:.3f}", flush=True)
     s = {k: float(np.mean(v)) for k, v in stats.items()}
+    # after the window is full (t + P >= context): the part where pinning matters
+    W = int(os.environ.get("MOSHI_CONTEXT", "3000")) - P
+    if T > W + 10:
+        s["text_top1_after_window"] = float(np.mean(stats["text_top1"][W:]))
+        s["dep_top1_after_window"] = float(np.mean(stats["dep_top1"][W:]))
+        s["text_top1_before_window"] = float(np.mean(stats["text_top1"][:W]))
     s.update(text_rel_max=float(np.max(stats["text_rel"])), frames=T, prompt_frames=P)
     print("PP_ACC", s, flush=True)
 
