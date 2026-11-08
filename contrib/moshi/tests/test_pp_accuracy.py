@@ -24,6 +24,7 @@ def main():
     ap.add_argument("--golden", required=True)
     ap.add_argument("--frames", type=int, default=10000)
     ap.add_argument("--no-prompt", action="store_true", help="skip the system prompt (control)")
+    ap.add_argument("--prefill", action="store_true", help="prompt via the batched MoshiPrefill graph")
     args = ap.parse_args()
     from moshi_neuron.serving.common import compile_fn, neuron_runtime_env, torch_device
     from moshi_neuron.lm import MoshiLM, MoshiFrame
@@ -42,7 +43,18 @@ def main():
     stats = dict(text_top1=[], dep_top1=[], text_rel=[], dep_rel=[])
     dummy_tok = torch.zeros(1, 17, dtype=torch.long, device=dev)
     with torch.inference_mode():
-        for p in range(P):
+        if args.prefill and P:
+            from moshi_neuron.lm import MoshiPrefill
+            pmax = 192
+            pf = compile_fn()(MoshiPrefill(lm, pmax))
+            e = torch.zeros(pmax, g["prompt_emb"].shape[-1], dtype=torch.bfloat16)
+            e[:P] = g["prompt_emb"].to(torch.bfloat16)
+            pf(e.to(dev), torch.tensor(P, device=dev), torch.tensor(0, device=dev)).cpu()
+            lm.offset.copy_(torch.full_like(lm.offset, P))
+            P_steps = 0
+        else:
+            P_steps = P
+        for p in range(P_steps):
             r = fn(dummy_tok, torch.tensor([p == 0], device=dev), one, z(1, 32000), z(1, 8, 2048),
                z(1, dtype=torch.long), z(1, 8, dtype=torch.long), one,
                g["prompt_emb"][p].view(1, -1).to(dev), one)

@@ -709,3 +709,77 @@ class LMGenHost:
         res = self.cache.gather(2, idx.unsqueeze(-1)).squeeze(-1)                 # [B,9]
         ready = (self.offsets > self.max_delay) & active
         return res, ready
+
+
+class MoshiPrefill(nn.Module):
+    """Batched prompt prefill for ONE row (PersonaPlex system prompt): runs the P_MAX-step prompt (input embeddings
+    [P_MAX, dim], valid count n) through the 32 Helium layers in one pass -- causal attention among the prompt
+    frames only (the row is fresh) -- and writes each frame's K/V into the row's KV ring blocks at slots 0..n-1
+    exactly where the decode kernel would have written them (frame f -> slot f % SCTX). Text head / depformer are
+    skipped (all prompt outputs are forced). Same math as stepping the prompt through MoshiFrame (bf16 rounding of
+    the attention partial sums differs). Kernel KV layout only (MOSHI_KERNELS=1), bf16 or FP8 KV, TP-aware."""
+
+    def __init__(self, lm: "MoshiLM", p_max: int):
+        super().__init__()
+        self.lm, self.p_max = lm, int(p_max)
+
+    def forward(self, emb, n, row):
+        lm, cfg = self.lm, self.lm.cfg
+        H, D, P = lm.Hl, cfg.head_dim, self.p_max
+        BLK, NBLK = lm.BLK, lm.NBLK
+        dev = emb.device
+        if lm.tp > 1:
+            import torch.distributed as dist
+            from torch.distributed._functional_collectives import all_reduce as _ar
+            allr = lambda t: _ar(t, reduceOp="sum", group=dist.group.WORLD)
+        else:
+            allr = lambda t: t
+        pos = torch.arange(P, device=dev)
+        valid = pos < n                                                     # [P]
+        x = emb.to(lm.dtype).view(1, P, -1)
+        cos, sin = rope_tables(pos.view(1, P), D, cfg.max_period)           # [1,1,P,D/2]
+        cos2 = torch.cat([cos, cos], -1)
+        sin2 = torch.cat([-sin, sin], -1)
+        causal = (pos.view(P, 1) >= pos.view(1, P)) & valid.view(1, P)
+        mask = torch.where(causal, 0.0, NEG).float().view(1, 1, P, P)
+        # destination slots of frame f in the row's pool blocks (head-inner [blocks*H + h, BLK, D] layout)
+        blk = row * NBLK + pos // BLK                                        # [P]
+        off_in = pos % BLK
+        for i, l in enumerate(lm.layers):
+            h = rms_f32(x, l["n1"].view(-1), cfg.eps)
+            qkv = h @ l["wqkv"]                                              # [1,P,3*H*D] (kernel layout [in,out])
+            q, k, v = qkv.view(1, P, 3, H, D).permute(2, 0, 3, 1, 4)         # [1,H,P,D]
+            qf, kf = q.float(), k.float()
+            q = (qf * cos2 + torch.cat([qf[..., D // 2:], qf[..., :D // 2]], -1) * sin2).to(q.dtype)
+            k = (kf * cos2 + torch.cat([kf[..., D // 2:], kf[..., :D // 2]], -1) * sin2).to(k.dtype)
+            sc = (q @ k.transpose(-1, -2)).float() * (D ** -0.5) + mask
+            o = (torch.softmax(sc, -1).to(v.dtype) @ v).transpose(1, 2).reshape(1, P, H * D)
+            kb, vb = getattr(lm, f"k{i}"), getattr(lm, f"v{i}")
+            kw, vw = k[0].transpose(0, 1), v[0].transpose(0, 1)              # [P,H,D]
+            if lm.fp8_kv:
+                ks, vs = lm.kv_scales[i]
+                kw = (kw.float() * ks).to(kb.dtype)
+                vw = (vw.float() * vs).to(vb.dtype)
+            else:
+                kw, vw = kw.to(kb.dtype), vw.to(vb.dtype)
+            # write only valid frames: invalid ones go to their (unused) slot too but are masked/overwritten later;
+            # to keep the ring clean they are written with the slot's current content
+            # buffer [B*NBLK, H, BLK, D]: frame f of this row -> [row*NBLK + f//BLK, h, f%BLK]
+            hh = torch.arange(H, device=dev).view(1, H).expand(P, H)
+            bb = blk.view(P, 1).expand(P, H)
+            oo = off_in.view(P, 1).expand(P, H)
+            m3 = valid.view(P, 1, 1)
+            kb.index_put_((bb, hh, oo), torch.where(m3, kw, kb[bb, hh, oo]))
+            vb.index_put_((bb, hh, oo), torch.where(m3, vw, vb[bb, hh, oo]))
+            wo = l["wo"]
+            if lm.fp8_kv:
+                wo = (wo.float() * lm.kv_scales[i][1]).to(wo.dtype)          # undo the folded 1/vs (V not scaled here)
+            a = allr(o @ wo)
+            x = x + a
+            h2 = rms_f32(x, l["n2"].view(-1), cfg.eps)
+            if lm.mlp_xw:
+                m = (F.silu(h2 @ l["wg"]) * (h2 @ l["wu"])) @ l["wd"]
+            else:
+                m = F.linear(F.silu(F.linear(h2, l["wg"].t())) * F.linear(h2, l["wu"].t()), l["wd"].t())
+            x = x + allr(m)
+        return x[0, 0, :1].float()   # tiny output (keeps the graph live)

@@ -115,6 +115,15 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                 self.s0.reset(range(self.B))
             self.s0.force_ctx = None
             logger.info("[MoshiS0] warmed bucket %d x ctx %s (%.1fs)", bb, ctxs, time.time() - t0)
+        if getattr(self.s0, "emb_inputs", False) and os.environ.get("MOSHI_PP_PREFILL", "0") == "1":
+            from ..lm import MoshiPrefill
+            pmax = int(os.environ.get("MOSHI_PP_PMAX", "192"))
+            self.s0._prefill = self.s0._cf(MoshiPrefill(self.s0.lm, pmax))
+            dv = self.s0.device
+            self.s0._prefill(torch.zeros(pmax, self.s0.cfg.dim, dtype=self.s0.lm.dtype, device=dv),
+                             torch.tensor(1, device=dv), torch.tensor(0, device=dv)).cpu()
+            self.s0.reset(range(self.B))
+            logger.info("[MoshiS0] warmed prefill graph (P_MAX %d) (%.1fs)", pmax, time.time() - t0)
         logger.info("[MoshiS0] warmup %.1fs", time.time() - t0)
         return time.time() - t0
 
@@ -208,7 +217,12 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                 if (voice and int(duplex.get("seq") or 0) <= 1 and b not in self.__dict__.setdefault("_prompted", set())
                         and os.environ.get("MOSHI_PP_PROMPT", "1") == "1"):
                     # PersonaPlex system prompt (voice + persona) for this session's row, before its first user frame
-                    if os.environ.get("MOSHI_PP_INLINE", "0") == "1":
+                    if os.environ.get("MOSHI_PP_PREFILL", "0") == "1":
+                        t_p = time.perf_counter()
+                        np_ = self.s0.prefill_batched(b, str(voice), str(rc.get("personaplex_persona") or ""))
+                        logger.info("[MoshiS0] row %d: PersonaPlex prompt prefilled (%s, %d frames) in %.0f ms", b,
+                                    voice, np_, 1e3 * (time.perf_counter() - t_p))
+                    elif os.environ.get("MOSHI_PP_INLINE", "0") == "1":
                         t_p = time.perf_counter()
                         np_ = self.s0.prefill_prompt(b, str(voice), str(rc.get("personaplex_persona") or ""))
                         logger.info("[MoshiS0] row %d: PersonaPlex prompt inline (%s, %d steps) in %.0f ms", b,

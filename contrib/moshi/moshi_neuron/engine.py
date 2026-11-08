@@ -157,6 +157,38 @@ class MoshiStage0:
         q[row] = dict(emb=emb, ring=ring, P=P, offset=offset, i=0)
         return P
 
+    @torch.inference_mode()
+    def prefill_batched(self, row: int, voice: str, persona: str):
+        """MOSHI_PP_PREFILL=1: whole PersonaPlex prompt in ONE prefill-graph call for the row (MoshiPrefill, P_MAX =
+        MOSHI_PP_PMAX frames), instead of one prompt frame per serving step. Leaves the row exactly as the stepped
+        prompt does (KV slots 0..P-1, LM offset P, host ring, fresh Mimi)."""
+        from .lm import MoshiPrefill
+        if getattr(self, "_pb", None) is None:
+            import sentencepiece
+            from .prompt import PromptBuilder
+            self._pb = PromptBuilder(self.lm, self.cfg, sentencepiece.SentencePieceProcessor(self.tok_path))
+        key = (voice, persona)
+        cache = self.__dict__.setdefault("_prompt_cache", {})
+        if key not in cache:
+            cache[key] = self._pb.build(voice, persona)
+        emb, ring, P, offset = cache[key]
+        pmax = int(os.environ.get("MOSHI_PP_PMAX", "192"))
+        if P > pmax:
+            raise ValueError(f"PersonaPlex prompt has {P} frames > MOSHI_PP_PMAX={pmax}")
+        if getattr(self, "_prefill", None) is None:
+            self._prefill = self._cf(MoshiPrefill(self.lm, pmax))
+        e = torch.zeros(pmax, emb.shape[-1], dtype=self.lm.dtype)
+        e[:P] = emb.to(e.dtype)
+        dev = self.device
+        r = self._prefill(e.to(dev), torch.tensor(P, device=dev), torch.tensor(row, device=dev))
+        r.cpu()
+        # LM offset of the row = P (the next decode step writes slot P); host state as after the stepped prompt
+        off = self.lm.offset.clone().cpu()
+        off[row] = P
+        self.lm.offset.copy_(off.to(self.lm.offset.device))
+        self._finish_prompt(row, dict(ring=ring, offset=offset, P=P))
+        return P
+
     def prompting(self, row: int) -> bool:
         return row in self.__dict__.get("_pq", {})
 
