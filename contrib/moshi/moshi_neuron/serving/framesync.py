@@ -48,7 +48,12 @@ def _patch(core_mod) -> bool:
         seen = st["seen"]
         for r in [r for r, t in seen.items() if now - t > win]:
             del seen[r]
-        if not (seen.keys() <= ready) and now - st["last"] < period:
+        # MOSHI_FS_MIN_FRAC (default 1.0): fire as soon as this fraction of the recently active sessions has a
+        # frame ready (stragglers ride the next tick) instead of waiting for all or the full period
+        frac = float(os.environ.get("MOSHI_FS_MIN_FRAC", "1.0"))
+        have = len(seen.keys() & ready)
+        enough = (seen.keys() <= ready) or (frac < 1.0 and seen and have >= frac * len(seen))
+        if not enough and now - st["last"] < period:
             st["held"] += 1
             return {}, False
         st["last"] = now
