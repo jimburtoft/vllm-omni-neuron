@@ -266,7 +266,8 @@ class MoshiLM(nn.Module):
         self.register_buffer("pin_n", torch.zeros(B, dtype=torch.long), persistent=False)
         if getattr(self, "pin_max", 0):
             for i in range(L):
-                self.register_buffer(f"pk{i}", torch.zeros(B, self.pin_max, self.Hl, D, dtype=dtype),
+                # un-rotated prompt keys in the KV pool's block layout [B, NPB, H, BLK, D] (whole-block writes)
+                self.register_buffer(f"pk{i}", torch.zeros(B, self.NPB, self.Hl, self.BLK, D, dtype=dtype),
                                      persistent=False)
         self.register_buffer("hoff", torch.arange(H), persistent=False)
 
@@ -497,25 +498,21 @@ class MoshiLM(nn.Module):
             pcos, psin = rope_tables(shift.view(B, 1), D, cfg.max_period)              # [B,1,1,D/2]
             pcos = pcos.view(B, 1, 1, D // 2)
             psin = psin.view(B, 1, 1, D // 2)
-            pslot = torch.arange(self.pin_max, device=dev)
-            pblk = (rows * NBLK + pslot.view(1, -1) // BLK)                             # [B,pin_max]
-            poff = (pslot % BLK).view(1, -1).expand(B, -1)
-            pkeep = (pslot.view(1, -1) < n_pin.view(B, 1))                              # [B,pin_max]
+            pcos5 = pcos.view(B, 1, 1, 1, D // 2)
+            psin5 = psin.view(B, 1, 1, 1, D // 2)
+            pblk_ids = (rows * NBLK + torch.arange(self.NPB, device=dev).view(1, -1)).reshape(-1)   # [B*NPB]
         abl = getattr(self, "_abl", "")  # profiling ablations only
         for i, l in enumerate(self.layers):
-            if pin_mask is not None:
-                pk = getattr(self, f"pk{i}").float()                                    # [B,pin_max,H,D] rot @ j
+            if pin_mask is not None and "norot" not in getattr(self, "_abl", ""):
+                # re-rotate the pinned prompt keys by shift and write them back as whole KV blocks (index_copy on the
+                # pool's leading block dim; slots >= n are never attended, so the whole pinned region is written)
+                pk = getattr(self, f"pk{i}")[:B].float()                                # [B,NPB,H,BLK,D]
                 a1, a2 = pk[..., :D // 2], pk[..., D // 2:]
-                rot = torch.cat([a1 * pcos - a2 * psin, a2 * pcos + a1 * psin], -1)
+                rot = torch.cat([a1 * pcos5 - a2 * psin5, a2 * pcos5 + a1 * psin5], -1)
                 kb_ = getattr(self, f"k{i}")
                 if self.fp8_kv:
                     rot = rot * self.kv_scales[i][0]
-                rot = rot.to(kb_.dtype)
-                bb = pblk.view(B, -1, 1).expand(B, self.pin_max, H)
-                oo = poff.view(B, -1, 1).expand(B, self.pin_max, H)
-                hh3 = torch.arange(H, device=dev).view(1, 1, H).expand(B, self.pin_max, H)
-                cur = kb_[bb, hh3, oo]
-                kb_.index_put_((bb, hh3, oo), torch.where(pkeep.view(B, -1, 1, 1), rot, cur))
+                kb_.index_copy_(0, pblk_ids, rot.to(kb_.dtype).view(B * self.NPB, H, BLK, D))
             if "noattn" in abl:
                 a = x
             else:
@@ -854,13 +851,14 @@ class MoshiPrefill(nn.Module):
             oo = off_in.view(P, 1).expand(P, H)
             m3 = valid.view(P, 1, 1)
             if lm.pin_max:
-                pk = getattr(lm, f"pk{i}")                                     # [B,pin_max,H,D]
-                npk = min(P, lm.pin_max)
-                ri = row.view(1, 1).expand(npk, H) if torch.is_tensor(row) else torch.full((npk, H), int(row), device=dev)
-                ji = torch.arange(npk, device=dev).view(npk, 1).expand(npk, H)
-                hi = torch.arange(H, device=dev).view(1, H).expand(npk, H)
-                newk = k[0].transpose(0, 1)[:npk].to(pk.dtype)                  # [npk,H,D]
-                pk.index_put_((ri, ji, hi), torch.where(valid[:npk].view(npk, 1, 1), newk, pk[ri, ji, hi]))
+                pk = getattr(lm, f"pk{i}")                                     # [B,NPB,H,BLK,D]
+                PSl = lm.pin_slots
+                kk = k[0]                                                       # [H,P,D] rotated at 0..P-1
+                kk = kk[:, :PSl] if P >= PSl else torch.cat([kk, torch.zeros(H, PSl - P, D, dtype=kk.dtype, device=dev)], 1)
+                kk = torch.where((torch.arange(PSl, device=dev) < n).view(1, PSl, 1), kk, torch.zeros_like(kk))
+                blk5 = kk.view(H, lm.NPB, BLK, D).transpose(0, 1).to(pk.dtype)  # [NPB,H,BLK,D]
+                ri = (row.view(1) if torch.is_tensor(row) else torch.tensor([int(row)], device=dev))
+                pk.index_copy_(0, ri, blk5.unsqueeze(0))
             kb.index_put_((bb, hh, oo), torch.where(m3, kw, kb[bb, hh, oo]))
             vb.index_put_((bb, hh, oo), torch.where(m3, vw, vb[bb, hh, oo]))
             wo = l["wo"]

@@ -22,6 +22,9 @@ def main():
     s0 = MoshiStage0(B=Bmax, device=torch.device("neuron:0"), compile_fn=compile_fn(), seed=7,
                      greedy=os.environ.get("MOSHI_GREEDY", "0") == "1")
     x = torch.randn(Bmax, 1920) * 0.05
+    s0.lm._abl = os.environ.get("MOSHI_ABL", "")
+    if getattr(s0.lm, "pin_max", 0):
+        s0.lm.pin_n.fill_(134)
     res = {}
     with torch.inference_mode():
         for B in Bs:

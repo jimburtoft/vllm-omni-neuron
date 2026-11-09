@@ -30,6 +30,9 @@ def main():
     ap.add_argument("--clips", default="utt2")
     ap.add_argument("--goldens", default=os.path.expanduser("~/goldens"))
     ap.add_argument("--dtype", default="float32")
+    ap.add_argument("--pin", action="store_true", help="reference pinning (pin_system_prompt=True, max_pinned 512)")
+    ap.add_argument("--context", type=int, default=0, help="override lm context (e.g. 1500)")
+    ap.add_argument("--loops", type=int, default=1, help="repeat the clip N times (long-session goldens)")
     args = ap.parse_args()
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "16")))
     from huggingface_hub import hf_hub_download
@@ -45,6 +48,10 @@ def main():
     tok = sentencepiece.SentencePieceProcessor(hf_hub_download(repo, loaders.TEXT_TOKENIZER_NAME))
     lm = loaders.get_moshi_lm(hf_hub_download(repo, loaders.MOSHI_NAME), device="cpu")
     lm = lm.to(getattr(torch, args.dtype)).eval()
+    if args.context:
+        from moshi.modules.transformer import set_attention_context
+        set_attention_context(lm.transformer, args.context)
+        lm.context = args.context
     vdir = os.path.join(args.out, "voices")
     if not os.path.isdir(vdir):
         with tarfile.open(hf_hub_download(repo, "voices.tgz")) as t:
@@ -77,7 +84,8 @@ def main():
     lm.forward_codes = fc
 
     gen = LMGen(lm, audio_silence_frame_cnt=int(0.5 * mimi.frame_rate), sample_rate=mimi.sample_rate, device="cpu",
-                frame_rate=mimi.frame_rate, use_sampling=False, prefill_system_prompt=False, pin_system_prompt=False)
+                frame_rate=mimi.frame_rate, use_sampling=False, prefill_system_prompt=False, pin_system_prompt=args.pin,
+                max_pinned_frames=512)
     gen.streaming_forever(1)
     mimi.streaming_forever(1)
     other.streaming_forever(1)
@@ -96,6 +104,7 @@ def main():
     mimi.reset_streaming()
     for name in args.clips.split(","):
         wav = np.load(os.path.join(args.goldens, f"clip_{name}.npy")).astype(np.float32)
+        wav = np.concatenate([wav] * args.loops)
         x = torch.from_numpy(wav)[None, None]
         rec.update(inputs=[], emb=[], text_logits=[], dep_logits=[], tokens=[], user_codes=[])
         for i, t in enumerate(range(0, x.shape[-1], FRAME)):
@@ -112,7 +121,8 @@ def main():
                                                                   "user_codes")}
         res["prompt_emb"], res["prompt_cache"], res["prompt_offset"] = prompt_emb, prompt_cache, prompt_offset
         res["voice"], res["prompt"] = args.voice, args.prompt
-        torch.save(res, os.path.join(args.out, f"pp_{name}_{args.dtype}_greedy.pt"))
+        tag = f"pp_{name}_{args.dtype}_greedy" + (f"_x{args.loops}" if args.loops > 1 else "") + ("_pin" if args.pin else "") + (f"_c{args.context}" if args.context else "")
+        torch.save(res, os.path.join(args.out, tag + ".pt"))
         text = "".join(tok.id_to_piece(int(t)).replace("\u2581", " ") for t in res["tokens"][:, 0]
                        if int(t) not in (0, 3, -2))
         print(name, "inputs", tuple(res["inputs"].shape), "prompt", tuple(prompt_emb.shape), "offset", prompt_offset,
