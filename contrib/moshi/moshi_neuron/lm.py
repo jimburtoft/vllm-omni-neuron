@@ -183,6 +183,7 @@ class MoshiLM(nn.Module):
             # MOSHI_FP8_KV=1: FP8 (e4m3) KV cache. Per-layer quant scales: scale = FP8_MAX / amax(K or V), amax from
             # MOSHI_KV_SCALES (json {"k": [32], "v": [32]} of bf16 amax per layer) or a default amax.
             self.fp8_kv = os.environ.get("MOSHI_FP8_KV", "0") == "1"
+            self.fp8_packed = self.fp8_kv and os.environ.get("MOSHI_FP8_PACKED", "0") == "1"
             # 0 = auto: split only odd B (see _attn_chunks); >0 = fixed chunk size
             self.attn_chunk = int(os.environ.get("MOSHI_ATTN_CHUNK", "0"))
             if self.fp8_kv:
@@ -244,7 +245,15 @@ class MoshiLM(nn.Module):
                     wg=P(wg_.t()), wu=P(wu_.t()), wd=P(wout.t()))))
                 kvdt = torch.float8_e4m3fn if self.fp8_kv else dtype
                 Hk = self.Hl
-                self.register_buffer(f"k{i}", torch.zeros(B * self.NBLK, Hk, self.BLK, D, dtype=kvdt), persistent=False)
+                # MOSHI_FP8_PACKED=1 (FP8 KV only): K in the kernel's swizzled packed layout [blocks, H, BLK/2, D, 2]
+                # (two adjacent positions interleaved) -> the decode kernel loads K with DMA transpose instead of the
+                # PE-transpose + PSUM->SBUF copy path (profile: ~25 ms of ~42 ms attention at TP1 B=10)
+                if self.fp8_kv and self.fp8_packed:
+                    self.register_buffer(f"k{i}", torch.zeros(B * self.NBLK, Hk, self.BLK // 2, D, 2, dtype=kvdt),
+                                         persistent=False)
+                else:
+                    self.register_buffer(f"k{i}", torch.zeros(B * self.NBLK, Hk, self.BLK, D, dtype=kvdt),
+                                         persistent=False)
                 self.register_buffer(f"v{i}", torch.zeros(B * self.NBLK, Hk, self.BLK, D, dtype=kvdt), persistent=False)
                 if self.fp8_kv:
                     # kernel quantizes with x * scale and dequantizes by folding 1/scale into softmax scale and W_out
@@ -512,7 +521,10 @@ class MoshiLM(nn.Module):
                 kb_ = getattr(self, f"k{i}")
                 if self.fp8_kv:
                     rot = rot * self.kv_scales[i][0]
-                kb_.index_copy_(0, pblk_ids, rot.to(kb_.dtype).view(B * self.NPB, H, BLK, D))
+                rb = rot.to(kb_.dtype).view(B * self.NPB, H, BLK, D)
+                if self.fp8_packed:   # [.., BLK, D] -> packed [.., BLK/2, D, 2]
+                    rb = rb.view(B * self.NPB, H, BLK // 2, 2, D).transpose(-1, -2)
+                kb_.index_copy_(0, pblk_ids, rb.contiguous())
             if "noattn" in abl:
                 a = x
             else:
@@ -535,6 +547,7 @@ class MoshiLM(nn.Module):
                       update_cache=True, kv_cache_update_idx=widx[r0:r1].contiguous(),
                       k_scale=getattr(self, f"ks{i}") if self.fp8_kv else None,
                       v_scale=getattr(self, f"vs{i}") if self.fp8_kv else None,
+                      **(dict(fp8_packed=True) if self.fp8_packed else {}),
                       W_out=l["wo"], bias_out=None, transposed_out=False, out_in_sb=False))
               a = parts[0] if len(parts) == 1 else torch.cat([p.view(-1, cfg.dim) for p in parts], 0)
               a = allr(a)
@@ -859,7 +872,18 @@ class MoshiPrefill(nn.Module):
                 blk5 = kk.view(H, lm.NPB, BLK, D).transpose(0, 1).to(pk.dtype)  # [NPB,H,BLK,D]
                 ri = (row.view(1) if torch.is_tensor(row) else torch.tensor([int(row)], device=dev))
                 pk.index_copy_(0, ri, blk5.unsqueeze(0))
-            kb.index_put_((bb, hh, oo), torch.where(m3, kw, kb[bb, hh, oo]))
+            if lm.fp8_packed:
+                # packed K [blocks, H, BLK/2, D, 2]: the prompt frames 0..P-1 of the (fresh) row fill pairs from
+                # slot 0, so write whole pairs (P_MAX even): pair j = frames (2j, 2j+1); frames >= n zeroed (never
+                # attended: outside the mask)
+                kz = torch.where(m3, kw, torch.zeros_like(kw))                  # [P,H,D]
+                pairs = kz.view(P // 2, 2, H, D).permute(0, 2, 3, 1)             # [P/2,H,D,2]
+                pb = blk.view(P // 2, 2)[:, 0].view(-1, 1).expand(P // 2, H)
+                po = (off_in.view(P // 2, 2)[:, 0] // 2).view(-1, 1).expand(P // 2, H)
+                ph = torch.arange(H, device=dev).view(1, H).expand(P // 2, H)
+                kb.index_put_((pb, ph, po), pairs)
+            else:
+                kb.index_put_((bb, hh, oo), torch.where(m3, kw, kb[bb, hh, oo]))
             vb.index_put_((bb, hh, oo), torch.where(m3, vw, vb[bb, hh, oo]))
             wo = l["wo"]
             if lm.fp8_kv:
