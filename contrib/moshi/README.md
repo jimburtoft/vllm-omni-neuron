@@ -4,7 +4,8 @@
 same time, in 80 ms frames: a Mimi codec encodes the user's audio, a 7B temporal transformer (Helium) plus a small
 depth transformer generate Moshi's text and audio tokens, and Mimi decodes them to 24 kHz speech.
 
-This contrib serves `kyutai/moshiko-pytorch-bf16` (or `kyutai/moshika-pytorch-bf16`) on Trainium2 through
+This contrib serves `kyutai/moshiko-pytorch-bf16` (or `kyutai/moshika-pytorch-bf16`) and NVIDIA
+`nvidia/personaplex-7b-v1` (same architecture, with voice + persona system prompt) on Trainium2 through
 **vLLM-Omni's full-duplex realtime API** (`/v1/realtime?duplex=1`), using the PersonaPlex pipeline that ships in
 vllm-omni 0.29 and two Neuron workers from this directory. It runs on the public SDK 2.33 DLAMI without upstream
 source changes.
@@ -18,9 +19,24 @@ source changes.
 All streaming state (Mimi convolution buffers and transformer KV caches, the 3000-frame Helium KV) lives in
 device memory per session row; only 1920 PCM samples and ~10 tokens cross the host boundary per frame.
 
-## Results (trn2.3xlarge, SDK 2.33)
+## Results (one trn2.3xlarge, SDK 2.33)
 
-Served (`/v1/realtime?duplex=1`), audio streamed at real-time pace, 28.8 s conversation:
+**Highest capacity: PersonaPlex, TP4 throughput layout, packed FP8 KV cache** (`nvidia/personaplex-7b-v1`, voice
+prompt + persona, 1500-frame attention window as in the PersonaPlex reference; sessions arriving 0.5-1 s apart):
+
+| Session length | Concurrent sessions | Every frame on time | Per-frame latency p50 / p99 |
+|---|---|---|---|
+| 4 minutes | **36** | yes | 39-51 / 230 ms |
+| 60 s | 36 | yes | 54-68 / 1275 ms |
+| 60 s | 40 | 740 / 750 frames | 1.0-1.2 s (output path queues) |
+| 4 minutes | 40 | no (2727 / 3000 frames) | 7.8-10.8 s |
+
+The Neuron side keeps up with more: in steady state stage 0 processes exactly the required frames per second
+for 40, 44 and 48 sessions (stage-0 step ~51 ms at 40 rows). Above ~36-40 sessions the limit is the vLLM-Omni API
+server process (WebSocket frontend and orchestrator share one Python GIL), not the device; the vLLM-Omni
+multi-process orchestrator / multi-frontend work upstream addresses this.
+
+**moshiko / moshika** (3000-frame window), served, audio streamed at real-time pace, 28.8 s conversation:
 
 | Layout | Concurrent sessions | Every frame on time | First audio | Per-frame latency p50 / p99 |
 |---|---|---|---|---|
@@ -106,6 +122,44 @@ session has filled (young sessions are cheap; at a full 4-minute window it falls
 step runs the smallest one that covers the active sessions, so the step time (and latency) scales with load instead
 of always paying for the maximum batch. Each bucket adds a compile on first start (cached afterwards).
 
+### PersonaPlex, 36-40 sessions per instance (TP4, packed FP8 KV)
+
+`nvidia/personaplex-7b-v1` is gated on Hugging Face (request access first). Serve the local snapshot directory (the
+voice prompts are resolved from its `voices.tgz`):
+
+```bash
+PP=$(python -c "from huggingface_hub import snapshot_download as s; print(s('nvidia/personaplex-7b-v1'))")
+export PYTHONPATH=$PYTHONPATH:$PWD/vllm-omni-neuron/contrib/moshi/scripts/fs_site   # frame-sync gate + GC settings
+export MOSHI_CONTEXT=1500 MOSHI_KV_SLOTS=1536 MOSHI_CTX_BUCKETS=512,1024 MOSHI_BUCKETS=24,32,40,48 \
+  MOSHI_FP8_KV=1 MOSHI_FP8_PACKED=1 MOSHI_ENC_SHARD=1 MOSHI_DEP_RUN=8 \
+  MOSHI_EMB_INPUTS=1 MOSHI_PP_PREFILL=1 \
+  MOSHI_FRAMESYNC=1 MOSHI_FS_PERIOD_MS=60 MOSHI_WORKER_THREADS=1 MOSHI_GC_FULL=0 \
+  MOSHI_FAST_APPEND=1 MOSHI_CONS_FIX=1 MOSHI_MARKS_FIX=1 MOSHI_WS_NO_DEFLATE=1 \
+  MOSHI_STAGE_EVENTS_CAP=64 MOSHI_MARK_COALESCE=1 MOSHI_SNAP_FIX=1 \
+  MOSHI_PCM_FAST=1 MOSHI_SHM_PROBE=1 MOSHI_API_TORCH_THREADS=4 \
+  MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 MOSHI_NC_COUNT=4
+MOSHI_B=48 MOSHI_TP0=4 MOSHI_DEV0=0,1,2,3 MOSHI_DEV1=0 python -m moshi_neuron.serving.make_deploy /tmp/pp_tp4.yaml
+python -m moshi_neuron.serving.serve_launcher serve $PP --deploy-config /tmp/pp_tp4.yaml --port 8000 --omni \
+    --init-timeout 10800 --stage-init-timeout 10800
+```
+
+What the main switches do:
+- `MOSHI_FP8_KV=1 MOSHI_FP8_PACKED=1`: FP8 (e4m3) KV cache in the attention kernel's packed layout, which lets the
+  kernel load K with a DMA transpose (attention -41% at 40 sessions vs unpacked FP8, bit-identical output).
+  FP8 KV costs ~1.4 points of teacher-forced audio-code top-1 vs bf16 KV; text is unchanged.
+- `MOSHI_PP_PREFILL=1`: the voice + persona prompt of a new session runs as one batched prefill (19 ms), so first
+  audio arrives in 0.1-0.5 s and other sessions are not stalled.
+- `MOSHI_FRAMESYNC=1 MOSHI_FS_PERIOD_MS=60`: stage 0 waits (up to 60 ms) until the sessions' next frames have
+  arrived, so each step carries close to all active sessions instead of splitting a tick into partial batches.
+- `MOSHI_DEP_RUN=8`: only the agent-stream depth-transformer steps run (PersonaPlex also predicts the user stream).
+- `MOSHI_GC_FULL=0`: no automatic gen-2 garbage collection (its pauses grow to ~1 s over a 4-minute session).
+
+For calls longer than about 2 minutes, keep the system prompt in context with pinning:
+`MOSHI_PP_PIN=160 MOSHI_KV_SLOTS=2048 VLLM_NEURON_ATTN_MASK_TORCH=1` and no `MOSHI_CTX_BUCKETS`. This was measured
+with unpacked FP8 at 32 sessions x 4 min (p99 352 ms); sessions stay in persona to the end.
+
+The first start compiles every batch x context bucket graph (about 2 hours); later starts use the cache.
+
 ## Talk to it
 
 ```bash
@@ -115,7 +169,8 @@ python -m moshi_neuron.serving.duplex_client --wav my_question.wav --sessions 1 
 The client also records Moshi's inner-monologue text (`out/session0.txt`), streamed as `text` deltas on
 `response.output_audio.delta` events. The client streams the file in real time over `ws://127.0.0.1:8000/v1/realtime?duplex=1` (24 kHz float32 in,
 16-bit PCM out) and writes Moshi's reply to `out/session0.wav`. Any client of the vLLM-Omni realtime duplex API
-works (`vllm_omni.clients.duplex.DuplexClient`); Moshi takes no `voice` or `instructions`.
+works (`vllm_omni.clients.duplex.DuplexClient`). Moshi takes no `voice` or `instructions`; for PersonaPlex pass
+`--voice NATM1.pt --instructions "<persona text>"` (and `--stagger-s 0.5` to spread session arrivals in a load test).
 
 ## Standalone (no server)
 

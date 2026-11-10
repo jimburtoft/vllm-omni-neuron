@@ -1,4 +1,4 @@
-"""Standalone stage-0 step time vs B (TP ranks via torchrun), customer-format table: B -> step ms.
+"""Standalone stage-0 step time vs B (TP ranks via torchrun), table: B -> step ms per 80 ms frame.
 usage: torchrun --nproc_per_node=4 s0_bench.py "1,8,16,24,32,40,48" N  (env as for serving: MOSHI_B = max B, buckets)."""
 import os, sys, time
 rank = int(os.environ["RANK"]); world = int(os.environ["WORLD_SIZE"]); local = int(os.environ["LOCAL_RANK"])
