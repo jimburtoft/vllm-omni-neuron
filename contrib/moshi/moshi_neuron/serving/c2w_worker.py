@@ -235,7 +235,20 @@ class MoshiCode2WavRunner(OmniConnectorModelRunnerMixin):
                 wavs.append(torch.cat(a) if a else torch.zeros(0))
             else:
                 wavs.append(new)
-        self._last = (req_ids, wavs, [self.text.get(r, "") for r in req_ids])
+        if os.environ.get("MOSHI_TEXT_DELTA", "0") == "1":
+            # send only the text added since the last frame (the API data plane accumulates; see backports
+            # _patch_data_plane_text) -- the cumulative text grows over the whole session and was re-encoded,
+            # IPC'd, msgpack-decoded and utf-8-decoded every 80 ms frame
+            sent = self.__dict__.setdefault("_text_sent", {})
+            tx = []
+            for r in req_ids:
+                full = self.text.get(r, "")
+                k = sent.get(r, 0)
+                tx.append("\x00" + full[k:] if len(full) > k else "")
+                sent[r] = len(full)
+            self._last = (req_ids, wavs, tx)
+        else:
+            self._last = (req_ids, wavs, [self.text.get(r, "") for r in req_ids])
         return None
 
     @torch.inference_mode()

@@ -449,8 +449,16 @@ def _make_tp_worker():
             # host CPUs are shared by all TP ranks (8 at LNC=1 on 12 vCPUs): pin each rank to its own CPU slice so the
             # Mimi/sampling host work of the ranks does not contend
             ncpu = os.cpu_count() or 1
-            per = max(1, ncpu // max(1, tp))
-            cpus = set(range((self.local_rank * per) % ncpu, (self.local_rank * per) % ncpu + per))
+            pin = os.environ.get("MOSHI_WORKER_CPUS")  # e.g. "0;1;2;3" -> rank r gets the r-th ';' group (cpu list)
+            if pin:
+                grp = pin.split(";")[self.local_rank % len(pin.split(";"))]
+                cpus = set()
+                for part in grp.split(","):
+                    a, _, b = part.partition("-")
+                    cpus |= set(range(int(a), int(b or a) + 1))
+            else:
+                per = max(1, ncpu // max(1, tp))
+                cpus = set(range((self.local_rank * per) % ncpu, (self.local_rank * per) % ncpu + per))
             try:
                 os.sched_setaffinity(0, cpus)
             except Exception:  # noqa: BLE001

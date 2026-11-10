@@ -108,3 +108,20 @@ if os.environ.get("MOSHI_SWITCH_INTERVAL"):
     # one interval before it gets the GIL. Applied to every process (cheap); matters where threads contend.
     import sys as _s3
     _s3.setswitchinterval(float(os.environ["MOSHI_SWITCH_INTERVAL"]))
+
+if os.environ.get("MOSHI_API_CPUS") or os.environ.get("MOSHI_EC_CPUS"):
+    # MOSHI_API_CPUS / MOSHI_EC_CPUS: pin the API-server process / stage engine-core processes to CPU lists so they
+    # do not land on the TP workers' cores (and their hyperthread siblings)
+    try:
+        _cl = open("/proc/self/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="ignore")
+
+        def _cpus(spec):
+            out = set()
+            for part in spec.split(","):
+                a, _, b = part.partition("-")
+                out |= set(range(int(a), int(b or a) + 1))
+            return out
+        if "serve_launcher" in _cl and os.environ.get("MOSHI_API_CPUS"):
+            os.sched_setaffinity(0, _cpus(os.environ["MOSHI_API_CPUS"]))
+    except Exception:  # noqa: BLE001
+        pass

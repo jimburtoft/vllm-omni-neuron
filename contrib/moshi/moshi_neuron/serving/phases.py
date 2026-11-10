@@ -519,3 +519,62 @@ def install_mark_coalesce():
 
     S.mark_audio_sent = mark_audio_sent
     return True
+
+
+def install_drain_batch():
+    """MOSHI_DRAIN_BATCH=1 (API-server process): DuplexRequestClient.collect_outputs returns after the FIRST output
+    message, so each session's frontend drain loop forwards one 80 ms frame per iteration (one projection + one
+    websocket send + several awaits). Under load a session that falls behind can never catch up (it can only
+    forward one frame per iteration, at the rate frames arrive). Patched: keep collecting while more messages are
+    already queued (no extra waiting), so a backlog is forwarded in one iteration."""
+    import inspect
+    import textwrap
+    from vllm_omni.entrypoints import duplex_request_client as m
+    C = m.DuplexRequestClient
+    if getattr(C, "_moshi_db", False):
+        return False
+    src = textwrap.dedent(inspect.getsource(C.collect_outputs))
+    old = "            if message.finished or outputs:\n                break"
+    if old.replace("            ", "    ", 1) not in src and old not in src:
+        old_d = "        if message.finished or outputs:\n            break"
+    else:
+        old_d = old.replace("            ", "    ", 1) if old.replace("            ", "    ", 1) in src else old
+    new_d = old_d.replace("message.finished or outputs:", "message.finished or (outputs and request_state.queue.empty()):")
+    if old_d not in src:
+        raise RuntimeError("collect_outputs source changed; drain-batch patch not applied")
+    ns = {}
+    exec(compile(src.replace(old_d, new_d), m.__file__, "exec"), m.__dict__, ns)
+    C.collect_outputs = ns["collect_outputs"]
+    C._moshi_db = True
+    return True
+
+
+def install_output_queue_probe():
+    """MOSHI_OQ_PROBE=<s>: every <s> s log the depth of the orchestrator -> frontend output queue and the per-request
+    queues (where the 44-session output lag accumulates)."""
+    import sys
+    import threading
+    from vllm_omni.engine import async_omni_engine as aoe
+    E = aoe.AsyncOmniEngine
+    if getattr(E, "_moshi_oq", False):
+        return False
+    E._moshi_oq = True
+    orig_init = E.__init__
+    period = float(os.environ.get("MOSHI_OQ_PROBE", "5"))
+
+    def init(self, *a, **k):
+        orig_init(self, *a, **k)
+        eng = self
+
+        def run():
+            while True:
+                time.sleep(period)
+                try:
+                    q = eng.output_queue.sync_q.qsize()
+                    rq = eng.request_queue.sync_q.qsize()
+                    sys.stderr.write(f"[MoshiOQ] output_queue {q} request_queue {rq}\n")
+                except Exception:  # noqa: BLE001
+                    pass
+        threading.Thread(target=run, daemon=True, name="moshi-oq").start()
+    E.__init__ = init
+    return True

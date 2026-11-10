@@ -120,6 +120,34 @@ def _patch_data_plane_text():
 
     text_value._moshi_text = True
     dp._text_value = text_value
+    # MOSHI_TEXT_DELTA=1: stage 1 sends "\x00" + only the new text; rebuild the cumulative text per request here
+    # (cheap string append) so the stock _text_delta / cursor logic is unchanged.
+    orig_proj = dp.PersonaPlexDataPlaneSession._project_output
+    cur = {"acc": None, "rid": None}
+
+    def _project_output(self, output, *, context):
+        o, _ = dp._unwrap_output(output)
+        cur["acc"] = self.__dict__.setdefault("_moshi_text_acc", {})
+        cur["rid"] = getattr(o, "request_id", None)
+        try:
+            return orig_proj(self, output, context=context)
+        finally:
+            cur["acc"] = None
+
+    def text_value2(multimodal, completion):
+        t = text_value(multimodal, completion)
+        if t.startswith("\x00") and cur["acc"] is not None:
+            acc = cur["acc"]
+            acc[cur["rid"]] = acc.get(cur["rid"], "") + t[1:]
+            return acc[cur["rid"]]
+        if t.startswith("\x00"):
+            return t[1:]
+        if t == "" and cur["acc"] is not None:
+            return cur["acc"].get(cur["rid"], "")   # no new text this frame: cumulative unchanged
+        return t
+    text_value2._moshi_text = True
+    dp._text_value = text_value2
+    dp.PersonaPlexDataPlaneSession._project_output = _project_output
     return True
 
 
@@ -151,6 +179,20 @@ def _patch_pipeline_processor():
 
 def apply():
     applied = []
+    if os.environ.get("MOSHI_OQ_PROBE"):
+        try:
+            from .phases import install_output_queue_probe
+            if install_output_queue_probe():
+                applied.append("async_omni_engine:oq-probe")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"oq probe failed: {e!r}")
+    if os.environ.get("MOSHI_DRAIN_BATCH", "0") == "1":
+        try:
+            from .phases import install_drain_batch
+            if install_drain_batch():
+                applied.append("duplex_request_client:drain-batch")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"drain batch failed: {e!r}")
     if os.environ.get("MOSHI_PCM_FAST", "0") == "1":
         try:
             from .audio_encoding_fast import install as _pcm
