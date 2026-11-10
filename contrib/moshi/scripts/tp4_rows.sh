@@ -25,7 +25,7 @@ for n in $NS; do
   for f in $R/ph.ec.*; do [ -f $f ] && : > $f; done
   ( while true; do ps -eo pid,rss,args | grep -E "VLLM::|serve_launcher" | grep -v grep | awk '{print systime(), $1, $2, $3}' >> $R/rss_$n.log; sleep 10; done ) &
   RSSP=$!
-  python -m moshi_neuron.serving.duplex_client --wav ${WAV:-$HOME/q.wav} --sessions $n --stagger-s ${STAGGER:-0} ${VOICE:+--voice $VOICE} ${PERSONA:+--instructions "$PERSONA"} --out $R/o_$n/ > $R/c_$n.log 2>&1 &
+  python -m moshi_neuron.serving.duplex_client --wav ${WAV:-$HOME/q.wav} --sessions $n --stagger-s ${STAGGER:-0} ${CTRACE:+--trace $R/ct_$n} ${VOICE:+--voice $VOICE} ${PERSONA:+--instructions "$PERSONA"} --out $R/o_$n/ > $R/c_$n.log 2>&1 &
   CL=$!
   if [ "${SPY:-0}" = "1" ]; then
     sleep ${SPY_AT:-14}

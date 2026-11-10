@@ -289,6 +289,16 @@ class MoshiStage0Runner(OmniConnectorModelRunnerMixin):
                     st.update(enc=0.0, lm=0.0, dec=0.0, rows=0, t0=now)
         self._last = (list(scheduler_output.num_scheduled_tokens.keys()), emitted)
         self._trace("s0_exit", len(rows))
+        if os.environ.get("MOSHI_TRACE_ROWS") == "1" and os.environ.get("MOSHI_TRACE"):
+            # per-session progress: request id -> frames computed so far (one line per step, rank 0 only)
+            if getattr(self, "rank", 0) == 0 or not hasattr(self, "rank"):
+                f = self.__dict__.get("_tfr")
+                if f is None:
+                    f = self._tfr = open(f"{os.environ['MOSHI_TRACE']}.rows.{os.getpid()}", "a", buffering=1)
+                now = time.time()
+                for rid in rows:
+                    st_ = self.requests.get(rid)
+                    f.write(f"{now:.6f} {rid.split('.i.')[0][-16:]} {st_.get('computed', -1) if isinstance(st_, dict) else -1}\n")
         if os.environ.get("MOSHI_STEP_STATS", "0") == "1":
             g = self._gap
             g["last"] = time.perf_counter()

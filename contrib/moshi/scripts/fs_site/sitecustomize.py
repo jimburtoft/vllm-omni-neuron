@@ -101,3 +101,10 @@ if os.environ.get("MOSHI_TRACEMALLOC") and "serve_launcher" in _cmdline():
                     _s2.stderr.write(f"[MoshiTM] +{st.size_diff / 1e6:.1f} MB ({st.count_diff:+d}) {fr}\n")
             prev = snap
     _t2.Thread(target=_tm, daemon=True, name="moshi-tm").start()
+
+if os.environ.get("MOSHI_SWITCH_INTERVAL"):
+    # MOSHI_SWITCH_INTERVAL=<seconds>: CPython GIL switch interval (default 0.005). In the API process the frontend
+    # event loop and the orchestrator thread hand the GIL back and forth per frame; a waiting thread can sit up to
+    # one interval before it gets the GIL. Applied to every process (cheap); matters where threads contend.
+    import sys as _s3
+    _s3.setswitchinterval(float(os.environ["MOSHI_SWITCH_INTERVAL"]))
