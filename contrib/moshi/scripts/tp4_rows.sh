@@ -29,11 +29,12 @@ for n in $NS; do
   CL=$!
   if [ "${SPY:-0}" = "1" ]; then
     sleep ${SPY_AT:-14}
+    if [ -n "${PERF:-}" ]; then sudo perf record -a -g -F 199 -o $R/perf_$n.data -- sleep ${SPY_D:-8} > /dev/null 2>&1 & fi
     for p in $(pgrep -f "StageEngineCoreProc_stage0|StageEngineCoreProc_stage1|Worker_TP0|VLLM::Worker_TP0"); do
-      sudo env "PATH=$PATH" py-spy record -p $p -d ${SPY_D:-8} -r 100 -f raw -o $R/spy_${n}_$p.txt --nonblocking > /dev/null 2>&1 &
+      sudo env "PATH=$PATH" py-spy record -p $p -d ${SPY_D:-8} -r 100 ${SPY_IDLE:+--idle} ${SPY_NATIVE:+--native} -f raw -o $R/spy_${n}_$p.txt --nonblocking > /dev/null 2>&1 &
     done
     for p in $(pgrep -f "serve_launcher"); do
-      sudo env "PATH=$PATH" py-spy record -p $p -d ${SPY_D:-8} -r 100 -f raw -o $R/spy_${n}_api_$p.txt --nonblocking > /dev/null 2>&1 &
+      sudo env "PATH=$PATH" py-spy record -p $p -d ${SPY_D:-8} -r 100 ${SPY_IDLE:+--idle} ${SPY_NATIVE:+--native} -f raw -o $R/spy_${n}_api_$p.txt --nonblocking > /dev/null 2>&1 &
     done
     ps -eo pid,comm,args | grep -E "VLLM|Stage|serve_launcher" | grep -v grep > $R/ps_$n.txt
   fi

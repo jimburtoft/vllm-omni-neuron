@@ -55,6 +55,11 @@ def _patch(core_mod) -> bool:
         enough = (seen.keys() <= ready) or (frac < 1.0 and seen and have >= frac * len(seen))
         if not enough and now - st["last"] < period:
             st["held"] += 1
+            # MOSHI_FS_HOLD_SLEEP_MS: yield the CPU while holding (the engine-core loop would otherwise spin through
+            # held polls); never past the period deadline, so the step still fires on time
+            hs = float(os.environ.get("MOSHI_FS_HOLD_SLEEP_MS", "0")) / 1e3
+            if hs > 0:
+                time.sleep(max(0.0, min(hs, st["last"] + period - now)))
             return {}, False
         st["last"] = now
         out = orig(self)

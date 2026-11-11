@@ -125,3 +125,111 @@ if os.environ.get("MOSHI_API_CPUS") or os.environ.get("MOSHI_EC_CPUS"):
             os.sched_setaffinity(0, _cpus(os.environ["MOSHI_API_CPUS"]))
     except Exception:  # noqa: BLE001
         pass
+
+if os.environ.get("MOSHI_SHM_BUSY_S"):
+    # MOSHI_SHM_BUSY_S=<seconds>: vLLM's shm MessageQueue readers (TP workers waiting for the scheduler broadcast, the
+    # engine core waiting for worker results) busy-spin with sched_yield for busy_loop_s (default 1 s) after the last
+    # read before blocking on the zmq notify socket. With a step every ~60 ms they never block -> each reader burns a
+    # core. A few ms keeps the fast path for back-to-back messages and blocks between steps.
+    try:
+        import importlib.abc as _iab2
+        import importlib.util as _iu2
+        import sys as _s4
+        _busy = float(os.environ["MOSHI_SHM_BUSY_S"])
+
+        def _patch_sc(mod):
+            SC = mod.SpinCondition
+            if getattr(SC, "_moshi_busy", False):
+                return
+            _oi = SC.__init__
+
+            def _init(self, *a, **k):
+                _oi(self, *a, **k)
+                if getattr(self, "is_reader", False):
+                    self.busy_loop_s = _busy      # set after init (the reader branch assigns the default itself)
+            SC.__init__ = _init
+            SC._moshi_busy = True
+
+        _NAME = "vllm.distributed.device_communicators.shm_broadcast"
+        if _NAME in _s4.modules:
+            _patch_sc(_s4.modules[_NAME])
+        else:
+            class _F2(_iab2.MetaPathFinder):
+                def find_spec(self, fullname, path, target=None):
+                    if fullname != _NAME:
+                        return None
+                    _s4.meta_path.remove(self)
+                    spec = _iu2.find_spec(fullname)
+                    if spec is None or spec.loader is None:
+                        return spec
+                    _oe = spec.loader.exec_module
+
+                    def _ex(module):
+                        _oe(module)
+                        _patch_sc(module)
+                    spec.loader.exec_module = _ex
+                    return spec
+            _s4.meta_path.insert(0, _F2())
+    except Exception as _e:  # noqa: BLE001
+        __import__("sys").stderr.write(f"[MoshiShm] patch failed: {_e}\n")
+
+
+if os.environ.get("MOSHI_RESP_SLEEP_MS"):
+    # MOSHI_RESP_SLEEP_MS=<ms>: the stage-0 engine core waits for the TP workers' step result by spinning on the shm
+    # response queue for the whole device step (~50 ms, ~65% of a core). Sleep <ms> per empty poll instead of
+    # sched_yield (results arrive at most <ms> later). Only the engine core's response queues (reader of
+    # worker_response_mq) are affected: TP workers read the broadcast queue, which stays a fast spin.
+    try:
+        import importlib.abc as _iab3
+        import importlib.util as _iu3
+        import sys as _s5
+        import time as _t5
+        _rs = float(os.environ["MOSHI_RESP_SLEEP_MS"]) / 1e3
+        _NAME3 = "vllm.v1.executor.multiproc_executor"
+
+        def _patch_mp(mod):
+            ME = mod.MultiprocExecutor
+            if getattr(ME, "_moshi_rs", False):
+                return
+            ME._moshi_rs = True
+            _orig_init_ex = ME._init_executor
+
+            def _ie(self, *a, **k):
+                r = _orig_init_ex(self, *a, **k)
+                for mq in getattr(self, "response_mqs", []) or []:
+                    sc = getattr(mq, "_spin_condition", None)
+                    if sc is None or not getattr(sc, "is_reader", False):
+                        continue
+                    _ow = sc.wait
+
+                    def _w(timeout_ms=None, _ow=_ow, _sc=sc):
+                        if _t5.monotonic() <= _sc.last_read + _sc.busy_loop_s:
+                            _t5.sleep(_rs)
+                        else:
+                            _ow(timeout_ms)
+                    sc.wait = _w
+                    _s5.stderr.write(f"[MoshiResp] response queue wait -> sleep {_rs * 1e3:.2f} ms (pid {os.getpid()})\n")
+                return r
+            ME._init_executor = _ie
+
+        if _NAME3 in _s5.modules:
+            _patch_mp(_s5.modules[_NAME3])
+        else:
+            class _F3(_iab3.MetaPathFinder):
+                def find_spec(self, fullname, path, target=None):
+                    if fullname != _NAME3:
+                        return None
+                    _s5.meta_path.remove(self)
+                    spec = _iu3.find_spec(fullname)
+                    if spec is None or spec.loader is None:
+                        return spec
+                    _oe = spec.loader.exec_module
+
+                    def _ex(module):
+                        _oe(module)
+                        _patch_mp(module)
+                    spec.loader.exec_module = _ex
+                    return spec
+            _s5.meta_path.insert(0, _F3())
+    except Exception as _e:  # noqa: BLE001
+        __import__("sys").stderr.write(f"[MoshiResp] patch failed: {_e}\n")

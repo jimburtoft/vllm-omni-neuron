@@ -177,8 +177,59 @@ def _patch_pipeline_processor():
     return True
 
 
+def _install_spin_patches(applied):
+    """MOSHI_RESP_SLEEP_MS / MOSHI_SHM_BUSY_S in processes that do not load scripts/fs_site (stage engine cores are
+    spawned without PYTHONPATH): call the same patch code here."""
+    if not (os.environ.get("MOSHI_RESP_SLEEP_MS") or os.environ.get("MOSHI_SHM_BUSY_S")):
+        return
+    try:
+        import time as _t
+        if os.environ.get("MOSHI_SHM_BUSY_S"):
+            import vllm.distributed.device_communicators.shm_broadcast as sb
+            SC = sb.SpinCondition
+            if not getattr(SC, "_moshi_busy", False):
+                busy = float(os.environ["MOSHI_SHM_BUSY_S"])
+                oi = SC.__init__
+
+                def init(self, *a, **k):
+                    oi(self, *a, **k)
+                    if getattr(self, "is_reader", False):
+                        self.busy_loop_s = busy
+                SC.__init__ = init
+                SC._moshi_busy = True
+                applied.append(f"shm busy_loop_s={busy}")
+        if os.environ.get("MOSHI_RESP_SLEEP_MS"):
+            import vllm.v1.executor.multiproc_executor as mp
+            ME = mp.MultiprocExecutor
+            if not getattr(ME, "_moshi_rs", False):
+                rs = float(os.environ["MOSHI_RESP_SLEEP_MS"]) / 1e3
+                oe = ME._init_executor
+
+                def ie(self, *a, **k):
+                    r = oe(self, *a, **k)
+                    for mq in getattr(self, "response_mqs", []) or []:
+                        sc = getattr(mq, "_spin_condition", None)
+                        if sc is None or not getattr(sc, "is_reader", False):
+                            continue
+                        ow = sc.wait
+
+                        def w(timeout_ms=None, _ow=ow, _sc=sc):
+                            if _t.monotonic() <= _sc.last_read + _sc.busy_loop_s:
+                                _t.sleep(rs)
+                            else:
+                                _ow(timeout_ms)
+                        sc.wait = w
+                    return r
+                ME._init_executor = ie
+                ME._moshi_rs = True
+                applied.append(f"executor response wait sleep {rs * 1e3:.2f} ms")
+    except Exception as e:  # noqa: BLE001
+        applied.append(f"spin patches failed: {e!r}")
+
+
 def apply():
     applied = []
+    _install_spin_patches(applied)
     if os.environ.get("MOSHI_OQ_PROBE"):
         try:
             from .phases import install_output_queue_probe
