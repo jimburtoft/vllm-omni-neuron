@@ -180,7 +180,8 @@ def _patch_pipeline_processor():
 def _install_spin_patches(applied):
     """MOSHI_RESP_SLEEP_MS / MOSHI_SHM_BUSY_S in processes that do not load scripts/fs_site (stage engine cores are
     spawned without PYTHONPATH): call the same patch code here."""
-    if not (os.environ.get("MOSHI_RESP_SLEEP_MS") or os.environ.get("MOSHI_SHM_BUSY_S")):
+    if not (os.environ.get("MOSHI_RESP_SLEEP_MS") or os.environ.get("MOSHI_SHM_BUSY_S")
+            or os.environ.get("MOSHI_SHM_NOTIFY_POLL") == "1"):
         return
     try:
         import time as _t
@@ -198,6 +199,31 @@ def _install_spin_patches(applied):
                 SC.__init__ = init
                 SC._moshi_busy = True
                 applied.append(f"shm busy_loop_s={busy}")
+        if os.environ.get("MOSHI_SHM_NOTIFY_POLL", "0") == "1":
+            # backport vllm #63165: a reader that never idles never services its CONFLATE notify socket; libzmq
+            # queues one internal command per write (~41 B each, ~23 MiB/h per process at a 5.7 ms step).
+            # Poll it (timeout 0) at most every 2 s from record_read().
+            import vllm.distributed.device_communicators.shm_broadcast as sb2
+            SC2 = sb2.SpinCondition
+            if not getattr(SC2, "_moshi_np", False):
+                import zmq as _zmq
+                orr = SC2.record_read
+
+                def record_read(self):
+                    orr(self)
+                    lp = getattr(self, "_moshi_lnp", None)
+                    if lp is None:
+                        self._moshi_lnp = self.last_read
+                    elif self.last_read - lp >= 2.0:
+                        self._moshi_lnp = self.last_read
+                        try:
+                            if self.local_notify_socket.poll(timeout=0):
+                                self.local_notify_socket.recv(flags=_zmq.NOBLOCK, copy=False)
+                        except Exception:  # noqa: BLE001
+                            pass
+                SC2.record_read = record_read
+                SC2._moshi_np = True
+                applied.append("shm notify poll (#63165)")
         if os.environ.get("MOSHI_RESP_SLEEP_MS"):
             import vllm.v1.executor.multiproc_executor as mp
             ME = mp.MultiprocExecutor
@@ -230,6 +256,13 @@ def _install_spin_patches(applied):
 def apply():
     applied = []
     _install_spin_patches(applied)
+    if os.environ.get("MOSHI_B64_CACHE", "0") == "1" and "serve_launcher" in " ".join(__import__("sys").argv):
+        try:
+            from .phases import install_b64_cache
+            if install_b64_cache():
+                applied.append("base64 decode memo (#9705-style)")
+        except Exception as e:  # noqa: BLE001
+            applied.append(f"b64 cache failed: {e!r}")
     if os.environ.get("MOSHI_OQ_PROBE"):
         try:
             from .phases import install_output_queue_probe

@@ -37,7 +37,16 @@ def _patch(core_mod) -> bool:
             logger.warning("[MoshiFS] frame-sync gate %s (period %.0f ms, worker_cls %s, pid %d)",
                            "ON" if st["on"] else "off", period * 1e3, wc, os.getpid())
         if not st["on"]:
-            return orig(self)
+            # MOSHI_S1_IDLE_SLEEP_MS (stage 1 / any non-stage-0 engine core): resumable requests keep the core "busy",
+            # so its loop runs empty steps back to back (~865/s on the PersonaPlex pass-through stage, ~0.4 core).
+            # Sleep briefly after a step that scheduled nothing; a new stage-0 chunk is picked up <= that much later.
+            out = orig(self)
+            s1 = st.get("s1_sleep")
+            if s1 is None:
+                s1 = st["s1_sleep"] = float(os.environ.get("MOSHI_S1_IDLE_SLEEP_MS", "0")) / 1e3
+            if s1 > 0 and isinstance(out, tuple) and len(out) == 2 and not out[1]:
+                time.sleep(s1)
+            return out
         from vllm.v1.request import RequestStatus as RS
         sched = self.scheduler
         ready = {rid for rid, r in sched.requests.items()

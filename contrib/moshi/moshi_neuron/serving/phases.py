@@ -578,3 +578,34 @@ def install_output_queue_probe():
         threading.Thread(target=run, daemon=True, name="moshi-oq").start()
     E.__init__ = init
     return True
+
+
+def install_b64_cache():
+    """MOSHI_B64_CACHE=1 (API-server process), in the spirit of vllm-omni #9705 root cause 2: one 80 ms input frame's
+    base64 audio is decoded 4-5 times on the 0.29 append path (speech-heuristic RMS, payload size accounting, PCM
+    append buffer, append-plan validation, request build). Memoize base64.b64decode for the 256 most recent large strings (exact-string key), returning the same
+    bytes object. Results identical."""
+    import base64 as b64
+    if getattr(b64, "_moshi_cache", False):
+        return False
+    orig = b64.b64decode
+    cache = {}
+    order = []
+
+    def b64decode(s, altchars=None, validate=False):
+        if isinstance(s, str) and altchars is None and len(s) >= 1024:
+            key = (s, bool(validate))                # exact string + validate flag (same result and errors as stock)
+            hit = cache.get(key)
+            if hit is not None:
+                return hit
+            out = orig(s, validate=validate)
+            cache[key] = out
+            order.append(key)
+            if len(order) > 256:
+                cache.pop(order.pop(0), None)
+            return out
+        return orig(s, altchars=altchars, validate=validate)
+
+    b64.b64decode = b64decode
+    b64._moshi_cache = True
+    return True
