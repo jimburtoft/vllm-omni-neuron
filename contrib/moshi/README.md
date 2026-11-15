@@ -35,10 +35,10 @@ The Neuron side keeps up with more: stage 0 runs at the required frame rate for 
 is the vLLM-Omni API server process on the host (one Python process for the WebSocket frontend and the
 orchestrator), not the device.
 
-**With upcoming vLLM-Omni** (unified duplex framework plus its pending duplex CPU fixes) and the same Neuron
-workers: **56 PersonaPlex sessions x 4 minutes per trn2.3xlarge-equivalent (12 vCPUs), every frame on time, p50
-69-93 / p99 197 ms**, with the API server process pinned to its own physical core. The device keeps up with 64
-sessions there; the API process is again the next limit.
+**With upcoming vLLM-Omni** (unified duplex framework, its pending duplex CPU fixes, and the duplex orchestrator in
+its own process) and the same Neuron workers: **64 PersonaPlex sessions x 4 minutes per trn2.3xlarge-equivalent
+(12 vCPUs), every frame on time, p50 63-80 / p99 146-158 ms**, with the API server process and the orchestrator
+process each pinned to their own physical core. At 64 the device is again the limit (68 sessions fall behind).
 
 **moshiko / moshika** (3000-frame window), served, audio streamed at real-time pace, 28.8 s conversation:
 
