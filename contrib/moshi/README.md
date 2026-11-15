@@ -22,19 +22,23 @@ device memory per session row; only 1920 PCM samples and ~10 tokens cross the ho
 ## Results (one trn2.3xlarge, SDK 2.33)
 
 **Highest capacity: PersonaPlex, TP4 throughput layout, packed FP8 KV cache** (`nvidia/personaplex-7b-v1`, voice
-prompt + persona, 1500-frame attention window as in the PersonaPlex reference; sessions arriving 0.5-1 s apart):
+prompt + persona, 1500-frame attention window as in the PersonaPlex reference; sessions arriving 1 s apart; trn2.3xlarge,
+12 vCPUs):
 
 | Session length | Concurrent sessions | Every frame on time | Per-frame latency p50 / p99 |
 |---|---|---|---|
-| 4 minutes | **36** | yes | 39-51 / 230 ms |
-| 60 s | 36 | yes | 54-68 / 1275 ms |
-| 60 s | 40 | 740 / 750 frames | 1.0-1.2 s (output path queues) |
-| 4 minutes | 40 | no (2727 / 3000 frames) | 7.8-10.8 s |
+| 4 minutes | 36 | yes | 36-47 / 248 ms |
+| 4 minutes | **40** | yes | **56-64 / 112 ms** |
+| 60 s | 44 | no (695 / 750 frames) | 2.4-3.1 s |
 
-The Neuron side keeps up with more: in steady state stage 0 processes exactly the required frames per second
-for 40, 44 and 48 sessions (stage-0 step ~51 ms at 40 rows). Above ~36-40 sessions the limit is the vLLM-Omni API
-server process (WebSocket frontend and orchestrator share one Python GIL), not the device; the vLLM-Omni
-multi-process orchestrator / multi-frontend work upstream addresses this.
+The Neuron side keeps up with more: stage 0 runs at the required frame rate for 44-48 sessions. Above 40 the limit
+is the vLLM-Omni API server process on the host (one Python process for the WebSocket frontend and the
+orchestrator), not the device.
+
+**With upcoming vLLM-Omni** (unified duplex framework plus its pending duplex CPU fixes) and the same Neuron
+workers: **56 PersonaPlex sessions x 4 minutes per trn2.3xlarge-equivalent (12 vCPUs), every frame on time, p50
+69-93 / p99 197 ms**, with the API server process pinned to its own physical core. The device keeps up with 64
+sessions there; the API process is again the next limit.
 
 **moshiko / moshika** (3000-frame window), served, audio streamed at real-time pace, 28.8 s conversation:
 
@@ -122,7 +126,7 @@ session has filled (young sessions are cheap; at a full 4-minute window it falls
 step runs the smallest one that covers the active sessions, so the step time (and latency) scales with load instead
 of always paying for the maximum batch. Each bucket adds a compile on first start (cached afterwards).
 
-### PersonaPlex, 36-40 sessions per instance (TP4, packed FP8 KV)
+### PersonaPlex, 40 sessions per instance (TP4, packed FP8 KV)
 
 `nvidia/personaplex-7b-v1` is gated on Hugging Face (request access first). Serve the local snapshot directory (the
 voice prompts are resolved from its `voices.tgz`):
@@ -137,7 +141,8 @@ export MOSHI_CONTEXT=1500 MOSHI_KV_SLOTS=1536 MOSHI_CTX_BUCKETS=512,1024 MOSHI_B
   MOSHI_FAST_APPEND=1 MOSHI_CONS_FIX=1 MOSHI_MARKS_FIX=1 MOSHI_WS_NO_DEFLATE=1 \
   MOSHI_STAGE_EVENTS_CAP=64 MOSHI_MARK_COALESCE=1 MOSHI_SNAP_FIX=1 \
   MOSHI_PCM_FAST=1 MOSHI_SHM_PROBE=1 MOSHI_API_TORCH_THREADS=4 \
-  MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 MOSHI_NC_COUNT=4
+  MOSHI_S0_DECODE=1 MOSHI_MLP_XW=1 MOSHI_NC_COUNT=4 \
+  NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=0 MOSHI_RESP_SLEEP_MS=0.5
 MOSHI_B=48 MOSHI_TP0=4 MOSHI_DEV0=0,1,2,3 MOSHI_DEV1=0 python -m moshi_neuron.serving.make_deploy /tmp/pp_tp4.yaml
 python -m moshi_neuron.serving.serve_launcher serve $PP --deploy-config /tmp/pp_tp4.yaml --port 8000 --omni \
     --init-timeout 10800 --stage-init-timeout 10800
@@ -153,6 +158,10 @@ What the main switches do:
   arrived, so each step carries close to all active sessions instead of splitting a tick into partial batches.
 - `MOSHI_DEP_RUN=8`: only the agent-stream depth-transformer steps run (PersonaPlex also predicts the user stream).
 - `MOSHI_GC_FULL=0`: no automatic gen-2 garbage collection (its pauses grow to ~1 s over a 4-minute session).
+- `NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=0`: the Neuron runtime's per-worker completion threads stop
+  busy-polling (~2.2 host cores saved on 12 vCPUs; device step unchanged).
+- `MOSHI_RESP_SLEEP_MS=0.5`: the stage-0 engine core sleeps 0.5 ms per empty poll of the TP workers' response queue
+  instead of spinning for the whole device step (~0.65 core).
 
 For calls longer than about 2 minutes, keep the system prompt in context with pinning:
 `MOSHI_PP_PIN=160 MOSHI_KV_SLOTS=2048 VLLM_NEURON_ATTN_MASK_TORCH=1` and no `MOSHI_CTX_BUCKETS`. This was measured
