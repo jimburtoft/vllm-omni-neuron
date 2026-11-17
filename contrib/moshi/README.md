@@ -36,10 +36,9 @@ is the vLLM-Omni API server process on the host (one Python process for the WebS
 orchestrator), not the device.
 
 **With upcoming vLLM-Omni** (unified duplex framework, its pending duplex CPU fixes, and the duplex orchestrator in
-its own process) and the same Neuron workers, on a trn2.3xlarge: **60 PersonaPlex sessions x 4 minutes, every frame
-on time, p50 63-79 / p99 140 ms** (client on the same instance), with the API server process and the orchestrator
-process each pinned to their own physical core (Neuron workers on the other four). 64 is ~4 ms per step short (host
-work around the device step).
+its own process) and the same Neuron workers, on a trn2.3xlarge: **64 PersonaPlex sessions x 4 minutes, every frame
+on time, p50 59-109 / p99 221-451 ms** (3 runs, client on the same instance), with the API server process and the
+orchestrator process each pinned to their own physical core (Neuron workers on the other four). 68 is marginal.
 
 **moshiko / moshika** (3000-frame window), served, audio streamed at real-time pace, 28.8 s conversation:
 
