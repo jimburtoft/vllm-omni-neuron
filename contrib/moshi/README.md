@@ -36,11 +36,25 @@ is the vLLM-Omni API server process on the host (one Python process for the WebS
 orchestrator), not the device.
 
 **With upcoming vLLM-Omni** (unified duplex framework, its pending duplex CPU fixes, and the duplex orchestrator in
-its own process) and the same Neuron workers, on a trn2.3xlarge: **72 PersonaPlex sessions x 4 minutes, every frame
-on time, p50 53-114 / p99 106-777 ms** (3 runs, client on the same instance) with PersonaPlex as a single pipeline
-stage (the Neuron workers decode the audio and hand it straight to the realtime front end), and 64 with the
-two-stage pipeline. API server process and orchestrator process each pinned to their own physical core (Neuron
-workers on the other four).
+its own process) and the same Neuron workers, on a trn2.3xlarge, client on the same instance, API server and
+orchestrator process each pinned to their own physical core (Neuron workers on the other four):
+
+| PersonaPlex, 4-minute sessions | sessions | every frame on time | latency p50 / p99 |
+|---|---|---|---|
+| two-stage pipeline | 64 | yes (3 of 3) | 59-109 / 221-451 ms |
+| single stage (the Neuron workers decode the audio and hand it straight to the realtime front end) | 72 | yes (3 of 3) | 53-114 / 106-777 ms |
+| + `MOSHI_DEP_NKI_MINB=1 MOSHI_KV_BLOCK=12`, context buckets `768` | **80** | **yes (4 of 4)** | **54-97 / 123-515 ms** |
+| same | 84 | 2 of 5 (the edge) | 55-72 / 518-988 ms on the clean runs |
+| same, BF16 KV cache instead of FP8 | 64 | yes (2 of 2) | 53-90 / 446-487 ms |
+
+`MOSHI_DEP_NKI_MINB=1` runs the depth transformer with the NKI kernel. `MOSHI_KV_BLOCK=12` makes the KV-cache block
+12 slots. At the 1536-slot window the attention kernel then keeps whole 12-position blocks; it no longer splits
+32-slot blocks into 4-position pieces, so each KV read is 3x larger. Together they take about 7 ms off the model step at
+full load.
+
+Quality at 84 sessions:
+- Teacher-forced against the fp32 reference: text 99.3 %, audio codes 97.8 %.
+- Whisper's transcript of the output speech vs the model's own text: WER 0.110 mean / 0.105 median.
 
 **moshiko / moshika** (3000-frame window), served, audio streamed at real-time pace, 28.8 s conversation:
 
@@ -159,6 +173,14 @@ What the main switches do:
 - `MOSHI_FRAMESYNC=1 MOSHI_FS_PERIOD_MS=60`: stage 0 waits (up to 60 ms) until the sessions' next frames have
   arrived, so each step carries close to all active sessions instead of splitting a tick into partial batches.
 - `MOSHI_DEP_RUN=8`: only the agent-stream depth-transformer steps run (PersonaPlex also predicts the user stream).
+- `MOSHI_DEP_NKI_MINB=1`: the depth transformer runs as one NKI kernel per step (6 layers) instead of the compiled
+  torch chain (~3.5 ms off the step at 72 sessions, accuracy unchanged).
+- `MOSHI_KV_BLOCK=12` (with `MOSHI_CTX_BUCKETS=768`): the KV cache uses 12-slot blocks.
+  - The attention kernel splits blocks until there are 128 per row. At the 1536-slot window, 32-slot blocks become
+    4-position pieces, while 12-slot blocks stay whole. Each KV read is then 3x larger, and a BF16 KV cache keeps the
+    kernel's DMA-transpose load.
+  - Context buckets must be multiples of 384 and resize to an even block length, so 768 and 1536 work but 384 and
+    1152 do not.
 - `MOSHI_GC_FULL=0`: no automatic gen-2 garbage collection (its pauses grow to ~1 s over a 4-minute session).
 - `NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=0`: the Neuron runtime's per-worker completion threads stop
   busy-polling (~2.2 host cores saved on 12 vCPUs; device step unchanged).
