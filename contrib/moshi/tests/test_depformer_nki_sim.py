@@ -51,11 +51,13 @@ def main():
     wgT, wuT, wdT = r(L, D, FF), r(L, D, FF), r(L, FF, D)
     n1 = (1 + 0.1 * rng.standard_normal((L, D))).astype(np.float32)
     n2 = (1 + 0.1 * rng.standard_normal((L, D))).astype(np.float32)
-    y, kn, vn = nki.simulate(depformer_step)(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps)
+    split = int(os.environ.get("SPLIT", "0"))
+    kern = depformer_step[2] if split else depformer_step
+    y, kn, vn = nki.simulate(kern)(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps, 4, split)
     yr, knr, vnr = ref(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps)
     y = y.astype(np.float32)
     rel = lambda a, b: float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-12))
-    print(f"B={B} s={s}: y rel {rel(y, yr):.4f}  k rel {rel(kn.astype(np.float32), knr):.4f}  "
+    print(f"split={split} B={B} s={s}: y rel {rel(y, yr):.4f}  k rel {rel(kn.astype(np.float32), knr):.4f}  "
           f"v rel {rel(vn.astype(np.float32), vnr):.4f}  cos {float((y * yr).sum() / np.linalg.norm(y) / np.linalg.norm(yr)):.5f}")
 
 

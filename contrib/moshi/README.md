@@ -45,6 +45,8 @@ orchestrator process each pinned to their own physical core (Neuron workers on t
 | single stage (the Neuron workers decode the audio and hand it straight to the realtime front end) | 72 | yes (3 of 3) | 53-114 / 106-777 ms |
 | + `MOSHI_DEP_NKI_MINB=1 MOSHI_KV_BLOCK=12`, context buckets `768` | **80** | **yes (4 of 4)** | **54-97 / 123-515 ms** |
 | same | 84 | 2 of 5 (the edge) | 55-72 / 518-988 ms on the clean runs |
+| + `MOSHI_DEP_FUSED=1`, max batch 92 | **92** | **yes (2 of 2)** | **60-102 / 421-1417 ms** |
+| same | 88 | yes (2 of 2 on a max-batch-88 server; clean on the 92 server) | 57-73 / 136-339 ms |
 | same, BF16 KV cache instead of FP8 | 64 | yes (2 of 2) | 53-90 / 446-487 ms |
 
 `MOSHI_DEP_NKI_MINB=1` runs the depth transformer with the NKI kernel. `MOSHI_KV_BLOCK=12` makes the KV-cache block
@@ -52,9 +54,15 @@ orchestrator process each pinned to their own physical core (Neuron workers on t
 32-slot blocks into 4-position pieces, so each KV read is 3x larger. Together they take about 7 ms off the model step at
 full load.
 
+`MOSHI_DEP_FUSED=1` runs the whole depth transformer of a frame in one NKI launch: all 8 codebook steps, each
+step's output head, exact top-k sampling (k = 250, the 8-wide hardware top-k primitives) and the next code's
+embedding (`moshi_neuron/kernels/depformer_fused_nki.py`). That removes 8 launches and the host-side glue between
+them, ~5 ms per frame. Teacher-forced accuracy is unchanged (text 99.3 %, audio codes 97.8 %).
+
 Quality at 84 sessions:
 - Teacher-forced against the fp32 reference: text 99.3 %, audio codes 97.8 %.
-- Whisper's transcript of the output speech vs the model's own text: WER 0.110 mean / 0.105 median.
+- Whisper's transcript of the output speech vs the model's own text: WER 0.110 mean / 0.105 median (0.100 / 0.094 at
+  88 sessions with the fused depth transformer).
 
 **moshiko / moshika** (3000-frame window), served, audio streamed at real-time pace, 28.8 s conversation:
 
@@ -175,6 +183,8 @@ What the main switches do:
 - `MOSHI_DEP_RUN=8`: only the agent-stream depth-transformer steps run (PersonaPlex also predicts the user stream).
 - `MOSHI_DEP_NKI_MINB=1`: the depth transformer runs as one NKI kernel per step (6 layers) instead of the compiled
   torch chain (~3.5 ms off the step at 72 sessions, accuracy unchanged).
+- `MOSHI_DEP_FUSED=1` (with `MOSHI_DEP_NKI_MINB=1`): the whole depth transformer, its heads, top-k sampling and code
+  embeddings in one NKI launch per frame. It needs the default multinomial sampler (`MOSHI_SAMPLER=multinomial`).
 - `MOSHI_KV_BLOCK=12` (with `MOSHI_CTX_BUCKETS=768`): the KV cache uses 12-slot blocks.
   - The attention kernel splits blocks until there are 128 per row. At the 1536-slot window, 32-slot blocks become
     4-position pieces, while 12-slot blocks stay whole. Each KV read is then 3x larger, and a BF16 KV cache keeps the

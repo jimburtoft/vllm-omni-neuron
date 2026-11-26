@@ -46,6 +46,8 @@ DC = D // P            # 8 chunks of the model dim
 FC = (FF + P - 1) // P  # 22 chunks of the FFN dim (2816 = 22 * 128)
 NMAX = 512
 QMAX = 16             # max depformer positions per frame (moshiko 8, PersonaPlex 16)
+import os as _os
+FAST_PV = _os.environ.get("MOSHI_DEP_NKI_FASTPV", "0") == "1"   # broadcast P.V multiply (trace-time switch)
 
 
 def _rms_T(dstT, srcT, w_sb, B, eps):
@@ -90,6 +92,41 @@ def _proj(out_sb, hT, w_hbm, layer, B, n_out):
         nisa.tensor_copy(dst=out_sb[:, n0:n0 + nn], src=ps[:, 0:nn])
 
 
+def _proj_split(out_sb, hT, w_hbm, layer, B, n_out, prg, nprg, pipe):
+    """Like _proj, but on an LNC2 pair each core computes half of the output columns (its own weight half, so each core
+    streams half the weights), then the two halves are exchanged with sendrecv so both cores hold the full out_sb.
+    n_out/2 must be a multiple of 128 (qkv 3072, o 1024, gate/up 2816 -> 1408 = 11 x 128, down 1024)."""
+    if nprg == 1:
+        _proj(out_sb, hT, w_hbm, layer, B, n_out)
+        return
+    half = n_out // 2
+    kin = hT.shape[1]
+    c0 = prg * half
+    wv = w_hbm[layer].reshape((kin, P, n_out)).rearrange(("c", "p", "n"), ("p", "c", "n"))
+    mine = nl.ndarray((B, half), dtype=nl.float32, buffer=nl.sbuf)
+    nblk = (half + NMAX - 1) // NMAX
+    wts = []
+    for bi in range(nblk):
+        n0 = bi * NMAX
+        nn = min(NMAX, half - n0)
+        wt = nl.ndarray((P, kin, NMAX), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=wt[:, :, 0:nn], src=wv[:, :, c0 + n0:c0 + n0 + nn])
+        wts.append((wt, n0, nn))
+    for wt, n0, nn in wts:
+        ps = nl.ndarray((B, NMAX), dtype=nl.float32, buffer=nl.psum)
+        for c in range(kin):
+            nisa.nc_matmul(dst=ps[:, 0:nn], stationary=hT[:, c, :], moving=wt[:, c, 0:nn])
+        nisa.tensor_copy(dst=mine[:, n0:n0 + nn], src=ps[:, 0:nn])
+    other = nl.ndarray((B, half), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.sendrecv(src=mine, dst=other, send_to_rank=1 - prg, recv_from_rank=1 - prg, pipe_id=pipe)
+    if prg == 0:
+        nisa.tensor_copy(dst=out_sb[:, 0:half], src=mine)
+        nisa.tensor_copy(dst=out_sb[:, half:n_out], src=other)
+    else:
+        nisa.tensor_copy(dst=out_sb[:, 0:half], src=other)
+        nisa.tensor_copy(dst=out_sb[:, half:n_out], src=mine)
+
+
 def _transpose_to_T(dstT, src, B, nchunks):
     """src [B, nchunks*128] (fp32 SBUF) -> dstT [128, nchunks, B] (bf16) via PE transposes."""
     for c in range(nchunks):
@@ -101,9 +138,15 @@ def _transpose_to_T(dstT, src, B, nchunks):
 
 
 @nki.jit
-def depformer_step(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps, ver=3):
+def depformer_step(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps, ver=3, split=0):
     # `ver`: lite's NKI cache keys on this top-level source + args only -- bump it when a helper changes.
     B = x.shape[0]
+    # split=1 (MOSHI_DEP_NKI_SPLIT): the two LNC2 cores each compute half of every projection's output columns and
+    # exchange halves; otherwise both cores run the whole step redundantly (the grid-2 launch was not sharded).
+    nprg = nl.num_programs(0) if split else 1
+    prg = nl.program_id(0) if split else 0
+    proj = (lambda o_, h_, w_, l_, n_, pp: _proj_split(o_, h_, w_, l_, B, n_, prg, nprg, pp)) if split else \
+        (lambda o_, h_, w_, l_, n_, pp: _proj(o_, h_, w_, l_, B, n_))
     y = nl.ndarray((B, D), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     k_new = nl.ndarray((L, B, D), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     v_new = nl.ndarray((L, B, D), dtype=nl.bfloat16, buffer=nl.shared_hbm)
@@ -123,19 +166,41 @@ def depformer_step(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps, ver=3):
         hT = nl.ndarray((P, DC, B), dtype=nl.bfloat16, buffer=nl.sbuf)
         _rms_T(hT, xT, w1, B, eps)
         qkv = nl.ndarray((B, 3 * D), dtype=nl.float32, buffer=nl.sbuf)
-        _proj(qkv, hT, wqkvT, l, B, 3 * D)
+        proj(qkv, hT, wqkvT, l, 3 * D, 0)
         # this step's k, v -> HBM for the caller's cache
         kb = nl.ndarray((B, D), dtype=nl.bfloat16, buffer=nl.sbuf)
         vb = nl.ndarray((B, D), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.tensor_copy(dst=kb, src=qkv[:, D:2 * D])
         nisa.tensor_copy(dst=vb, src=qkv[:, 2 * D:3 * D])
-        nisa.dma_copy(dst=k_new[l, 0:B, 0:D], src=kb)
-        nisa.dma_copy(dst=v_new[l, 0:B, 0:D], src=vb)
+        if prg == 0:
+            nisa.dma_copy(dst=k_new[l, 0:B, 0:D], src=kb)
+            nisa.dma_copy(dst=v_new[l, 0:B, 0:D], src=vb)
         # scores over positions 0..s: elementwise on [B, D] tiles, per-head sums on the free axis
         npos = s + 1
         sc = nl.ndarray((B, NH, QMAX), dtype=nl.float32, buffer=nl.sbuf)
         vall = nl.ndarray((B, QMAX, D), dtype=nl.float32, buffer=nl.sbuf)
-        for j in range(npos):
+        if FAST_PV and s > 0:
+            # all earlier positions at once: one [B, s, D] load each for K and V (instead of 2 DMAs + 2 casts per
+            # position), one multiply q x K over [B, s, D] and one per-head reduce -> scores [B, s, NH]
+            kall_b = nl.ndarray((B, QMAX, D), dtype=nl.bfloat16, buffer=nl.sbuf)
+            vall_b = nl.ndarray((B, QMAX, D), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kall_b[:, 0:s, :], src=kc[l, 0:B, 0:s, 0:D])
+            nisa.dma_copy(dst=vall_b[:, 0:s, :], src=vc[l, 0:B, 0:s, 0:D])
+            nisa.tensor_copy(dst=vall[:, 0:s, :], src=vall_b[:, 0:s, :])
+            prods = nl.ndarray((B, QMAX, D), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=prods[:, 0:s, :], data1=kall_b[:, 0:s, :],
+                               data2=qkv[:, 0:D].reshape((B, 1, D)).broadcast(1, s), op=nl.multiply)
+            sc_t = nl.ndarray((B, QMAX, NH), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=sc_t[:, 0:s, :], data=prods[:, 0:s, :].reshape((B, s, NH, HD)), op=nl.add, axis=(3,))
+            for j in range(s):
+                nisa.tensor_copy(dst=sc[:, :, j], src=sc_t[:, j, :])
+            kj = nl.ndarray((B, D), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=kj, src=kb)
+            nisa.tensor_copy(dst=vall[:, s, :], src=vb)
+            prod = nl.ndarray((B, D), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=prod, data1=qkv[:, 0:D], data2=kj, op=nl.multiply)
+            nisa.tensor_reduce(dst=sc[:, :, s], data=prod.reshape((B, NH, HD)), op=nl.add, axis=(2,))
+        for j in (range(npos) if not (FAST_PV and s > 0) else ()):
             kj = nl.ndarray((B, D), dtype=nl.float32, buffer=nl.sbuf)
             if j < s:
                 kjb = nl.ndarray((B, D), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -167,14 +232,20 @@ def depformer_step(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps, ver=3):
             pj = nl.ndarray((B, NH), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_tensor(dst=pj, data1=ex[:, :, j], data2=den, op=nl.multiply)
             tj = nl.ndarray((B, NH, HD), dtype=nl.float32, buffer=nl.sbuf)
-            for h in range(NH):
-                nisa.tensor_scalar(dst=tj[:, h, :], data=vall[:, j, h * HD:(h + 1) * HD], op0=nl.multiply,
-                                   operand0=pj[:, h:h + 1])
+            if FAST_PV:
+                # one broadcast multiply for all 16 heads (p_j[b, h] broadcast over the 64 head dims), instead of 16
+                # per-head tensor_scalar ops
+                nisa.tensor_tensor(dst=tj, data1=vall[:, j, :].reshape((B, NH, HD)),
+                                   data2=pj.reshape((B, NH, 1)).broadcast(2, HD), op=nl.multiply)
+            else:
+                for h in range(NH):
+                    nisa.tensor_scalar(dst=tj[:, h, :], data=vall[:, j, h * HD:(h + 1) * HD], op0=nl.multiply,
+                                       operand0=pj[:, h:h + 1])
             nisa.tensor_tensor(dst=att, data1=att, data2=tj.reshape((B, D)), op=nl.add)
         attT = nl.ndarray((P, DC, B), dtype=nl.bfloat16, buffer=nl.sbuf)
         _transpose_to_T(attT, att, B, DC)
         o = nl.ndarray((B, D), dtype=nl.float32, buffer=nl.sbuf)
-        _proj(o, attT, woT, l, B, D)
+        proj(o, attT, woT, l, D, 1)
         nisa.tensor_tensor(dst=xr, data1=xr, data2=o, op=nl.add)
         # --- MLP sub-block
         xT2 = nl.ndarray((P, DC, B), dtype=nl.float32, buffer=nl.sbuf)
@@ -185,18 +256,19 @@ def depformer_step(x, kc, vc, wqkvT, woT, wgT, wuT, wdT, n1, n2, s, eps, ver=3):
         _rms_T(h2T, xT2, w2, B, eps)
         g = nl.ndarray((B, FF), dtype=nl.float32, buffer=nl.sbuf)
         u = nl.ndarray((B, FF), dtype=nl.float32, buffer=nl.sbuf)
-        _proj(g, h2T, wgT, l, B, FF)
-        _proj(u, h2T, wuT, l, B, FF)
+        proj(g, h2T, wgT, l, FF, 0)
+        proj(u, h2T, wuT, l, FF, 1)
         sg = nl.ndarray((B, FF), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(dst=sg, op=nl.silu, data=g)
         nisa.tensor_tensor(dst=sg, data1=sg, data2=u, op=nl.multiply)
         sgT = nl.ndarray((P, FC, B), dtype=nl.bfloat16, buffer=nl.sbuf)
         _transpose_to_T(sgT, sg, B, FC)
         dn = nl.ndarray((B, D), dtype=nl.float32, buffer=nl.sbuf)
-        _proj(dn, sgT, wdT, l, B, D)
+        proj(dn, sgT, wdT, l, D, 0)
         nisa.tensor_tensor(dst=xr, data1=xr, data2=dn, op=nl.add)
 
     yb = nl.ndarray((B, D), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.tensor_copy(dst=yb, src=xr)
-    nisa.dma_copy(dst=y[0:B, 0:D], src=yb)
+    if prg == 0:
+        nisa.dma_copy(dst=y[0:B, 0:D], src=yb)
     return y, k_new, v_new

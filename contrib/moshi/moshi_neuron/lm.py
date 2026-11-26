@@ -107,6 +107,7 @@ def sample(logits, gumbel, temp: float, top_k: int):
 
 
 _TOPK_BISECT = int(os.environ.get("MOSHI_TOPK_BISECT", "0"))
+_FASTPV = os.environ.get("MOSHI_DEP_NKI_FASTPV", "0") == "1"   # NKI depformer cache-key version follows the kernel variant
 
 
 class MoshiLM(nn.Module):
@@ -133,11 +134,18 @@ class MoshiLM(nn.Module):
 
         # ---- input embeddings: one flat table [text (32001) | audio_0 (2049) | ... | audio_15 (2049)]
         tabs = [g("text_emb.weight")] + [g(f"emb.{k}.weight") for k in range(cfg.n_q)]
-        self.emb = P(torch.cat(tabs, 0))
+        # MOSHI_EMB_ZROW=1 (default): one zero row appended at index V; invalid tokens (< 0) index it, so the
+        # frame embedding is a plain gather + sum. The `* valid` form lowers to ~2k serial row DMAs from B >= 56
+        # (11 ms at B=56 vs 0.4 ms at B=52 on trn2, Task 046); the zero-row form stays ~0.5 ms.
+        self.emb_zrow = os.environ.get("MOSHI_EMB_ZROW", "1") == "1"
+        self.emb_V = sum(t.shape[0] for t in tabs)
         offs = [0]
         for t in tabs[:-1]:
             offs.append(offs[-1] + t.shape[0])
         self.register_buffer("emb_off", torch.tensor(offs).view(1, -1), persistent=False)
+        if self.emb_zrow:
+            tabs = tabs + [torch.zeros(1, tabs[0].shape[1], dtype=tabs[0].dtype)]
+        self.emb = P(torch.cat(tabs, 0))
 
         self.layers = nn.ModuleList()
         # Interleaved RoPE == rotate-half RoPE after permuting each head's Q/K output rows from [r0,i0,r1,i1,...] to
@@ -186,6 +194,12 @@ class MoshiLM(nn.Module):
             self.fp8_packed = self.fp8_kv and os.environ.get("MOSHI_FP8_PACKED", "0") == "1"
             # 0 = auto: split only odd B (see _attn_chunks); >0 = fixed chunk size
             self.attn_chunk = int(os.environ.get("MOSHI_ATTN_CHUNK", "0"))
+            # MOSHI_FP8_FUSED_MASK=1: keep pos_ids on the FP8 path (fp8_fused_mask_allowed=True), so nkilib builds the
+            # mask for its own head-folded batch; without it vllm-neuron pre-generates the mask for the unfolded
+            # (B, heads) shape, which is laid out wrongly for odd B (see _attn_chunks). With it, one call for any B.
+            # Correct for every B (same teacher-forced accuracy as the split). Opt-in: TP4 frame vs the odd-B split
+            # B=17 -8 %, B=33 -3 %, B=71 +5 % (one 284-row-per-core call is slower than 70 + 1); serving buckets are even.
+            self.fp8_fused_mask = self.fp8_kv and os.environ.get("MOSHI_FP8_FUSED_MASK", "0") == "1"
             if self.fp8_kv:
                 import json
                 fmax = float(os.environ.get("MOSHI_FP8_MAX", "240"))
@@ -319,6 +333,15 @@ class MoshiLM(nn.Module):
             from .kernels.depformer_nki import depformer_step
             self._dep_k = wrap_nki(depformer_step)
             self._dep_grid = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"))
+            # MOSHI_DEP_NKI_SPLIT=1: the two LNC2 cores split every depformer projection's columns (half the weights
+            # each) instead of both running the full step.
+            self._dep_split = 1 if (os.environ.get("MOSHI_DEP_NKI_SPLIT", "0") == "1" and self._dep_grid == 2) else 0
+            # MOSHI_DEP_FUSED=1: all depformer steps + head + top-k sampling + code embedding in ONE NKI launch
+            # (kernels/depformer_fused_nki.py). Needs the multinomial sampler (one uniform per row and step).
+            self.dep_fused = os.environ.get("MOSHI_DEP_FUSED", "0") == "1"
+            if self.dep_fused:
+                from .kernels.depformer_fused_nki import depformer_all
+                self._dep_all = wrap_nki(depformer_all)
         self.dep_in_fused = os.environ.get("MOSHI_DEP_IN_FUSED", "1") == "1"
 
     # ---------------------------------------------------------------- temporal transformer
@@ -392,9 +415,12 @@ class MoshiLM(nn.Module):
         return tout, F.linear(tout, self.text_linear).float()[:, 0]  # [B,32000]
 
     def _attn_chunks(self, B, H):
-        """Row ranges for the per-layer attention kernel calls. bf16 KV: one call. FP8 KV: fixed chunks if
-        MOSHI_ATTN_CHUNK > 0, else one call for even B (or B*H <= 128) and (B-1) + 1 for odd B."""
+        """Row ranges for the per-layer attention kernel calls. bf16 KV: one call. FP8 KV: one call with
+        MOSHI_FP8_FUSED_MASK=1 (no pinned prompt); else fixed chunks if MOSHI_ATTN_CHUNK > 0, else one call for even B
+        (or B*H <= 128) and (B-1) + 1 for odd B. (The B=1 / 256-slot-bucket trigger is outside our bucket set.)"""
         if not self.fp8_kv:
+            return [(0, B)]
+        if self.fp8_fused_mask and not self.pin_max:
             return [(0, B)]
         if self.attn_chunk > 0:
             return [(r0, min(B, r0 + self.attn_chunk)) for r0 in range(0, B, self.attn_chunk)]
@@ -427,8 +453,12 @@ class MoshiLM(nn.Module):
         else:
             allr = lambda t: t
         dev = tokens.device
-        valid = (tokens >= 0).to(self.dtype).unsqueeze(-1)
-        x = (F.embedding(tokens.clamp(min=0) + self.emb_off, self.emb) * valid).sum(1)  # [B,dim]
+        if self.emb_zrow:
+            ids = torch.where(tokens >= 0, tokens + self.emb_off, torch.full_like(tokens, self.emb_V))
+            x = F.embedding(ids, self.emb).sum(1)                                        # [B,dim]
+        else:
+            valid = (tokens >= 0).to(self.dtype).unsqueeze(-1)
+            x = (F.embedding(tokens.clamp(min=0) + self.emb_off, self.emb) * valid).sum(1)  # [B,dim]
         if emb_in is not None:
             x = torch.where(use_emb.view(B, 1), emb_in.to(x.dtype), x)
         t = torch.where(reset, torch.zeros_like(off_b), off_b)                          # frames before this one
@@ -528,10 +558,10 @@ class MoshiLM(nn.Module):
             if "noattn" in abl:
                 a = x
             else:
-              # The kernel folds the KV heads into its batch. With FP8 KV on LNC2 it is wrong when the folded
-              # batch is split across the two cores mid-sequence: odd B with B*heads > 128 (fails at B=5,7,9 @32
-              # heads and B=17,23,33 @8 heads; even B is correct). Split odd B into (B-1) + 1. The KV pool and the
-              # global block tables are shared, so per-chunk calls are exact.
+              # The kernel folds the KV heads into its batch (bs = B*heads). With FP8 KV vllm-neuron pre-generates
+              # the mask for the unfolded (B, heads) shape; on LNC2 its block layout differs from the kernel's for
+              # odd B with B*heads >= 128 (also B=1 at a 256-slot bucket), and every row is wrong. Split odd B into
+              # (B-1) + 1, or MOSHI_FP8_FUSED_MASK=1. The KV pool and block tables are shared, so chunks are exact.
               parts = []
               for r0, r1 in self._attn_chunks(B, H):
                   parts.append(attention_decode(
@@ -548,6 +578,7 @@ class MoshiLM(nn.Module):
                       k_scale=getattr(self, f"ks{i}") if self.fp8_kv else None,
                       v_scale=getattr(self, f"vs{i}") if self.fp8_kv else None,
                       **(dict(fp8_packed=True) if self.fp8_packed else {}),
+                      **(dict(fp8_fused_mask_allowed=True) if (self.fp8_fused_mask and pin_mask is None) else {}),
                       W_out=l["wo"], bias_out=None, transposed_out=False, out_in_sb=False))
               a = parts[0] if len(parts) == 1 else torch.cat([p.view(-1, cfg.dim) for p in parts], 0)
               a = allr(a)
@@ -601,19 +632,65 @@ class MoshiLM(nn.Module):
         prev = self._lookup(self.dep_text_emb, text)
         NS = max(Q, int(os.environ.get("MOSHI_DEP_STEPS", str(Q))))   # PersonaPlex perf proxy (see depformer())
         NS = min(NS, int(os.environ.get("MOSHI_DEP_RUN", str(NS))))
+        if getattr(self, "dep_fused", False) and (gumbel_audio.shape[-1] == 1 or temp <= 0):
+            tk = top_k                        # exact top-k (ceil(k/8) 8-wide rounds, surplus dropped)
+            uu = gumbel_audio[:, :, 0].float() if gumbel_audio.shape[-1] == 1 else \
+                torch.zeros(B, Q, device=tout.device)                               # [B, Q] uniforms (greedy: unused)
+            if NS > Q:
+                uu = torch.cat([uu, uu[:, :NS - Q]], 1)
+            if not hasattr(self, "dn_headT"):
+                self.dn_headT = self.dep_heads.transpose(1, 2).contiguous()         # [Q, 1024, 2048] ([in, out])
+                self.dn_embc = self.dep_emb.contiguous()                            # [Q-1, 2048, 1024]
+            force = None
+            if force_audio is not None and os.environ.get("MOSHI_DEP_FUSED_TF", "0") == "1":
+                # validation only (teacher forcing): feed the forced codes into the next steps, return debug logits
+                force = force_audio.to(torch.int32).contiguous()
+            res = self._dep_all[self._dep_grid](
+                din.transpose(0, 1).contiguous(), prev.to(self.dtype).contiguous(), uu[:, :NS].contiguous(),
+                self.dn_wqkv, self.dn_wo, self.dn_wg, self.dn_wu, self.dn_wd, self.dn_n1, self.dn_n2,
+                self.dn_headT, self.dn_embc, NS, Q, float(max(temp, 0.0)), int(tk), cfg.eps, 3,
+                1 if force is not None else 0, force)
+            if force is not None:
+                codes, lgo = res
+                return codes.long()[:, :Q], lgo.transpose(0, 1)[:, :Q].float()
+            codes = res.long()
+            out = codes[:, :Q]
+            if NS > Q:
+                extra = codes[:, Q:].sum(1)
+                out = torch.cat([out[:, :-1], (out[:, -1] + (extra < 0).long()).view(B, 1)], 1)
+            if force_audio is not None:
+                # forced rows take the forced code; their depformer chain does not see it (serving forces audio only
+                # during the prompt, which runs through the batched prefill)
+                out = torch.where(use_force.view(B, 1), force_audio, out)
+            return out, None
         kc = torch.zeros(NL, B, NS, dd, dtype=self.dtype, device=tout.device)
         vc = torch.zeros(NL, B, NS, dd, dtype=self.dtype, device=tout.device)
         codes, logits_all = [], []
         extra = None
         k = self._dep_k[self._dep_grid]
+        # MOSHI_DEP_KV_STACK=1: keep this frame's per-step K/V as a list and pass the kernel a cache built only from
+        # the steps so far (torch.stack of s_ tensors, [6, B, s_, 1024]) instead of rewriting the whole [6, B, NS, 1024]
+        # cache twice per step with torch.cat; the kernel reads positions 0..s_-1 only.
+        kv_stack = os.environ.get("MOSHI_DEP_KV_STACK", "0") == "1"
+        ks_, vs_ = [], []
         for s_ in range(NS):
             s = s_ % Q
             x = (din[:, s] + prev).to(self.dtype).contiguous()
-            y, kn, vn = k(x, kc, vc, self.dn_wqkv[s], self.dn_wo[s], self.dn_wg[s], self.dn_wu[s], self.dn_wd[s],
-                          self.dn_n1, self.dn_n2, s_, cfg.eps, 3)
+            if kv_stack:
+                if s_ == 0:
+                    kc_s, vc_s = kc[:, :, :1], vc[:, :, :1]
+                else:
+                    kc_s, vc_s = torch.stack(ks_, 2), torch.stack(vs_, 2)
+            else:
+                kc_s, vc_s = kc, vc
+            y, kn, vn = k(x, kc_s, vc_s, self.dn_wqkv[s], self.dn_wo[s], self.dn_wg[s], self.dn_wu[s], self.dn_wd[s],
+                          self.dn_n1, self.dn_n2, s_, cfg.eps, 7 if _FASTPV else 4, self._dep_split)
             if s_ + 1 < NS:
-                kc = torch.cat([kc[:, :, :s_], kn.unsqueeze(2), kc[:, :, s_ + 1:]], 2)
-                vc = torch.cat([vc[:, :, :s_], vn.unsqueeze(2), vc[:, :, s_ + 1:]], 2)
+                if kv_stack:
+                    ks_.append(kn); vs_.append(vn)
+                else:
+                    kc = torch.cat([kc[:, :, :s_], kn.unsqueeze(2), kc[:, :, s_ + 1:]], 2)
+                    vc = torch.cat([vc[:, :, :s_], vn.unsqueeze(2), vc[:, :, s_ + 1:]], 2)
             lg = F.linear(y, self.dep_heads[s]).float()
             c = sample(lg, gumbel_audio[:, s], temp, top_k)
             if s_ < Q:
