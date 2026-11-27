@@ -48,6 +48,7 @@ orchestrator process each pinned to their own physical core (Neuron workers on t
 | + `MOSHI_DEP_FUSED=1`, max batch 92 | **92** | **yes (2 of 2)** | **60-102 / 421-1417 ms** |
 | same | 88 | yes (2 of 2 on a max-batch-88 server; clean on the 92 server) | 57-73 / 136-339 ms |
 | same, BF16 KV cache instead of FP8 | 64 | yes (2 of 2) | 53-90 / 446-487 ms |
+| BF16 KV cache + `MOSHI_DEP_FUSED=1` | **68** | yes (2 of 2) | 47-65 / 125-356 ms |
 
 `MOSHI_DEP_NKI_MINB=1` runs the depth transformer with the NKI kernel. `MOSHI_KV_BLOCK=12` makes the KV-cache block
 12 slots. At the 1536-slot window the attention kernel then keeps whole 12-position blocks; it no longer splits
